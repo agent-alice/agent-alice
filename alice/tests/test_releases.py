@@ -19,6 +19,7 @@ from alice_codex.store import Store
 def make_wheel(
     path, version="0.0.1", value="good", *, resource_schema=1,
     epoch_capability=None, identity_capability=None,
+    summary_capability=None, heartbeat_capability=None,
 ):
     """A real minimal wheel: installation/entry execution need no network."""
     filename = path / f"alice_codex-{version}-py3-none-any.whl"
@@ -37,6 +38,10 @@ def make_wheel(
         files["alice_codex/service.py"] = f"RESOURCE_EPOCH_CAPABILITY = {epoch_capability!r}\n"
     if identity_capability is not None:
         files["alice_codex/identity.py"] = f"IDENTITY_HOOK_COMPAT_VERSION = {identity_capability!r}\n"
+    if summary_capability is not None:
+        files["alice_codex/summary_partitions.py"] = f"SUMMARY_COMMIT_SCHEMA = {summary_capability!r}\n"
+    if heartbeat_capability is not None:
+        files["alice_codex/heartbeat.py"] = f"HEARTBEAT_SOURCES_CONFIG_VERSION = {heartbeat_capability!r}\n"
     record = io.StringIO()
     writer = csv.writer(record)
     for name, text in files.items():
