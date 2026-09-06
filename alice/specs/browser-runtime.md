@@ -4,6 +4,20 @@ Alice can install a pinned Playwright MCP through the public Codex App Server
 interfaces. This is browser support; it does not supply Desktop Computer Use or
 prove general autonomous learning or live website integration.
 
+The public commands are:
+
+```sh
+alice --home /path/to/alice browser status
+alice --home /path/to/alice browser install \
+  --node /path/to/node \
+  --npm-cli /path/to/npm-cli.js \
+  --browser-executable /path/to/chrome
+```
+
+Stop Alice before installing. Successful installation returns `installed: true`
+and `native_verified: true` only after the native localhost browser check. Status
+does not install dependencies or start a service.
+
 `browser.install(config, node=..., npm_cli=..., browser_executable=...)` is a
 synchronous operation. Async CLI callers must use `asyncio.to_thread`. All three
 paths are explicit; the installer does not search accounts, install Chrome,

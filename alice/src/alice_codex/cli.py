@@ -29,6 +29,14 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--login-home", type=Path)
     init.add_argument("--model", default="gpt-6-astra")
     init.add_argument("--no-pin", action="store_true")
+    browser = commands.add_parser(
+        "browser", help="Install or inspect Alice's standalone browser"
+    ).add_subparsers(dest="operation", required=True)
+    browser.add_parser("status")
+    browser_install = browser.add_parser("install")
+    browser_install.add_argument("--node", type=Path, required=True)
+    browser_install.add_argument("--npm-cli", type=Path, required=True)
+    browser_install.add_argument("--browser-executable", type=Path, required=True)
     for command in ("check-draft", "summarize-observation"):
         commands.add_parser(command).add_argument("path", type=Path)
     collect = commands.add_parser("collect", help="Collect a bounded read-only HTTP collection")
@@ -244,6 +252,18 @@ async def execute(args) -> dict | None:
             "snapshot": result,
         }
     config = load_config(args.home)
+    if args.command == "browser":
+        from . import browser
+
+        if args.operation == "status":
+            return browser.status(config)
+        return await asyncio.to_thread(
+            browser.install,
+            config,
+            node=args.node,
+            npm_cli=args.npm_cli,
+            browser_executable=args.browser_executable,
+        )
     if args.command == "resources":
         action, params = "resources_" + args.operation, {}
         if args.operation == "observation":
