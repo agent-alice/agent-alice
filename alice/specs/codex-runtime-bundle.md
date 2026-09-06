@@ -33,10 +33,12 @@ original distribution directory.
 - `invalid`: a recorded pair is missing, changed or inconsistent.
 
 These states do not claim successful tool execution. `native_verified` remains
-false in this file-integrity interface. New release gates can call
-`verify_runtime_bundle(config, require=True)` to require a pair, followed by
-`tests/test_native_code_mode.py` to verify actual execution. That native test
-uses `initialize_config` to create the private pair, then an owned App Server
+false in this file-integrity interface. Release policy 5 requires a recorded
+pair and separates native protocol checks from the mandatory `native_pair`
+check in `tests/test_native_code_mode.py`. Without explicit `--native`, ordinary
+checks may pass but the candidate remains `promotable=false`. The native pair
+check invokes the installed candidate's CLI initialization to create a private
+copy, then uses an owned App Server
 and a recorded localhost Responses endpoint to call `functions.exec`, which
 reads a synthetic file through its real child Code Mode host. No live model,
 personal account, Desktop connection or external website is needed.
@@ -44,12 +46,31 @@ personal account, Desktop connection or external website is needed.
 ## Explicit migration of an existing installation
 
 The old `config.json` schema is unchanged, so an earlier Alice release can still
-read the migrated configuration and ignore the new pair manifest. Historical
+parse the migrated configuration. This is data compatibility, not approval to
+run an older main-only release under the new gate. Historical
 main-only pins remain readable and explicitly unverified until migrated; a
 nearby unrecorded host is never automatically adopted as a verified companion.
 
-After fully stopping the service, callers can run the synchronous migration
-function from an environment containing the updated Alice package:
+After fully stopping the service, use the updated CLI:
+
+```sh
+alice runtime status
+alice runtime repin --codex /path/to/original-complete-distribution/codex
+alice doctor
+```
+
+The CLI holds the shared `offline_maintenance(config)` context throughout the
+copy and atomic switch. This synchronous context holds lifecycle, bootstrap
+and service locks in that order. It rejects loaded supervision even before a
+control socket exists, live recorded owners and uncertain sockets. Callers must
+run it off an asyncio event loop and must not reacquire those locks or call
+public launchd transitions inside it. Browser installation and release switching
+can use the same public boundary.
+
+The existing standalone Python API retains its service-lock contract. Callers
+must independently ensure that no supervisor can start during this lower-level
+operation; prefer the CLI or the shared maintenance context for installations
+with a supervisor:
 
 ```python
 from pathlib import Path
@@ -68,14 +89,25 @@ manifest, then atomically changes only `codex_binary` in the original JSON.
 Other known and unknown JSON fields, Codex TOML, authentication, conversations,
 schedules and old executable files are preserved. Configuration changed by a
 concurrent writer is not overwritten. Async callers must use
-`asyncio.to_thread`; CLI and shared lifecycle-maintenance integration are
-separate entry-point work.
+`asyncio.to_thread`. Inside the shared context the CLI calls the private locked
+implementation, avoiding a second acquisition of the same service lock.
 
 If the original primary has changed, select an archived complete distribution
 with the recorded hash. This migration does not authorize a different Codex
-version. Build and validate a new release for an upgrade. Older releases can
-continue to point at the previous binary or the newly pinned complete pair;
-rollback must retain new conversation and schedule data.
+version. Build and validate a new release for an upgrade. Policy 5 candidates
+freeze their own complete pair and bind both hashes in the manifest and verified
+report. Their original distribution paths are provenance only. If runtime
+configuration exists, its actual recorded pair must match both candidate hashes;
+a missing, damaged or different valid host cannot reuse previous tool evidence.
+
+Old candidates and reports remain readable, but cannot be promoted or used for
+automatic rollback under policy 5. Stop and uninstall an older supervisor before
+activating a new candidate. Verify and activate two compatible policy 5 candidates
+to establish a usable previous, then install a new independent supervisor; its
+metadata binds the release policy and host hash. If any step fails, retain the
+old files and reports, keep the runtime stopped and diagnose the failure. Do not
+rewrite historical reports or restore old business data. See the README's ordered
+migration procedure. Schema compatibility remains a separate requirement.
 
 Restart the owned App Server after changing a runtime pair. Loaded threads cache
 Code Mode availability; copying a missing file beside a running process does

@@ -151,7 +151,7 @@ def run_check(
 class ReleaseManager:
     """Candidates live in home/releases; current.json is only a code selector."""
 
-    POLICY_VERSION = 4
+    POLICY_VERSION = 5
 
     def __init__(self, home: Path | str):
         self.home = Path(home).expanduser().resolve()
@@ -204,7 +204,7 @@ class ReleaseManager:
         if (
             not isinstance(manifest, dict)
             or manifest.get("id") != candidate_id
-            or manifest.get("policy_version") != self.POLICY_VERSION
+            or manifest.get("policy_version") not in {4, self.POLICY_VERSION}
         ):
             raise ReleaseError("invalid candidate manifest")
         return candidate, manifest
@@ -269,12 +269,28 @@ class ReleaseManager:
         constraints = source / "requirements.lock"
         if not constraints.is_file():
             raise ReleaseError("source requirements.lock is required for candidate installation")
+        from .runtime_bundle import inspect_bundle, pin_bundle
+
+        source_bundle = inspect_bundle(binary)
         initial_source = source_fingerprint(source)
         digest = sha256_file(wheel)
         candidate_id = f"{digest[:16]}-{uuid4().hex[:12]}"
         candidate = private_dir(self.root / candidate_id)
         env = self._environment(candidate / "build-home")
         try:
+            version = subprocess.run(
+                [str(source_bundle.binary), "--version"],
+                cwd=candidate,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if version.returncode != 0 or not version.stdout.strip().startswith("codex-cli "):
+                raise ReleaseError("pinned executable did not identify as Codex CLI")
+            # Freeze the matching pair before dependency installation. The
+            # original distribution is provenance, not a deployment dependency.
+            bundle = pin_bundle(candidate / "codex-runtime", source_bundle, version.stdout.strip())
             shutil.copyfile(wheel, candidate / wheel.name)
             shutil.copyfile(constraints, candidate / "requirements.lock")
             if sha256_file(candidate / wheel.name) != digest:
@@ -323,16 +339,6 @@ class ReleaseManager:
             head = subprocess.run(
                 ["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True, timeout=10
             )
-            version = subprocess.run(
-                [str(binary), "--version"],
-                cwd=candidate,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if version.returncode != 0 or not version.stdout.strip().startswith("codex-cli "):
-                raise ReleaseError("pinned executable did not identify as Codex CLI")
             if source_fingerprint(source) != initial_source:
                 raise ReleaseError("source changed during candidate installation")
             manifest = {
@@ -345,8 +351,12 @@ class ReleaseManager:
                 "verification_python": str(Path(python).absolute()),
                 "wheel": wheel.name,
                 "wheel_sha256": digest,
-                "codex_binary": str(binary),
-                "codex_sha256": sha256_file(binary),
+                "codex_binary": str(bundle.binary),
+                "codex_sha256": bundle.binary_sha256,
+                "codex_code_mode_host": str(bundle.host),
+                "codex_code_mode_host_sha256": bundle.host_sha256,
+                "codex_source_binary": str(source_bundle.binary),
+                "codex_source_code_mode_host": str(source_bundle.host),
                 "codex_version": version.stdout.strip(),
                 "installed": installed_metadata,
                 "environment_fingerprint": self._environment_fingerprint(candidate),
@@ -371,19 +381,63 @@ class ReleaseManager:
             digest.update(b"\0")
         return digest.hexdigest()
 
-    def _runtime_codex_binary(self, manifest: dict) -> Path:
-        config_path = self.home / "config.json"
-        if not config_path.exists():
-            return Path(manifest["codex_binary"])
+    def _candidate_pair(self, manifest: dict):
+        if manifest.get("policy_version") != self.POLICY_VERSION:
+            raise ReleaseError(
+                "legacy candidate needs a new paired-runtime verification; old report preserved"
+            )
+        from .config import RuntimeConfig
+        from .runtime_bundle import CodexBundle, verify_runtime_bundle
+
+        home = self._candidate(manifest["id"]) / "codex-runtime"
+        try:
+            binary = Path(manifest["codex_binary"])
+            if not binary.is_absolute() or not binary.resolve().is_relative_to(home / "bin"):
+                raise ValueError("candidate runtime escaped its private bundle directory")
+            config = RuntimeConfig(
+                str(home), str(binary), manifest["codex_version"], manifest["codex_sha256"]
+            )
+            pair = verify_runtime_bundle(config, require=True)
+            if (
+                pair["codex_code_mode_host"] != manifest["codex_code_mode_host"]
+                or pair["codex_code_mode_host_sha256"] != manifest["codex_code_mode_host_sha256"]
+            ):
+                raise ValueError("candidate companion disagrees with the verification identity")
+            return CodexBundle(
+                binary,
+                Path(pair["codex_code_mode_host"]),
+                config.codex_sha256,
+                pair["codex_code_mode_host_sha256"],
+            )
+        except (KeyError, OSError, ValueError) as error:
+            raise ReleaseError(f"candidate runtime pair is invalid: {error}") from error
+
+    def _configured_pair(self, manifest: dict):
         from .config import load_config
+        from .runtime_bundle import CodexBundle, verify_runtime_bundle
 
         try:
             config = load_config(self.home)
+            pair = verify_runtime_bundle(config, require=True)
+            if config.codex_sha256 != manifest["codex_sha256"]:
+                raise ValueError("runtime config expects a different Codex binary")
+            if pair["codex_code_mode_host_sha256"] != manifest.get("codex_code_mode_host_sha256"):
+                raise ValueError("runtime config expects a different or unverified Code Mode host")
+            return CodexBundle(
+                Path(config.codex_binary),
+                Path(pair["codex_code_mode_host"]),
+                config.codex_sha256,
+                pair["codex_code_mode_host_sha256"],
+            )
         except (OSError, ValueError) as error:
-            raise ReleaseError(f"runtime config is invalid: {error}") from error
-        if config.codex_sha256 != manifest["codex_sha256"]:
-            raise ReleaseError("runtime config expects a different Codex binary")
-        return Path(config.codex_binary)
+            raise ReleaseError(f"runtime pair is invalid: {error}") from error
+
+    def _runtime_codex_binary(self, manifest: dict) -> Path:
+        fixed = self._candidate_pair(manifest)
+        config_path = self.home / "config.json"
+        if not config_path.exists():
+            return fixed.binary
+        return self._configured_pair(manifest).binary
 
     def _assert_unchanged(self, candidate: Path, manifest: dict) -> None:
         if Path(manifest["wheel"]).name != manifest["wheel"]:
@@ -405,6 +459,10 @@ class ReleaseManager:
         timeout: float = 300,
     ) -> dict[str, Any]:
         candidate, manifest = self._manifest(candidate_id)
+        if manifest.get("policy_version") != self.POLICY_VERSION:
+            raise ReleaseError(
+                "legacy candidate needs new paired verification; old report preserved"
+            )
         # Invalidate a previous successful result before any new verification attempt.
         manifest["verified_report_sha256"] = None
         write_json(candidate / "candidate.json", manifest)
@@ -469,11 +527,37 @@ class ReleaseManager:
                 ),
             ]
             if native:
+                if not (source / "tests/test_native_code_mode.py").is_file():
+                    raise ReleaseError("required native Code Mode pair test is missing")
                 commands.append(
                     (
                         "native",
-                        [python, "-m", "pytest", "tests", "-m", "native and not live", "-q"],
+                        [
+                            python,
+                            "-m",
+                            "pytest",
+                            "tests",
+                            "--ignore=tests/test_native_code_mode.py",
+                            "-m",
+                            "native and not live",
+                            "-q",
+                        ],
                         candidate / "native.xml",
+                    )
+                )
+                commands.append(
+                    (
+                        "native_pair",
+                        [
+                            python,
+                            "-m",
+                            "pytest",
+                            "tests/test_native_code_mode.py",
+                            "-m",
+                            "native and not live",
+                            "-q",
+                        ],
+                        candidate / "native-pair.xml",
                     )
                 )
             if live:
@@ -503,12 +587,18 @@ class ReleaseManager:
             "source_fingerprint": manifest["source_fingerprint"],
             "wheel_sha256": manifest["wheel_sha256"],
             "codex_sha256": manifest["codex_sha256"],
+            "codex_code_mode_host_sha256": manifest["codex_code_mode_host_sha256"],
             "environment_fingerprint": manifest["environment_fingerprint"],
             "native_required": native,
             "live_required": live,
             "checks": [asdict(result) for result in results],
             "passed": bool(results) and all(result.status == "passed" for result in results),
         }
+        report["promotable"] = (
+            report["passed"]
+            and native
+            and any(item.name == "native_pair" and item.status == "passed" for item in results)
+        )
         write_json(candidate / "verification.json", report)
         if report["passed"]:
             manifest["verified_report_sha256"] = sha256_file(candidate / "verification.json")
@@ -527,19 +617,23 @@ class ReleaseManager:
             raise ReleaseError("candidate has no matching successful verification")
         report = read_json(report_path)
         required = {"ruff", "unit", "artifact"}
-        if report.get("native_required"):
-            required.add("native")
+        required.update({"native", "native_pair"})
         if report.get("live_required"):
             required.add("live")
         checks = report.get("checks", [])
         if (
             not report.get("passed")
+            or not report.get("promotable")
+            or not report.get("native_required")
+            or report.get("policy_version") != self.POLICY_VERSION
             or not required <= {check.get("name") for check in checks}
             or any(
                 check.get("status") != "passed" or check.get("returncode") != 0 for check in checks
             )
             or report.get("wheel_sha256") != manifest["wheel_sha256"]
             or report.get("candidate_id") != candidate_id
+            or report.get("codex_sha256") != manifest["codex_sha256"]
+            or report.get("codex_code_mode_host_sha256") != manifest["codex_code_mode_host_sha256"]
         ):
             raise ReleaseError("candidate required checks did not all pass")
         return candidate, manifest
@@ -573,8 +667,23 @@ class ReleaseManager:
                 )
         config_path = self.home / "config.json"
         if config_path.exists():
-            if sha256_file(self._runtime_codex_binary(manifest)) != manifest["codex_sha256"]:
-                raise ReleaseError("runtime pinned Codex binary changed")
+            self._configured_pair(manifest)
+
+    def _check_bootstrap_policy(self, manifest: dict) -> None:
+        if not (self.home / "state/supervisor.json").exists():
+            return
+        from .bootstrap import checked_runtime
+
+        bootstrap = checked_runtime(self.home)["manifest"]
+        if (
+            bootstrap.get("release_policy_version") != self.POLICY_VERSION
+            or bootstrap.get("codex_sha256") != manifest["codex_sha256"]
+            or bootstrap.get("codex_code_mode_host_sha256")
+            != manifest["codex_code_mode_host_sha256"]
+        ):
+            raise ReleaseError(
+                "stop and uninstall the previous supervisor before changing its verified runtime pair"
+            )
 
     def current(self) -> dict[str, Any] | None:
         path = self.root / "current.json"
@@ -622,6 +731,7 @@ class ReleaseManager:
         with SingletonLock(self.root / ".switch.lock"):
             candidate, manifest = self._verified(candidate_id)
             self._check_data_schema(manifest, data_schema)
+            self._check_bootstrap_policy(manifest)
             old = self.current()
             pointer = {
                 "current": candidate_id,
@@ -647,6 +757,7 @@ class ReleaseManager:
                 raise ReleaseError("no previous verified release is available")
             candidate, manifest = self._verified(old["previous"])
             self._check_data_schema(manifest, data_schema)
+            self._check_bootstrap_policy(manifest)
             pointer = {
                 "current": old["previous"],
                 "previous": old["current"],
