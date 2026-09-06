@@ -6,6 +6,7 @@ Only explicit rule/baseline configuration can enable virtual accounting.
 """
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import hashlib
 import json
@@ -172,6 +173,190 @@ def _block_cleared(response, limit_id, reason):
             value = window.get("usedPercent") if isinstance(window, dict) else None
             return type(value) in (int, float) and math.isfinite(value) and 0 <= value < 100
     return False
+
+
+@dataclass(frozen=True, slots=True)
+class TaskUsage:
+    """Caller-owned facts for one bounded task, independent of money and tokens.
+
+    The scheduler must persist the incremented attempt and ``running`` outcome
+    before dispatch, then record a confirmed terminal observation. ``complete``
+    means the task's independent result check passed, not merely HTTP/RPC success.
+    Times are UTC epoch seconds, never a process-local monotonic clock. Reload
+    these facts after restart; extending limits must not reset them. After every
+    decision persist last_checked_at = max(previous last_checked_at, observed_at),
+    including suppressed checks; never lower the saved watermark on clock rollback.
+    """
+
+    started_at: float
+    attempts: int = 0
+    consecutive_failures: int = 0
+    last_outcome: str | None = None
+    last_finished_at: float | None = None
+    last_checked_at: float | None = None
+
+    def __post_init__(self):
+        if self.started_at is None:
+            raise ValueError("started_at must be an explicit timestamp")
+        _timestamp(self.started_at)
+        if self.last_checked_at is not None:
+            _timestamp(self.last_checked_at)
+            if self.last_checked_at < self.started_at:
+                raise ValueError("last check cannot precede task start")
+        _integer(self.attempts, "attempts")
+        _integer(self.consecutive_failures, "consecutive_failures")
+        if self.consecutive_failures > self.attempts:
+            raise ValueError("consecutive failures cannot exceed attempts")
+        outcomes = {"running", "progress", "unchanged", "failed", "unknown", "complete"}
+        if self.last_outcome is not None and (
+            not isinstance(self.last_outcome, str) or self.last_outcome not in outcomes
+        ):
+            raise ValueError("unsupported task outcome")
+        if self.attempts == 0:
+            if self.last_outcome is not None or self.last_finished_at is not None:
+                raise ValueError("an unstarted task cannot have an attempt outcome")
+        elif self.last_outcome is None:
+            raise ValueError("an attempted task requires an explicit outcome")
+        if self.last_outcome == "running":
+            if self.last_finished_at is not None:
+                raise ValueError("a running attempt cannot have a finish timestamp")
+        elif self.last_outcome is not None:
+            if self.last_finished_at is None:
+                raise ValueError("an attempt outcome requires a finish timestamp")
+            _timestamp(self.last_finished_at)
+            if self.last_finished_at < self.started_at:
+                raise ValueError("finish timestamp cannot precede task start")
+        if self.last_outcome == "failed" and self.consecutive_failures == 0:
+            raise ValueError("a failed outcome requires a consecutive failure count")
+        if self.last_outcome in {"progress", "unchanged", "complete"} and self.consecutive_failures:
+            raise ValueError("a confirmed nonfailure must clear the consecutive failure count")
+
+
+def _positive_seconds(value, name):
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be positive finite seconds")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPolicy:
+    """Pure pre-dispatch decision; this class does not run or persist a task.
+
+    All limits are explicit. Wall time includes waiting, so unchanged observations
+    cannot create an unlimited idle loop. ``max_retries`` permits that many extra
+    attempts following consecutive confirmed failures. Unknown results always need
+    reconciliation, including after limits are extended. A caller can recover an
+    exhausted task by explicitly extending its limits while keeping all usage facts.
+
+    The service/store owners must atomically persist usage, honor wait decisions,
+    combine this result with ResourceLedger.can_dispatch, and enforce the deadline
+    on an already running native turn. A decision neither grants spending/publishing
+    authorization nor interrupts an existing process. No storage format is added.
+    """
+
+    max_elapsed_seconds: float
+    max_attempts: int
+    max_retries: int
+    retry_wait_seconds: float
+    unchanged_wait_seconds: float
+
+    def __post_init__(self):
+        _positive_seconds(self.max_elapsed_seconds, "max_elapsed_seconds")
+        _positive_seconds(self.retry_wait_seconds, "retry_wait_seconds")
+        _positive_seconds(self.unchanged_wait_seconds, "unchanged_wait_seconds")
+        if _integer(self.max_attempts, "max_attempts") == 0:
+            raise ValueError("max_attempts must be positive")
+        _integer(self.max_retries, "max_retries")
+
+    def decide(self, usage: TaskUsage, *, now: float, busy: bool) -> dict:
+        """Check one step without consuming an attempt or changing the caller's facts.
+
+        Example: TaskPolicy(120, 4, 1, 5, 30).decide(
+            TaskUsage(100, 1, 1, "failed", 105), now=106, busy=False)
+        returns waiting/retry_wait with next_attempt_at=110. There are no default
+        limits. now must be an injected UTC epoch timestamp, not monotonic time.
+
+        States/reasons: ready has allowed=True; complete never dispatches again;
+        reconciliation_required/attempt_outcome_unknown requires independent
+        reconciliation before retry, even after limits are extended. waiting has
+        task_busy, clock_before_task_evidence, retry_wait, or unchanged_wait.
+        exhausted has task_time_exhausted, task_attempts_exhausted and/or
+        task_retries_exhausted, or task_time_insufficient_for_wait. All exhausted
+        decisions require explicit recovery and preserve the supplied usage.
+
+        next_attempt_at is present for a scheduled wait, absent for busy or blocked
+        states. remaining reports time, total attempts, and additional consecutive
+        failure retries. observed_at is the clock/evidence high-water mark to save
+        as last_checked_at before the next evaluation; it never goes backwards.
+        """
+        if not isinstance(usage, TaskUsage):
+            raise ValueError("usage must contain validated TaskUsage facts")
+        if now is None:
+            raise ValueError("now must be an explicit timestamp")
+        _timestamp(now)
+        if type(busy) is not bool:
+            raise ValueError("busy must be an explicit boolean")
+        deadline = usage.started_at + self.max_elapsed_seconds
+        if not math.isfinite(deadline):
+            raise ValueError("task deadline must be finite")
+        observed_at = max(
+            now,
+            usage.started_at,
+            usage.started_at if usage.last_finished_at is None else usage.last_finished_at,
+            usage.started_at if usage.last_checked_at is None else usage.last_checked_at,
+        )
+        remaining = {
+            "seconds": max(0, min(self.max_elapsed_seconds, deadline - observed_at)),
+            "attempts": max(0, self.max_attempts - usage.attempts),
+            "retries": max(0, self.max_retries - max(0, usage.consecutive_failures - 1)),
+        }
+
+        def decision(state, *reasons, next_attempt_at=None, recovery_required=False):
+            return {
+                "allowed": state == "ready",
+                "observed_at": observed_at,
+                "state": state,
+                "reasons": list(reasons),
+                "next_attempt_at": next_attempt_at,
+                "remaining": remaining,
+                "recovery_required": recovery_required,
+            }
+
+        if usage.last_outcome == "complete":
+            return decision("complete")
+        if usage.last_outcome == "unknown" or (usage.last_outcome == "running" and not busy):
+            return decision(
+                "reconciliation_required", "attempt_outcome_unknown", recovery_required=True
+            )
+        if now < observed_at:
+            return decision("waiting", "clock_before_task_evidence", next_attempt_at=observed_at)
+        exhausted = []
+        if remaining["seconds"] == 0:
+            exhausted.append("task_time_exhausted")
+        if remaining["attempts"] == 0:
+            exhausted.append("task_attempts_exhausted")
+        if usage.last_outcome == "failed" and usage.consecutive_failures > self.max_retries:
+            exhausted.append("task_retries_exhausted")
+        if exhausted:
+            return decision("exhausted", *exhausted, recovery_required=True)
+        if busy:
+            return decision("waiting", "task_busy")
+        delays = {
+            "failed": (self.retry_wait_seconds, "retry_wait"),
+            "unchanged": (self.unchanged_wait_seconds, "unchanged_wait"),
+        }
+        if usage.last_outcome in delays:
+            delay, reason = delays[usage.last_outcome]
+            next_attempt_at = usage.last_finished_at + delay
+            if not math.isfinite(next_attempt_at):
+                raise ValueError("task wait deadline must be finite")
+            if now < next_attempt_at:
+                if next_attempt_at >= deadline:
+                    return decision(
+                        "exhausted", "task_time_insufficient_for_wait", recovery_required=True
+                    )
+                return decision("waiting", reason, next_attempt_at=next_attempt_at)
+        return decision("ready")
 
 
 class ResourceLedger:
