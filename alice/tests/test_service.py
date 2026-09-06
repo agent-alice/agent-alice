@@ -303,6 +303,67 @@ async def test_pause_checks_unloaded_empty_alias_without_creating_a_thread(
     service.codex.thread_start.assert_not_called()
 
 
+@pytest.mark.parametrize("has_input", [False, True])
+async def test_shutdown_restart_global_resume_and_due_dispatch_hydrates_original_task(
+    service, tmp_path, has_input
+):
+    service.state["tasks"]["main"] = {
+        "thread_id": "old-root",
+        "paused": False,
+        "has_input": has_input,
+    }
+    service.store.create_job(name="due", schedule_type="at", schedule_value=10, now=0)
+    await service._shutdown((tmp_path / "shutdown.log").open("ab"))
+    assert not json.loads(service.path.read_text())["tasks"]["main"]["paused"]
+    restarted = Service(service.config)
+    restarted.ready, restarted.codex = True, service.codex
+    restarted.scheduler.clock = lambda: 20
+    loaded = set()
+
+    async def read(thread_id):
+        if thread_id == "old-root" and thread_id not in loaded:
+            raise RpcError("thread not loaded: old-root", -32600)
+        return {"thread": {"id": thread_id, "status": {"type": "idle"}}}
+
+    async def resume(thread_id, **kwargs):
+        if not has_input:
+            raise RpcError("no rollout found for thread id old-root", -32600)
+        loaded.add(thread_id)
+        return await read(thread_id)
+
+    restarted.codex.thread_read.side_effect = read
+    restarted.codex.thread_resume = AsyncMock(side_effect=resume)
+    try:
+        assert restarted.store.is_autonomy_paused()
+        assert await restarted.handle("resume", {}) == {"resumed": "autonomy"}
+        events = await restarted.scheduler.poll()
+        assert len(events) == 1 and events[0].status == "accepted"
+        assert not restarted.stop_event.is_set()
+        expected = "old-root" if has_input else "new-root"
+        assert events[0].receipt.thread_id == expected
+        assert restarted.state["tasks"]["main"]["thread_id"] == expected
+        if has_input:
+            restarted.codex.thread_start.assert_not_called()
+        else:
+            restarted.codex.thread_start.assert_awaited_once()
+        restarted.codex.turn_start.assert_awaited_once()
+    finally:
+        restarted.store.close()
+
+
+async def test_capacity_query_does_not_hydrate_unrelated_paused_root(service):
+    service.state["tasks"]["paused"] = {
+        "thread_id": "paused-root",
+        "paused": True,
+        "has_input": True,
+    }
+    service.codex.thread_read.side_effect = RpcError("thread not loaded: paused-root", -32600)
+    service.codex.thread_resume = AsyncMock()
+    assert not await service.is_busy("new")
+    service.codex.thread_resume.assert_not_called()
+    service.codex.thread_start.assert_not_called()
+
+
 @pytest.mark.parametrize("method", ["turn/started", "item/completed"])
 async def test_native_input_marks_history_durable_before_archive_worker(service, method):
     service.state["tasks"]["main"] = {"thread_id": "root", "paused": True, "has_input": False}

@@ -598,7 +598,23 @@ class Service:
             if item.get("reconcile_error") == "native_history_missing":
                 continue
             try:
-                thread = (await self.codex.thread_read(item["thread_id"]))["thread"]
+                try:
+                    thread = (await self.codex.thread_read(item["thread_id"]))["thread"]
+                except RpcError as error:
+                    if (
+                        error.code != -32600
+                        or str(error) != f"thread not loaded: {item['thread_id']}"
+                    ):
+                        raise
+                    if item.get("paused"):
+                        # No loaded executor exists here. An automatic capacity
+                        # query must not resume a different manually paused root.
+                        continue
+                    previous_id = item["thread_id"]
+                    item = await self.ensure_thread(name)
+                    task_ids.discard((name, previous_id))
+                    task_ids.add((name, item["thread_id"]))
+                    thread = (await self.codex.thread_read(item["thread_id"]))["thread"]
             except RpcError as error:
                 if "no rollout found" in str(error):
                     if item.get("has_input"):

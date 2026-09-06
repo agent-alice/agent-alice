@@ -17,7 +17,7 @@
 
 每个 Scheduler 实例使用随机 UUID 作为进程代次/lease owner。SQLite 单事务维护唯一 lease、claim、窗口及游标。默认 lease 30 秒，每 10 秒续租；busy 查询最多等待 lease 的一半与 dispatch timeout 的较小值；派发确认默认上限 120 秒。丢失 lease、取消或超时都不提供“未执行”的证明。控制服务另用文件锁保证唯一入口；所属 Codex 进程以 PID、出生时间、命令和 socket 身份核对，不能按进程名杀进程。
 
-`request_id` 在一个 Alice 实例中全局唯一，指纹绑定 target 与文本。所有 submit 入口共用准入锁，保护跨 target 的 ID 与自动任务容量；锁只持有到原生确认，不等模型完成。同 ID 同输入返回已有回执，即便现在暂停；同 ID 不同输入明确拒绝。原生未决意图与可见 active roots 的并集占用自动任务容量，避免确认和状态可见性之间的竞态。手动输入保留原生排队语义；原生 TUI 在 Alice 之外直接发起的并发不受此锁原子控制，Codex 自身的准入仍有最终决定权。
+`request_id` 在一个 Alice 实例中全局唯一，指纹绑定 target 与文本。所有 submit 入口共用准入锁，保护跨 target 的 ID 与自动任务容量；锁只持有到原生确认，不等模型完成。同 ID 同输入返回已有回执，即便现在暂停；同 ID 不同输入明确拒绝。自动准入的容量查询也能处理普通关闭后留下的未加载根：同 ID resume 后才核对容量，仅明确无 rollout 的无输入根可替换；无关的已暂停根不会被容量查询唤醒。原生未决意图与可见 active roots 的并集占用自动任务容量，避免确认和状态可见性之间的竞态。手动输入保留原生排队语义；原生 TUI 在 Alice 之外直接发起的并发不受此锁原子控制，Codex 自身的准入仍有最终决定权。
 
 `DeferredDispatch` 只用于确定尚未发出输入的暂停、忙碌或依赖等待。它是内部异常，沿用现有控制面错误通道。Scheduler 校验有效 lease、原 owner 和 sending 状态后把同事件退回 pending；若期间定义改变则 cancelled。窗口、ID 和已推进的游标不会丢失。任何可能已发送的异常继续保持 unknown。新实现不会为确定未发送的暂缓写入永久 failed intent。
 

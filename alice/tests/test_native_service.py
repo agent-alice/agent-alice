@@ -414,6 +414,10 @@ stream_max_retries = 0
         remember_mcp()
         await rpc.close()
         rpc = None
+        unpaused_empty = await request(
+            config.control_socket, "thread", {"target": "unpaused-empty"}
+        )
+        assert not unpaused_empty["paused"] and not unpaused_empty["has_input"]
         assert (await cli("stop", timeout=25))["stopped"]
         await asyncio.wait_for(service.wait(), 10)
         assert service.returncode == 0
@@ -423,6 +427,7 @@ stream_max_retries = 0
         restarted = await launch()
         assert restarted["autonomy_paused"]
         assert restarted["tasks"]["main"]["thread_id"] == thread_id
+        assert not restarted["tasks"]["unpaused-empty"]["paused"]
         rpc = await RpcClient.connect_unix(config.codex_socket)
         await rpc.initialize()
         with pytest.raises(RpcError) as unreadable:
@@ -433,9 +438,7 @@ stream_max_retries = 0
             await rpc.request("thread/resume", {"threadId": empty_task["thread_id"]})
         assert unresumable.value.code == -32600
         assert str(unresumable.value) == f"no rollout found for thread id {empty_task['thread_id']}"
-        replacement = await request(
-            config.control_socket, "thread", {"target": "rehearsal-main"}
-        )
+        replacement = await request(config.control_socket, "thread", {"target": "rehearsal-main"})
         assert replacement["thread_id"] != empty_task["thread_id"]
         assert replacement["paused"] and not replacement["has_input"]
         assert len(model_requests) == 4, "replacing an untouched thread must not submit input"
@@ -474,8 +477,15 @@ stream_max_retries = 0
         # host intent have both been recorded. Recovery must retain the same
         # association and never turn absence of a completion into success.
         await cli("resume")
-        crashed = await cli(
-            "ask", "Wait for the isolated Codex crash.", "--request-id", "native-crashed-intent"
+        crashed = await request(
+            config.control_socket,
+            "ask",
+            {
+                "target": "main",
+                "text": "Wait for the isolated Codex crash.",
+                "request_id": "native-crashed-intent",
+                "automatic": True,
+            },
         )
         await asyncio.wait_for(crash_held.wait(), 15)
         remember_mcp()
