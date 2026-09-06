@@ -110,6 +110,66 @@ def test_verified_status_detects_artifact_or_configuration_drift(setup, mutation
     assert not result["installed"] and not result["native_verified"] and result["error"]
 
 
+@pytest.mark.parametrize("mutation", ["contents", "same_hash_new_path", "declared_hash"])
+def test_codex_drift_invalidates_status_without_executing_binary(setup, monkeypatch, mutation):
+    config, arguments, _ = setup
+    browser.install(config, **arguments)
+    original = Path(config.codex_binary)
+    if mutation == "contents":
+        original.write_text('#!/bin/sh\nprintf "different codex bytes\\n"\n')
+    elif mutation == "same_hash_new_path":
+        replacement = original.with_name("another-codex-location")
+        replacement.write_bytes(original.read_bytes())
+        replacement.chmod(0o700)
+        config.codex_binary = str(replacement)
+    else:
+        config.codex_sha256 = "0" * 64
+    monkeypatch.setattr(
+        browser.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("status must not execute a dependency"),
+    )
+    result = browser.status(config)
+    assert not result["installed"] and not result["native_verified"]
+    assert "Codex" in result["error"]
+
+
+def test_install_reverifies_same_codex_bytes_at_a_new_location(setup, monkeypatch):
+    config, arguments, calls = setup
+    browser.install(config, **arguments)
+    replacement = Path(config.codex_binary).with_name("another-codex-location")
+    replacement.write_bytes(Path(config.codex_binary).read_bytes())
+    replacement.chmod(0o700)
+    config.codex_binary = str(replacement)
+    verified = []
+
+    def verify(binary, _settings):
+        verified.append(binary)
+        return {"status": "passed", "model_calls": 0, "remaining_owned_processes": []}
+
+    monkeypatch.setattr(browser, "verify", verify)
+    result = browser.install(config, **arguments)
+    assert result["installed"] and result["native_verified"]
+    assert verified == [replacement]
+    assert len([call for call in calls if isinstance(call, list)]) == 2
+
+
+def test_codex_changed_during_verification_preserves_configuration(setup, monkeypatch):
+    config, arguments, _ = setup
+    path = config.codex_home / "config.toml"
+    original = path.read_bytes()
+
+    def verify(binary, _settings):
+        binary.write_text('#!/bin/sh\nprintf "changed during verification\\n"\n')
+        return {"status": "passed", "model_calls": 0, "remaining_owned_processes": []}
+
+    monkeypatch.setattr(browser, "verify", verify)
+    with pytest.raises((RuntimeError, ValueError), match="Codex|artifacts changed"):
+        browser.install(config, **arguments)
+    assert path.read_bytes() == original
+    assert not (config.root / "state/browser.json").exists()
+
+
 @pytest.mark.parametrize(
     "existing",
     ['[mcp_servers.alice_browser]\ncommand="operator-owned"\n', 'mcp_servers="invalid"\n'],

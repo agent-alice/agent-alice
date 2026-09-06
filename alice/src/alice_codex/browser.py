@@ -103,6 +103,15 @@ def _artifact_digest(root):
     return digest.hexdigest()
 
 
+def _codex_identity(config):
+    """Bind native evidence to the executable bytes and their installation path."""
+    path = Path(config.codex_binary)
+    actual = sha256_file(path)
+    if actual != config.codex_sha256:
+        raise ValueError("Codex executable differs from its configured hash")
+    return {"path": str(path.absolute()), "resolved_path": str(path.resolve()), "sha256": actual}
+
+
 def status(config) -> dict:
     """Read installed state and current hashes; never install, repair or execute."""
     result = {"installed": False, "native_verified": False, "server": SERVER}
@@ -116,6 +125,8 @@ def status(config) -> dict:
             raise ValueError("Browser installation path is outside its managed root")
         if current != manifest["settings"]:
             raise ValueError("Browser MCP configuration changed since verification")
+        if _codex_identity(config) != manifest.get("codex"):
+            raise ValueError("Codex installation changed or lacks matching browser verification")
         for name in ("node", "npm_cli", "browser"):
             entry = manifest[name]
             if sha256_file(Path(entry["path"])) != entry["sha256"]:
@@ -213,6 +224,7 @@ def install(config, *, node: Path, npm_cli: Path, browser_executable: Path) -> d
     """Install and verify before configuring; refuse running/uncertain services."""
     config.validate()
     config.verify_binary()
+    codex = _codex_identity(config)
     if config.root != config.root.resolve():
         raise ValueError("Browser installation requires a canonical Alice home")
     _directory(config.root / "state")
@@ -315,13 +327,14 @@ def install(config, *, node: Path, npm_cli: Path, browser_executable: Path) -> d
                 )
             if _artifact_digest(final) != artifact or any(
                 sha256_file(inputs[name]) != value["sha256"] for name, value in dependencies.items()
-            ):
+            ) or _codex_identity(config) != codex:
                 raise RuntimeError(
                     "Browser artifacts changed during verification; original config preserved"
                 )
             manifest = {
                 "version": VERSION,
                 "server": SERVER,
+                "codex": codex,
                 **dependencies,
                 "runtime_root": str(final),
                 "artifact_sha256": artifact,

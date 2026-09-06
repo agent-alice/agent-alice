@@ -34,6 +34,37 @@ async def _processes():
     return result
 
 
+def _remember_owned(snapshot, root_pid, root_birth, owned):
+    """Expand only from the original live root; never replace a recorded birth."""
+    root = snapshot.get(root_pid)
+    if root_birth is None or root is None or root[3] != root_birth:
+        return
+    found = {root_pid}
+    while True:
+        expanded = found | {
+            pid
+            for pid, item in snapshot.items()
+            if (pid not in owned or owned[pid] == item[3])
+            and (item[0] in found or item[1] == root_pid)
+        }
+        if expanded == found:
+            break
+        found = expanded
+    for pid in found & snapshot.keys():
+        owned.setdefault(pid, snapshot[pid][3])
+
+
+def _remaining_owned(snapshot, owned):
+    """A reused PID is not an owned process, even when its old parent was ours."""
+    return [
+        pid
+        for pid, birth in owned.items()
+        if pid in snapshot
+        and snapshot[pid][3] == birth
+        and not snapshot[pid][2].startswith("Z")
+    ]
+
+
 def verify(codex: Path, settings: dict) -> dict:
     """No inference or account access; callers invoke this synchronous API off-loop."""
     return asyncio.run(_verify(codex, settings))
@@ -44,6 +75,7 @@ async def _verify(codex, settings):
     record = {"status": "failed", "model_calls": 0, "snapshots": [], "requests": []}
     owned, peers = {}, set()
     process = rpc = client = None
+    root_birth = None
     identity = None
     closed = False
 
@@ -75,16 +107,7 @@ async def _verify(codex, settings):
 
     async def remember():
         snapshot = await _processes()
-        found = {process.pid}
-        while True:
-            expanded = found | {
-                pid for pid, item in snapshot.items() if item[0] in found or item[1] == process.pid
-            }
-            if expanded == found:
-                break
-            found = expanded
-        for pid in found & snapshot.keys():
-            owned[pid] = snapshot[pid][3]
+        _remember_owned(snapshot, process.pid, root_birth, owned)
         return snapshot
 
     http = await asyncio.start_server(page, "127.0.0.1", 0)
@@ -119,6 +142,11 @@ async def _verify(codex, settings):
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
+                initial = await _processes()
+                if process.returncode is not None or process.pid not in initial:
+                    raise RuntimeError("Owned verification server exited before identity capture")
+                root_birth = initial[process.pid][3]
+                _remember_owned(initial, process.pid, root_birth, owned)
                 while not socket.exists():
                     if process.returncode is not None:
                         raise RuntimeError("Owned browser verification server exited before ready")
@@ -250,11 +278,7 @@ async def _verify(codex, settings):
             except Exception:
                 state = {}
                 cleanup_errors.append("process_inventory_after_exit")
-            remaining = [
-                pid
-                for pid, birth in owned.items()
-                if pid in state and state[pid][3] == birth and not state[pid][2].startswith("Z")
-            ]
+            remaining = _remaining_owned(state, owned)
             for pid in remaining:
                 try:
                     os.kill(pid, signal.SIGKILL)
@@ -266,13 +290,7 @@ async def _verify(codex, settings):
                 except Exception:
                     cleanup_errors.append("process_inventory_after_cleanup")
                     break
-                remaining = [
-                    pid
-                    for pid in remaining
-                    if pid in state
-                    and state[pid][3] == owned[pid]
-                    and not state[pid][2].startswith("Z")
-                ]
+                remaining = _remaining_owned(state, {pid: owned[pid] for pid in remaining})
                 if not remaining:
                     break
                 await asyncio.sleep(0.05)
