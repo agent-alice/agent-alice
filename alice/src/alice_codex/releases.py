@@ -371,12 +371,26 @@ class ReleaseManager:
             digest.update(b"\0")
         return digest.hexdigest()
 
+    def _runtime_codex_binary(self, manifest: dict) -> Path:
+        config_path = self.home / "config.json"
+        if not config_path.exists():
+            return Path(manifest["codex_binary"])
+        from .config import load_config
+
+        try:
+            config = load_config(self.home)
+        except (OSError, ValueError) as error:
+            raise ReleaseError(f"runtime config is invalid: {error}") from error
+        if config.codex_sha256 != manifest["codex_sha256"]:
+            raise ReleaseError("runtime config expects a different Codex binary")
+        return Path(config.codex_binary)
+
     def _assert_unchanged(self, candidate: Path, manifest: dict) -> None:
         if Path(manifest["wheel"]).name != manifest["wheel"]:
             raise ReleaseError("invalid wheel path in manifest")
         if sha256_file(candidate / manifest["wheel"]) != manifest["wheel_sha256"]:
             raise ReleaseError("candidate wheel changed after staging")
-        if sha256_file(Path(manifest["codex_binary"])) != manifest["codex_sha256"]:
+        if sha256_file(self._runtime_codex_binary(manifest)) != manifest["codex_sha256"]:
             raise ReleaseError("pinned Codex binary changed")
         if self._environment_fingerprint(candidate) != manifest["environment_fingerprint"]:
             raise ReleaseError("installed candidate or dependency environment changed")
@@ -410,7 +424,7 @@ class ReleaseManager:
             # subprocesses use the candidate interpreter with -I instead.
             env["PYTHONPATH"] = str(source / "src")
             env["ALICE_ARTIFACT_PYTHON"] = str(self._python(candidate))
-            env["ALICE_TEST_CODEX_BINARY"] = manifest["codex_binary"]
+            env["ALICE_TEST_CODEX_BINARY"] = str(self._runtime_codex_binary(manifest))
             python = manifest["verification_python"]
             static_paths = [name for name in ("src", "tests", "tools") if (source / name).exists()]
             commands: list[tuple[str, list[str], Path | None]] = [
@@ -559,9 +573,8 @@ class ReleaseManager:
                 )
         config_path = self.home / "config.json"
         if config_path.exists():
-            config = read_json(config_path)
-            if config.get("codex_sha256") != manifest["codex_sha256"]:
-                raise ReleaseError("candidate was verified against a different Codex binary")
+            if sha256_file(self._runtime_codex_binary(manifest)) != manifest["codex_sha256"]:
+                raise ReleaseError("runtime pinned Codex binary changed")
 
     def current(self) -> dict[str, Any] | None:
         path = self.root / "current.json"
@@ -570,6 +583,16 @@ class ReleaseManager:
         value = read_json(path)
         if not isinstance(value, dict) or "current" not in value:
             raise ReleaseError("invalid active release pointer")
+        if not isinstance(value["current"], str) or not re.fullmatch(
+            r"[0-9a-f]{16}-[0-9a-f]{12}", value["current"]
+        ):
+            raise ReleaseError("invalid active candidate id")
+        epoch = value.get("activation_epoch")
+        if epoch is not None and (
+            not isinstance(epoch, str)
+            or not re.fullmatch(r"[0-9a-f]{32}|legacy:[0-9a-f]{16}-[0-9a-f]{12}", epoch)
+        ):
+            raise ReleaseError("invalid activation epoch")
         return value
 
     def checked_current(self, *, data_schema: int | None = None) -> dict[str, Any] | None:
@@ -585,6 +608,8 @@ class ReleaseManager:
             "python": str(self._python(candidate)),
             "wheel_sha256": manifest["wheel_sha256"],
         }
+        if "activation_epoch" in pointer:
+            canonical["activation_epoch"] = pointer["activation_epoch"]
         if (
             pointer.get("python") != canonical["python"]
             or pointer.get("wheel_sha256") != canonical["wheel_sha256"]
@@ -598,11 +623,16 @@ class ReleaseManager:
             candidate, manifest = self._verified(candidate_id)
             self._check_data_schema(manifest, data_schema)
             old = self.current()
-            if old is not None and old["current"] == candidate_id:
-                return old
             pointer = {
                 "current": candidate_id,
-                "previous": old["current"] if old else None,
+                "previous": (
+                    old.get("previous")
+                    if old and old["current"] == candidate_id
+                    else old["current"]
+                    if old
+                    else None
+                ),
+                "activation_epoch": uuid4().hex,
                 "python": str(self._python(candidate)),
                 "wheel_sha256": manifest["wheel_sha256"],
             }
@@ -620,6 +650,42 @@ class ReleaseManager:
             pointer = {
                 "current": old["previous"],
                 "previous": old["current"],
+                "activation_epoch": uuid4().hex,
+                "python": str(self._python(candidate)),
+                "wheel_sha256": manifest["wheel_sha256"],
+            }
+            write_json(self.root / "current.json", pointer)
+            return pointer
+
+    def automatic_rollback(
+        self,
+        expected_current: str,
+        failed_candidates: set[str],
+        *,
+        expected_epoch: str | None = None,
+    ) -> dict[str, Any]:
+        """One conditional fallback within the same explicit activation epoch.
+
+        The failed set is durable supervisor state. Keeping the epoch and failed
+        candidate prevents a restart from bouncing between A and B. This never
+        restores old data and never trusts the failed current environment.
+        """
+        with SingletonLock(self.root / ".switch.lock"):
+            old = self.current()
+            if old is None or old["current"] != expected_current:
+                raise ReleaseError("active candidate changed during startup recovery")
+            epoch = old.get("activation_epoch", "legacy:" + old["current"])
+            if expected_epoch is not None and epoch != expected_epoch:
+                raise ReleaseError("activation epoch changed during startup recovery")
+            previous = old.get("previous")
+            if not previous or previous in failed_candidates or previous == expected_current:
+                raise ReleaseError("no unfailed previous candidate is available")
+            candidate, manifest = self._verified(previous)
+            self._check_data_schema(manifest, None)
+            pointer = {
+                "current": previous,
+                "previous": expected_current,
+                "activation_epoch": epoch,
                 "python": str(self._python(candidate)),
                 "wheel_sha256": manifest["wheel_sha256"],
             }

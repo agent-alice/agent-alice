@@ -155,9 +155,70 @@ async def running(config) -> dict | None:
 
 
 async def start(config) -> dict:
-    status = await running(config)
-    if status:
+    from .control import ControlError
+
+    supervised = (config.root / "state/supervisor.json").exists()
+
+    async def observe():
+        try:
+            return await running(config)
+        except ControlError:
+            # An installed supervisor can reconcile an interrupted status read
+            # using owned process identities. Do not weaken running(), which also
+            # guards offline data writes, or tolerate unknown mutation outcomes.
+            if supervised:
+                return None
+            raise
+
+    status = await observe()
+    if status and status.get("ready"):
         return status
+    if supervised:
+        from .launchd import start as start_supervisor
+        from .launchd import status as supervisor_status
+
+        # The stable supervisor must be allowed to recover a damaged current
+        # candidate before resolving the runtime interpreter or writing MCP config.
+        await asyncio.to_thread(start_supervisor, config)
+        deadline = time.monotonic() + 180
+        next_supervisor_check = 0
+        while time.monotonic() < deadline:
+            status = await observe()
+            if status and status.get("ready"):
+                return status
+            if time.monotonic() >= next_supervisor_check:
+                supervision = await asyncio.to_thread(supervisor_status, config)
+                state = supervision.get("supervisor") or {}
+                if state.get("lifecycle") == "blocked":
+                    raise RuntimeError(
+                        "Supervisor could not start a compatible verified release; "
+                        "inspect service status and private launchd.log"
+                    )
+                next_supervisor_check = time.monotonic() + 1
+            await asyncio.sleep(0.2)
+        raise TimeoutError("User service startup unconfirmed; inspect private launchd.log")
+    from .files import SingletonLock
+
+    with SingletonLock(config.root / "state/lifecycle.lock"):
+        return await _start_unsupervised(config)
+
+
+async def _start_unsupervised(config) -> dict:
+    # Serialize process creation with release switching, including the interval
+    # before the daemon has acquired service.lock or created a control socket.
+    status = await running(config)
+    if status and status.get("ready"):
+        return status
+    if status:
+        # Another caller already started the daemon. A responsive control socket
+        # is not readiness, and launching a second daemon cannot fix initialization.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            status = await running(config)
+            if status and status.get("ready"):
+                return status
+            await asyncio.sleep(0.1)
+        raise TimeoutError("Existing service has not become ready; inspect private log")
     log_path = config.root / "logs/alice-service.log"
     from .releases import ReleaseManager
 
@@ -165,16 +226,6 @@ async def start(config) -> dict:
     python = release["python"] if release else sys.executable
     # MCP must use exactly the runtime being started, not a development venv.
     config.write_codex_config(python=python)
-    if (config.root / "state/supervisor.json").exists():
-        from .launchd import start as start_supervisor
-
-        start_supervisor(config)
-        for _ in range(300):
-            status = await running(config)
-            if status and status.get("ready"):
-                return status
-            await asyncio.sleep(0.1)
-        raise TimeoutError("User service startup unconfirmed; inspect private launchd.log")
     with log_path.open("ab", buffering=0) as log:
         child = subprocess.Popen(
             [python, "-m", "alice_codex", "--home", config.home, "serve"],
@@ -333,6 +384,22 @@ async def execute(args) -> dict | None:
                 "last_state": read_json(state) if state.exists() else None,
             }
     if args.command == "stop":
+        if (config.root / "state/supervisor.json").exists():
+            from .control import ControlError
+            from .launchd import stop as stop_supervisor
+
+            # A failed or starting candidate may not expose a usable control
+            # socket. The supervisor still owns and must confirm process cleanup.
+            try:
+                status = await running(config)
+                if status:
+                    await request(config.control_socket, "shutdown", timeout=5)
+            except (OSError, TimeoutError, ControlError):
+                pass
+            result = await asyncio.to_thread(stop_supervisor, config)
+            if not isinstance(result, dict) or result.get("stopped") is not True:
+                raise RuntimeError("Supervisor has not confirmed owned process shutdown")
+            return result
         status = await running(config)
         if not status:
             # Do not claim a crashed daemon's orphaned server was stopped.
@@ -503,12 +570,28 @@ async def execute(args) -> dict | None:
             return {"candidate_id": releases.build(args.source, codex_binary=config.codex_binary)}
         if args.operation == "verify":
             return releases.verify(args.candidate_id, native=args.native, live=args.live)
-        if args.operation in {"activate", "rollback"} and await running(config):
-            raise ValueError("Stop the service before switching its release")
-        if args.operation == "activate":
-            return releases.activate(args.candidate_id)
-        if args.operation == "rollback":
-            return releases.rollback()
+        if args.operation in {"activate", "rollback"}:
+            from .files import SingletonLock
+            from .launchd import _assert_owned_stopped, status as supervisor_status
+
+            # Socket absence does not prove that startup/cleanup is idle. The
+            # same lifecycle lock guards launchd transitions and direct start;
+            # owner locks cover a running or interrupted supervisor/daemon.
+            with (
+                SingletonLock(config.root / "state/lifecycle.lock"),
+                SingletonLock(config.root / "state/bootstrap.lock"),
+                SingletonLock(config.root / "state/service.lock"),
+            ):
+                if (config.root / "state/supervisor.json").exists():
+                    supervision = await asyncio.to_thread(supervisor_status, config)
+                    if supervision["loaded"]:
+                        raise ValueError("Stop the installed supervisor before switching its release")
+                _assert_owned_stopped(config)
+                if await running(config):
+                    raise ValueError("Stop the service before switching its release")
+                if args.operation == "activate":
+                    return releases.activate(args.candidate_id)
+                return releases.rollback()
         return releases.current()
     if args.command == "service":
         from . import launchd
