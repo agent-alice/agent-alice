@@ -30,6 +30,10 @@ token 可能早于 `thread/start` 返回，或早于宿主成功保存线程 ali
 
 资源 listener 保留至 native 停止及 RPC 关闭，确保停机尾部通知仍归原代。账本按 epoch+payload 去重，`last` 和上下文大小不追加到累计量；第一份累计快照是未知消费基线，金额凭证保持独立、虚拟预算保持禁用。
 
+停机开始时固定本次 RPC、CodexClient、自有进程和启动 epoch 引用。`stop_tree` 或归档失败后仍先停止并等待自有进程；SIGTERM 等待沿用 10 秒上限，必要时 SIGKILL 并回收。确认进程退出后，再等待该 RPC 的既有读取任务最多 1 秒，期间保留资源 listener 及原生 ancestry listener，允许 socket 中尚未处理的子代归属和累计快照入账；之后才关闭 listener 与连接。新连接替换 Service 字段不能改变这次清理的对象。
+
+`RpcClient.wait_reader_closed(*, timeout) -> bool` 只等待既有读取任务，不建立第二个通知队列。有限非负超时到期返回 false 且不取消 reader；外部取消向上传播，Service 的 finally 仍关闭本次连接。若取消发生在进程回收期间，受保护的清理任务会对该自有进程升级 SIGKILL、确认退出，再完成有界尾部读取及关闭后传播取消。true 只表示 reader 已结束，包括 EOF、传输错误或已取消，不能证明原生历史完整。尾部超时或等待错误会保留 Service 错误状态，并尽力将不含消息内容的固定诊断写入私有 server 日志；诊断写入失败不阻挡清理。不把未观察区间记为零，不因等通知而延误进程回收。
+
 ## 兼容、回退与验证
 
 这是显式协调的 additive runtime 字段扩展，不重新编号已有 ID，不覆盖旧 token。模块常量 `alice_codex.service.RESOURCE_EPOCH_CAPABILITY = 1` 声明此 Service 理解 prepared/bound/aborted 的启动语义。**此声明本身不是激活或回退门槛**；发布负责人另行从已安装候选读取能力并接线拒绝逻辑，缺失声明视为 0，未知或损坏的数据也须拒绝。组合验证完成前不声称安全回退。

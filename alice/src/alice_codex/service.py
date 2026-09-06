@@ -46,6 +46,8 @@ from .store import DispatchReceipt, Store
 # Release guards must inspect the installed candidate, not infer compatibility
 # from runtime.version or ResourceLedger's schema alone.
 RESOURCE_EPOCH_CAPABILITY = 1
+RESOURCE_SHUTDOWN_DRAIN_TIMEOUT = 1.0
+NATIVE_SHUTDOWN_TERM_TIMEOUT = 10.0
 
 
 def validate_resource_epoch_journal(state: dict) -> None:
@@ -599,6 +601,12 @@ class Service:
                 await self._shutdown(log)
 
     async def _shutdown(self, log) -> None:
+        # Shutdown must retain this epoch's transport and ancestry listener,
+        # even if a later connection replaces the Service's current fields.
+        rpc, codex, process = self.rpc, self.codex, self.process
+        starting_epoch = self._starting_resource_epoch
+        spawn_attempted = self._spawn_attempted
+        cancelled_while_reaping = False
         try:
             # Shutdown never means that externally published work was undone.
             try:
@@ -607,44 +615,88 @@ class Service:
                 self.save()
             except Exception as error:
                 self.error = f"Pause persistence failed: {type(error).__name__}"
-            if self.codex:
+            if codex:
                 for key in list(self.state["tasks"]):
                     try:
-                        await self._stop_task(key, timeout=8)
+                        await self._stop_task(key, codex=codex, timeout=8)
                     except Exception as error:
                         self.error = (
                             f"Shutdown required owned-server termination: {type(error).__name__}"
                         )
-                if self.journal:
+                if self.journal and self.rpc is rpc and self.codex is codex:
                     await self.archive_native_history("shutdown")
-                self.codex.close()
         finally:
             try:
-                if self.rpc:
-                    with suppress(Exception):
-                        await self.rpc.close()
-                if self.process and self.process.returncode is None:
-                    with suppress(ProcessLookupError):
-                        os.killpg(self.process.pid, signal.SIGTERM)
+                try:
+                    if process and process.returncode is None:
+
+                        async def terminate_owned_child():
+                            with suppress(ProcessLookupError):
+                                os.killpg(process.pid, signal.SIGTERM)
+                            try:
+                                await asyncio.wait_for(process.wait(), NATIVE_SHUTDOWN_TERM_TIMEOUT)
+                            except TimeoutError:
+                                with suppress(ProcessLookupError):
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                await process.wait()
+
+                        termination = asyncio.create_task(terminate_owned_child())
+                        while True:
+                            try:
+                                await asyncio.shield(termination)
+                                break
+                            except asyncio.CancelledError:
+                                if termination.cancelled():
+                                    raise
+                                # Cancellation cannot orphan the child by
+                                # cancelling its only wait. Escalate this owned
+                                # process, finish reaping, then propagate below.
+                                cancelled_while_reaping = True
+                                if process.returncode is None:
+                                    with suppress(ProcessLookupError):
+                                        os.killpg(process.pid, signal.SIGKILL)
+                    # The OS child is already reaped. Buffered frames can still
+                    # be waiting for the RPC reader; leave both listeners alive
+                    # until that reader finishes or this bounded wait expires.
+                    if rpc:
+                        try:
+                            drained = await rpc.wait_reader_closed(
+                                timeout=RESOURCE_SHUTDOWN_DRAIN_TIMEOUT
+                            )
+                            reason = None if drained else "Native notification tail drain timed out"
+                        except Exception as error:
+                            reason = (
+                                f"Native notification tail drain failed: {type(error).__name__}"
+                            )
+                        if reason:
+                            self.error = f"{self.error}; {reason}" if self.error else reason
+                            # A fixed, content-free diagnostic remains in the
+                            # private server log after this Service exits.
+                            with suppress(OSError):
+                                log.write(f"Alice resource shutdown: {reason}\n".encode())
+                finally:
                     try:
-                        await asyncio.wait_for(self.process.wait(), 10)
-                    except TimeoutError:
-                        with suppress(ProcessLookupError):
-                            os.killpg(self.process.pid, signal.SIGKILL)
-                        await self.process.wait()
+                        if codex:
+                            codex.close()
+                    finally:
+                        if rpc:
+                            with suppress(Exception):
+                                await rpc.close()
                 self.state["lifecycle"] = "stopped"
                 self.state["server"] = None
-                epoch = self.state.get("resource_epochs", {}).get(self._starting_resource_epoch)
+                epoch = self.state.get("resource_epochs", {}).get(starting_epoch)
                 if (
                     epoch
                     and epoch["state"] == "prepared"
                     and (
-                        not self._spawn_attempted
-                        or (self.process is not None and self.process.returncode is not None)
+                        not spawn_attempted
+                        or (process is not None and process.returncode is not None)
                     )
                 ):
                     epoch["state"] = "aborted"
                 self.save()
+                if cancelled_while_reaping:
+                    raise asyncio.CancelledError
             finally:
                 try:
                     self.config.control_socket.unlink(missing_ok=True)
