@@ -252,13 +252,6 @@ class RuntimeConfig:
             "web_search": "live",
         }.items():
             document[key] = value
-        if identity is not None:
-            previous = document.get("developer_instructions")
-            if previous is not None and not str(previous).startswith(IDENTITY_HEADER):
-                raise ValueError(
-                    "Custom developer instructions conflict with managed identity; original preserved"
-                )
-            document["developer_instructions"] = identity.developer_instructions
         # Migrate only settings managed by the former Alice generator. Keep
         # additional legacy fields and other named profiles for explicit use;
         # native default_permissions selects the Alice profile for this runtime.
@@ -304,27 +297,7 @@ class RuntimeConfig:
             "respect_system_proxy": True,
         }.items():
             features[key] = value
-        features["hooks"] = True
-        hooks = _table(document, "hooks")
-        for event, groups in self.identity_hooks(python=python).items():
-            current_groups = hooks.get(event, [])
-            if not isinstance(current_groups, list):
-                raise ValueError("Invalid hook configuration; original file preserved")
-            retained = []
-            for group in current_groups:
-                if not isinstance(group, MutableMapping) or not isinstance(
-                    group.get("hooks"), list
-                ):
-                    raise ValueError("Invalid hook group; original file preserved")
-                handlers = [
-                    handler for handler in group["hooks"] if not is_owned_identity_handler(handler)
-                ]
-                if handlers:
-                    if len(handlers) != len(group["hooks"]):
-                        group["hooks"] = handlers
-                    retained.append(group)
-            if current_groups != retained + groups:
-                hooks[event] = retained + groups
+        self._merge_identity_config(document, python=python, identity=identity)
         server = _table(document, "mcp_servers", "alice")
         if "url" in server:
             raise ValueError(
@@ -361,6 +334,65 @@ class RuntimeConfig:
             raise ValueError("Codex configuration changed during update; concurrent edit preserved")
         if rendered != original:
             atomic_write(path, rendered)
+
+    def write_identity_config(self, identity: IdentityBundle, *, python: str | None = None) -> None:
+        """Refresh identity on direct serve without repairing unrelated configuration.
+
+        Initialization and the launcher coordinate the full Alice configuration.
+        Service itself must preserve an explicitly broken required MCP so native
+        initialization can fail visibly instead of silently replacing its command.
+        """
+        self.validate()
+        path = self.codex_home / "config.toml"
+        if self.codex_home.is_symlink() or path.is_symlink():
+            raise ValueError("Managed Codex configuration cannot be a symlink; original preserved")
+        original = path.read_bytes()
+        try:
+            document = tomlkit.parse(original.decode("utf-8"))
+        except (UnicodeError, ParseError) as error:
+            raise ValueError("Invalid Codex TOML; original file preserved") from error
+        self._merge_identity_config(document, python=python or sys.executable, identity=identity)
+        rendered = tomlkit.dumps(document).encode("utf-8")
+        try:
+            tomllib.loads(rendered.decode("utf-8"))
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError("Merged Codex TOML is invalid; original file preserved") from error
+        if self.codex_home.is_symlink() or path.is_symlink() or path.read_bytes() != original:
+            raise ValueError("Codex configuration changed during update; concurrent edit preserved")
+        if rendered != original:
+            atomic_write(path, rendered)
+
+    def _merge_identity_config(
+        self, document: MutableMapping, *, python: str, identity: IdentityBundle | None
+    ) -> None:
+        if identity is not None:
+            previous = document.get("developer_instructions")
+            if previous is not None and not str(previous).startswith(IDENTITY_HEADER):
+                raise ValueError(
+                    "Custom developer instructions conflict with managed identity; original preserved"
+                )
+            document["developer_instructions"] = identity.developer_instructions
+        _table(document, "features")["hooks"] = True
+        hooks = _table(document, "hooks")
+        for event, groups in self.identity_hooks(python=python).items():
+            current_groups = hooks.get(event, [])
+            if not isinstance(current_groups, list):
+                raise ValueError("Invalid hook configuration; original file preserved")
+            retained = []
+            for group in current_groups:
+                if not isinstance(group, MutableMapping) or not isinstance(
+                    group.get("hooks"), list
+                ):
+                    raise ValueError("Invalid hook group; original file preserved")
+                handlers = [
+                    handler for handler in group["hooks"] if not is_owned_identity_handler(handler)
+                ]
+                if handlers:
+                    if len(handlers) != len(group["hooks"]):
+                        group["hooks"] = handlers
+                    retained.append(group)
+            if current_groups != retained + groups:
+                hooks[event] = retained + groups
 
     def identity_hooks(self, *, python: str | None = None) -> dict:
         return identity_hook_groups(
