@@ -8,7 +8,7 @@ and supplied cache freshness checks. It does not prove origin revalidation,
 unrequested content, account-wide state, or completion of a business goal.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import hashlib
 import json
 import math
@@ -20,6 +20,7 @@ from .collector import _origin, collect_collection
 
 
 VALIDATOR_VERSION = "collector-summary-v1"
+HEARTBEAT_SOURCES_CONFIG_VERSION = 1
 
 
 def _digest(value) -> str:
@@ -143,6 +144,73 @@ class CollectionSpec:
                 "max_age_seconds": float(self.max_age_seconds),
             }
         )
+
+
+@dataclass(frozen=True)
+class HeartbeatSourceBinding:
+    """A validated host registration, separate from collected evidence."""
+
+    target: str
+    spec: CollectionSpec
+    wait_seconds: float
+
+
+def parse_heartbeat_sources(raw: object) -> tuple[HeartbeatSourceBinding, ...]:
+    """Parse host configuration without reading credentials or collecting data.
+
+    Absent configuration is distinct from a malformed configured source: the
+    latter must fail rather than silently restore unconfigured self-review.
+    JSON arrays are copied into immutable spec fields. URLs may contain business
+    filters; authentication belongs in header_env, not embedded URL credentials
+    or signed queries. A general URL parser cannot identify query secrets.
+    """
+    if raw is None:
+        return ()
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"version", "sources"}
+        or type(raw["version"]) is not int
+        or raw["version"] != HEARTBEAT_SOURCES_CONFIG_VERSION
+        or not isinstance(raw["sources"], list)
+    ):
+        raise ValueError("heartbeat_sources requires version 1 and a sources list")
+    bindings, targets = [], set()
+    spec_fields = {item.name for item in fields(CollectionSpec)}
+    for entry in raw["sources"]:
+        if not isinstance(entry, dict) or set(entry) != {"target", "wait_seconds", "spec"}:
+            raise ValueError("heartbeat source requires target, wait_seconds and spec")
+        target = _text(entry["target"], "heartbeat target", maximum=150)
+        if target == "new" or target.startswith(("summary:", "scheduled:")):
+            raise ValueError("heartbeat source requires a stable named target")
+        if target in targets:
+            raise ValueError("heartbeat source targets must be unique")
+        wait = _number(entry["wait_seconds"], "heartbeat wait_seconds")
+        if wait == 0:
+            raise ValueError("heartbeat wait_seconds must be positive")
+        raw_spec = entry["spec"]
+        if not isinstance(raw_spec, dict) or not set(raw_spec).issubset(spec_fields):
+            raise ValueError("heartbeat source spec requires only CollectionSpec fields")
+        values = dict(raw_spec)
+        if "required_metrics" in values:
+            if not isinstance(values["required_metrics"], list):
+                raise ValueError("heartbeat required_metrics must be a JSON list")
+            values["required_metrics"] = tuple(values["required_metrics"])
+        if "header_env" in values:
+            headers = values["header_env"]
+            if not isinstance(headers, list) or any(
+                not isinstance(pair, list) or len(pair) != 2 for pair in headers
+            ):
+                raise ValueError("heartbeat header_env must be a JSON list of two-item lists")
+            values["header_env"] = tuple(tuple(pair) for pair in headers)
+        try:
+            spec = CollectionSpec(**values)
+        except (TypeError, ValueError, OverflowError):
+            # Never interpolate configuration values or expose constructor errors
+            # that could contain a private URL or credential material.
+            raise ValueError("heartbeat source has invalid CollectionSpec fields") from None
+        targets.add(target)
+        bindings.append(HeartbeatSourceBinding(target=target, spec=spec, wait_seconds=float(wait)))
+    return tuple(bindings)
 
 
 class HostHeartbeatAdapter:

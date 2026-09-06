@@ -76,6 +76,7 @@ class RuntimeConfig:
     network_access: bool = True
     task_policy: dict | None = None
     version: int = CONFIG_VERSION
+    heartbeat_sources: dict | None = None
 
     @property
     def root(self) -> Path:
@@ -131,10 +132,17 @@ class RuntimeConfig:
 
     def save(self) -> None:
         self.validate()
-        write_json(self.root / "config.json", asdict(self))
+        value = asdict(self)
+        if self.heartbeat_sources is None:
+            value.pop("heartbeat_sources")
+        write_json(self.root / "config.json", value)
 
     def validate(self) -> None:
         from zoneinfo import ZoneInfo
+
+        from .heartbeat import parse_heartbeat_sources
+
+        parse_heartbeat_sources(self.heartbeat_sources)
 
         if self.version != CONFIG_VERSION:
             raise ValueError(f"Unsupported Alice config version {self.version}")
