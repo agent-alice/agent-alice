@@ -80,7 +80,12 @@ def create_server(home: Path) -> FastMCP:
 
     @server.tool()
     async def task_status(name: str = "main") -> dict:
-        """Read native task history/state and evidence. This does not start a turn."""
+        """Read native task history, evidence and persisted policy/usage/decision.
+
+        Limits may be not_configured on older runtimes. Waiting and exhausted are
+        host decisions, not verified business outcomes. This does not start a turn,
+        extend limits, clear usage or undo a persisted pause.
+        """
         return await call("task_status", target=name)
 
     @server.tool()
