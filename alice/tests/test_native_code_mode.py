@@ -14,7 +14,7 @@ import subprocess
 import pytest
 import tomlkit
 
-from alice_codex.config import initialize_config
+from alice_codex.config import initialize_config, load_config
 from alice_codex.rpc import RpcClient
 from alice_codex.runtime_bundle import verify_runtime_bundle
 
@@ -54,7 +54,31 @@ async def test_native_pinned_pair_executes_code_mode_read(tmp_path):
         if "ALICE_TEST_CODEX_BINARY" in os.environ:
             pytest.fail("Required native Codex executable is unavailable")
         pytest.skip("Native Codex executable is unavailable")
-    config = initialize_config(tmp_path / "alice", binary)
+    artifact = os.environ.get("ALICE_ARTIFACT_PYTHON")
+    if artifact:
+        # Release acceptance must exercise this exact installed package's init
+        # and pair-copy path, not the verifier's editable source implementation.
+        result = subprocess.run(
+            [
+                artifact,
+                "-I",
+                "-m",
+                "alice_codex",
+                "--home",
+                str(tmp_path / "alice"),
+                "init",
+                "--codex",
+                str(binary),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        assert result.returncode == 0, result.stderr
+        config = load_config(tmp_path / "alice")
+    else:
+        config = initialize_config(tmp_path / "alice", binary)
     pair = verify_runtime_bundle(config, require=True)
     assert Path(config.codex_binary) != binary.resolve(), "Exercise the installed copy"
     process_home = tmp_path / "process-home"
