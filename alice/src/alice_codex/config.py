@@ -75,6 +75,7 @@ class RuntimeConfig:
     max_active_tasks: int = 2
     sandbox: str = "workspace-write"
     network_access: bool = True
+    task_policy: dict | None = None
     version: int = CONFIG_VERSION
 
     @property
@@ -152,6 +153,15 @@ class RuntimeConfig:
             raise ValueError("Use a bounded read-only or workspace-write Alice runtime")
         if type(self.network_access) is not bool:
             raise ValueError("network_access must be an explicit boolean")
+        if self.task_policy is not None:
+            from .resources import TaskPolicy
+
+            if not isinstance(self.task_policy, dict):
+                raise ValueError("task_policy must be an explicit object or null")
+            try:
+                TaskPolicy(**self.task_policy)
+            except (TypeError, OverflowError) as error:
+                raise ValueError("task_policy requires exactly five valid limits") from error
         ZoneInfo(self.timezone)
 
     def verify_binary(self) -> None:
