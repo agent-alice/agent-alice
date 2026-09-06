@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from uuid import uuid4
 
 from . import __version__
 from .config import default_home, initialize_config, load_config
@@ -88,6 +89,9 @@ def parser() -> argparse.ArgumentParser:
     read.add_argument("--max-chars", type=int, default=32768)
     snapshot = memory.add_parser("snapshot")
     snapshot.add_argument("source", type=Path)
+    snapshot.add_argument(
+        "--snapshot-id", help="Reuse an existing ID to resume the same snapshot request"
+    )
     snapshot.add_argument("--previous")
     snapshot.add_argument("--final", action="store_true")
     snapshot.add_argument("--include-logs", action="store_true")
@@ -418,9 +422,27 @@ async def execute(args) -> dict | None:
             external = {}
             for value in args.external:
                 prefix, path = value.split("=", 1)
+                if prefix in external:
+                    raise ValueError("External archive source prefixes must be unique")
                 external[prefix] = Path(path)
+            snapshot_id = args.snapshot_id
+            if snapshot_id is None:
+                snapshot_id = time.strftime("%Y%m%dT%H%M%SZ-", time.gmtime()) + uuid4().hex[:8]
+            # Persisted archive/index recovery needs this ID even when the first
+            # command is interrupted or indexing fails before stdout is emitted.
+            print(
+                json.dumps(
+                    {
+                        "snapshot_id": snapshot_id,
+                        "recovery": "Reuse --snapshot-id with the same source and options to resume",
+                    }
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
             return memory.snapshot_legacy(
                 args.source,
+                snapshot_id=snapshot_id,
                 previous_snapshot_id=args.previous,
                 final=args.final,
                 include_logs=args.include_logs,
