@@ -59,7 +59,8 @@ def main():
                     "kind": "close",
                     "epoch_id": self.epoch_id,
                     **state(self),
-                    "pending_count": self.pending_count,
+                "pending_count": self.pending_count,
+                "observer_error": self.error,
                     "unresolved": [
                         {
                             "thread_id": params.get("threadId"),

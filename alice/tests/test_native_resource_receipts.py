@@ -63,6 +63,7 @@ def validate_native_resource_receipts(
         _require(epoch in coverage, "Unexpected native observation epoch")
         _require(epoch not in final, "Native observations continue after epoch close")
         if record.get("kind") == "close":
+            _require(record.get("observer_error") is None, "Native resource observer failed")
             _require(record.get("write_failures") == 0, "Native frame capture had write failures")
             _require(record.get("pending_count") == 0 and record.get("unresolved") == [],
                      "Native resource listener closed with unresolved observations")

@@ -261,12 +261,12 @@ class _ResourceEpochListener:
         self._resolver = None
         self._attempted = set()
         self._closing = self._closed = False
+        self.error = None
 
         # These closures capture this process's epoch/client, never the next
         # values of Service.rpc, Service.codex or runtime.json's active server.
-        self._record = lambda params: service.resources.record_token_usage(
-            params, epoch_id=epoch_id
-        )
+        ledger = service.resources
+        self._record = lambda params: ledger.record_token_usage(params, epoch_id=epoch_id)
         # Read-only view: share the captured client's native ancestry, but only
         # trust roots whose host aliases were durably saved. Call owns() only;
         # this view creates no listener and never performs control or close().
@@ -278,6 +278,15 @@ class _ResourceEpochListener:
     @property
     def pending_count(self):
         return len(self._pending)
+
+    def _fail(self, message):
+        self.error = self.error or message
+        # A stale failure is evidence about this observer; it cannot pause the
+        # replacement client's dispatch or write its lifecycle state.
+        if self._current():
+            prior = self._service.error
+            reason = f"{prior}; {self.error}" if prior and self.error not in prior else prior or self.error
+            self._service._fail(reason)
 
     def confirm_roots(self, roots):
         """Called only after the host has successfully saved these root aliases."""
@@ -318,7 +327,7 @@ class _ResourceEpochListener:
                 # or explicit history discovery, and fail on the existing cap.
                 pass
             except Exception:
-                self._service._fail("Native resource ancestry reconciliation failed")
+                self._fail("Native resource ancestry reconciliation failed")
                 return
             self.flush()
 
@@ -326,6 +335,7 @@ class _ResourceEpochListener:
         """After reader-tail drain, settle or cancel/await every captured read."""
         self._closing = True
         task = self._resolver
+        cancelled_during_cleanup = False
         try:
             if task is not None:
                 await asyncio.wait({task}, timeout=self.RECONCILE_CLOSE_TIMEOUT)
@@ -333,9 +343,21 @@ class _ResourceEpochListener:
             if task is not None:
                 if not task.done():
                     task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                cleanup = asyncio.gather(task, return_exceptions=True)
+                while True:
+                    try:
+                        await asyncio.shield(cleanup)
+                        break
+                    except asyncio.CancelledError:
+                        # Cancellation of close must not interrupt the request's
+                        # own cleanup or leave a callback able to write later.
+                        cancelled_during_cleanup = True
             self.flush()
+            if self._pending:
+                self._fail("Native resource observations remain unresolved at close")
             self._closed = True
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError
 
     def flush(self):
         if self._closed:
@@ -352,7 +374,7 @@ class _ResourceEpochListener:
                 # Retain this notification and the unprocessed suffix for a
                 # possible shutdown delivery; never discard a failed write.
                 self._pending = remaining + self._pending[index:]
-                self._service._fail("Native resource observations could not be persisted")
+                self._fail("Native resource observations could not be persisted")
                 return
         self._pending = remaining
         self._attempted.intersection_update(params.get("threadId") for params, _ in remaining)
@@ -387,7 +409,7 @@ class _ResourceEpochListener:
                 self._service._on_notification(event)
         except Exception:
             # RpcClient isolates listener exceptions; explicitly stop dispatch.
-            self._service._fail("Native resource observation buffer could not be preserved")
+            self._fail("Native resource observation buffer could not be preserved")
 
 
 class Service:
@@ -765,7 +787,14 @@ class Service:
                     try:
                         try:
                             if observer:
-                                await observer.close()
+                                try:
+                                    await observer.close()
+                                finally:
+                                    if observer.error:
+                                        with suppress(OSError):
+                                            log.write(
+                                                f"Alice resource shutdown: {observer.error}\n".encode()
+                                            )
                         finally:
                             if codex:
                                 codex.close()

@@ -7,6 +7,9 @@ do not. No native binary, model, account, or external endpoint is used.
 import asyncio
 from collections import Counter
 
+import pytest
+
+from alice_codex.resources import ResourceLedger
 from test_service_resource_epochs import attach, epoch_tokens, host as host, token
 
 
@@ -290,6 +293,153 @@ async def test_close_cancels_and_awaits_read_then_prevents_further_writes(host, 
         assert observer.pending_count == 1
     finally:
         cleanup.set()
+        if close is not None:
+            await asyncio.gather(close, return_exceptions=True)
+        await observer.close()
+
+
+async def test_old_worker_failure_does_not_stop_replacement_epoch(host):
+    old_epoch, old_rpc, _, old_observer = attach(host)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def old_read(method, params):
+        assert method == "thread/read"
+        entered.set()
+        await release.wait()
+        raise RuntimeError("synthetic old connection failure")
+
+    old_rpc.on_request = old_read
+    old_observer.start_reconciliation()
+    new_observer = None
+    try:
+        old_rpc.publish(token(20, thread="child"))
+        await asyncio.wait_for(entered.wait(), 1)
+        new_epoch, new_rpc, _, new_observer = attach(host)
+        release.set()
+        await asyncio.wait_for(asyncio.shield(old_observer._resolver), 1)
+        assert not host.stopping, "An old epoch's failed read stopped the replacement client"
+        assert not host.stop_event.is_set() and new_rpc.connected
+        assert old_observer.error and old_observer.pending_count == 1
+        assert epoch_tokens(host, old_epoch, "child") is None
+        new_rpc.publish(token(60))
+        assert epoch_tokens(host, new_epoch)["high_water"]["totalTokens"] == 60
+    finally:
+        release.set()
+        await old_observer.close()
+        if new_observer is not None:
+            await new_observer.close()
+
+
+async def test_old_callback_persistence_failure_does_not_stop_replacement_epoch(host, monkeypatch):
+    old_epoch, old_rpc, _, old_observer = attach(host)
+    new_epoch, new_rpc, _, new_observer = attach(host)
+    record = host.resources.record_token_usage
+
+    def fail_old_write(params, *, epoch_id):
+        if epoch_id == old_epoch:
+            raise OSError("synthetic old epoch persistence failure")
+        return record(params, epoch_id=epoch_id)
+
+    monkeypatch.setattr(host.resources, "record_token_usage", fail_old_write)
+    try:
+        old_rpc.publish(token(30))
+        assert not host.stopping, "An old epoch's failed write stopped the replacement client"
+        assert not host.stop_event.is_set() and new_rpc.connected
+        assert old_observer.error and old_observer.pending_count == 1
+        assert epoch_tokens(host, old_epoch) is None
+        new_rpc.publish(token(90))
+        assert epoch_tokens(host, new_epoch)["high_water"]["totalTokens"] == 90
+    finally:
+        await old_observer.close()
+        await new_observer.close()
+
+
+async def test_old_listener_keeps_captured_ledger_after_host_ledger_replacement(host):
+    old_epoch, old_rpc, _, old_observer = attach(host)
+    old_ledger = host.resources
+    host.resources = ResourceLedger(host.config.root / "state/replacement-resources.sqlite3")
+    new_epoch, new_rpc, _, new_observer = attach(host)
+    try:
+        old_rpc.publish(token(25))
+        new_rpc.publish(token(85))
+        old_tokens = old_ledger.status()["tokens"]["epochs"]
+        new_tokens = host.resources.status()["tokens"]["epochs"]
+        assert old_tokens[old_epoch]["root"]["high_water"]["totalTokens"] == 25
+        assert new_tokens[new_epoch]["root"]["high_water"]["totalTokens"] == 85
+        assert new_epoch not in old_tokens and old_epoch not in new_tokens
+    finally:
+        await old_observer.close()
+        await new_observer.close()
+
+
+@pytest.mark.parametrize("replace_client", [False, True])
+async def test_close_with_unresolved_observations_keeps_explicit_error(host, replace_client):
+    epoch, rpc, _, observer = attach(host)
+    rpc.publish(token(40, thread="unresolved"))
+    replacement = None
+    if replace_client:
+        new_epoch, new_rpc, _, replacement = attach(host)
+    try:
+        await observer.close()
+        assert observer.error, (
+            "Closing an unresolved buffer must not claim a clean observation tail"
+        )
+        assert observer.pending_count == 1 and epoch_tokens(host, epoch, "unresolved") is None
+        if replace_client:
+            assert not host.stopping and not host.stop_event.is_set()
+            new_rpc.publish(token(100))
+            assert epoch_tokens(host, new_epoch)["high_water"]["totalTokens"] == 100
+    finally:
+        await observer.close()
+        if replacement is not None:
+            await replacement.close()
+
+
+async def test_cancel_close_during_read_cleanup_seals_listener_and_finishes_worker(
+    host, monkeypatch
+):
+    epoch, rpc, codex, observer = attach(host)
+    entered, cancelling, finish_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    cleanup_done = asyncio.Event()
+
+    async def read(method, params):
+        assert method == "thread/read"
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelling.set()
+            try:
+                await finish_cleanup.wait()
+            finally:
+                cleanup_done.set()
+            raise
+
+    rpc.on_request = read
+    monkeypatch.setattr(observer, "RECONCILE_CLOSE_TIMEOUT", 0.03)
+    observer.start_reconciliation()
+    close = None
+    try:
+        rpc.publish(token(45, thread="child"))
+        await asyncio.wait_for(entered.wait(), 1)
+        close = asyncio.create_task(observer.close())
+        await asyncio.wait_for(cancelling.wait(), 1)
+        close.cancel()  # Interrupt close's own await of already-cancelling work.
+        await asyncio.sleep(0)
+        finish_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close, 1)
+        assert cleanup_done.is_set() and observer._resolver.done()
+        codex._on_event(activity("child"))
+        observer.receive(activity("child"))
+        observer.receive(token(99, thread="child"))
+        observer.flush()
+        assert epoch_tokens(host, epoch, "child") is None, (
+            "Cancelled close allowed a late ledger write"
+        )
+        assert observer.pending_count == 1 and observer.error
+    finally:
+        finish_cleanup.set()
         if close is not None:
             await asyncio.gather(close, return_exceptions=True)
         await observer.close()
