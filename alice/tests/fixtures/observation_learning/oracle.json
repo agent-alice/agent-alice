@@ -1,0 +1,207 @@
+{
+  "schema_version": 1,
+  "fixture_version": "observation-learning-v1",
+  "answers": {
+    "training-expired-cache": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 4,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-old-observation": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 13,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-explicit-truncation": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 8,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-permission-metadata": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 2,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-denied-empty": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 0,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-independent-scope": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 3,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-reused-source": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 5,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-independent-cache": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 7,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-missing-field": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 0,
+        "metrics.count.unknown_items": [
+          "missing"
+        ]
+      }
+    },
+    "unseen-invalid-field-shapes": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 3,
+        "metrics.count.unknown_items": [
+          "bool",
+          "negative",
+          "null",
+          "string"
+        ]
+      }
+    },
+    "unseen-missing-page": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 11,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-source-contradiction": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 9,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "unseen-browser-only-record": {
+      "gap_expected": true,
+      "checks": {
+        "complete": false,
+        "metrics.count.state": "unknown",
+        "metrics.count.value": null,
+        "metrics.count.observed_sum": 1,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "counterexample-true-zero": {
+      "gap_expected": false,
+      "checks": {
+        "complete": true,
+        "metrics.count.state": "known",
+        "metrics.count.value": 0,
+        "metrics.count.observed_sum": 0,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "counterexample-empty-collection": {
+      "gap_expected": false,
+      "checks": {
+        "complete": true,
+        "metrics.count.state": "known",
+        "metrics.count.value": 0,
+        "metrics.count.observed_sum": 0,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "counterexample-complete-pages": {
+      "gap_expected": false,
+      "checks": {
+        "complete": true,
+        "metrics.count.state": "known",
+        "metrics.count.value": 10,
+        "metrics.count.observed_sum": 10,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "counterexample-fresh-cache": {
+      "gap_expected": false,
+      "checks": {
+        "complete": true,
+        "metrics.count.state": "known",
+        "metrics.count.value": 12,
+        "metrics.count.observed_sum": 12,
+        "metrics.count.unknown_items": []
+      }
+    },
+    "counterexample-bound-readback": {
+      "gap_expected": false,
+      "checks": {
+        "status": "confirmed",
+        "retry_allowed": false,
+        "external_id": "fixture-object"
+      }
+    },
+    "unseen-readback-before-action": {
+      "gap_expected": true,
+      "checks": {
+        "status": "needs_reconciliation",
+        "retry_allowed": false,
+        "external_id": null
+      }
+    },
+    "unseen-http-success-only": {
+      "gap_expected": true,
+      "checks": {
+        "status": "needs_reconciliation",
+        "retry_allowed": false,
+        "external_id": null
+      }
+    }
+  }
+}
