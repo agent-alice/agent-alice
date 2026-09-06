@@ -324,9 +324,13 @@ class ReleaseManager:
                     "import json,sys,importlib.metadata as m; from alice_codex.store import Store; "
                     "from alice_codex.memory import MemoryStore; "
                     "from alice_codex.resources import ResourceLedger; "
+                    "import importlib,importlib.util; "
+                    "service=importlib.import_module('alice_codex.service') if "
+                    "importlib.util.find_spec('alice_codex.service') is not None else None; "
                     "print(json.dumps({'python':sys.version, 'schedule_schema':Store.SCHEMA_VERSION, "
                     "'memory_schema':MemoryStore.SCHEMA_VERSION, "
                     "'resource_schema':ResourceLedger.SCHEMA_VERSION, "
+                    "'resource_epoch_capability':getattr(service,'RESOURCE_EPOCH_CAPABILITY',0), "
                     "'packages':sorted((d.metadata['Name'],d.version) for d in m.distributions())}))",
                 ],
                 cwd=candidate,
@@ -336,6 +340,7 @@ class ReleaseManager:
             if probe.status != "passed":
                 raise ReleaseError(f"installed candidate cannot load its schema: {probe.output}")
             installed_metadata = json.loads(probe.output)
+            self._epoch_capability(installed_metadata)
             head = subprocess.run(
                 ["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True, timeout=10
             )
@@ -448,6 +453,42 @@ class ReleaseManager:
             raise ReleaseError("pinned Codex binary changed")
         if self._environment_fingerprint(candidate) != manifest["environment_fingerprint"]:
             raise ReleaseError("installed candidate or dependency environment changed")
+        if self._probe_epoch_capability(self._python(candidate), candidate) != self._epoch_capability(
+            manifest["installed"]
+        ):
+            raise ReleaseError("installed resource epoch capability does not match candidate metadata")
+
+    @staticmethod
+    def _epoch_capability(installed: dict) -> int:
+        """Missing legacy declarations mean no support, never inferred support."""
+        if not isinstance(installed, dict):
+            raise ReleaseError("invalid installed compatibility metadata")
+        value = installed.get("resource_epoch_capability", 0)
+        if type(value) is not int or value not in {0, 1}:
+            raise ReleaseError("unsupported or invalid resource epoch capability")
+        return value
+
+    def _probe_epoch_capability(self, python: Path, directory: Path) -> int:
+        result = run_check(
+            "installed-resource-epoch-capability",
+            [
+                str(python), "-I", "-c",
+                "import importlib,importlib.util,json; "
+                "service=importlib.import_module('alice_codex.service') if "
+                "importlib.util.find_spec('alice_codex.service') is not None else None; "
+                "print(json.dumps({'resource_epoch_capability':"
+                "getattr(service,'RESOURCE_EPOCH_CAPABILITY',0)}))",
+            ],
+            cwd=directory,
+            env=self._environment(directory / "compatibility-probe-home"),
+            timeout=30,
+        )
+        if result.status != "passed":
+            raise ReleaseError("installed resource epoch capability probe failed: " + result.output)
+        try:
+            return self._epoch_capability(json.loads(result.output))
+        except (TypeError, ValueError) as error:
+            raise ReleaseError("invalid installed resource epoch capability probe") from error
 
     def verify(
         self,
@@ -482,7 +523,11 @@ class ReleaseManager:
             # subprocesses use the candidate interpreter with -I instead.
             env["PYTHONPATH"] = str(source / "src")
             env["ALICE_ARTIFACT_PYTHON"] = str(self._python(candidate))
-            env["ALICE_TEST_CODEX_BINARY"] = str(self._runtime_codex_binary(manifest))
+            pair = self._candidate_pair(manifest)
+            env["ALICE_TEST_CODEX_BINARY"] = str(pair.binary)
+            env["ALICE_TEST_CODEX_SHA256"] = pair.binary_sha256
+            env["ALICE_TEST_CODEX_HOST_BINARY"] = str(pair.host)
+            env["ALICE_TEST_CODEX_HOST_SHA256"] = pair.host_sha256
             python = manifest["verification_python"]
             static_paths = [name for name in ("src", "tests", "tools") if (source / name).exists()]
             commands: list[tuple[str, list[str], Path | None]] = [
@@ -518,9 +563,9 @@ class ReleaseManager:
                         python,
                         "-m",
                         "pytest",
-                        "tests/test_artifact_smoke.py",
+                        "tests",
                         "-m",
-                        "not live and not native",
+                        "artifact and not live and not native",
                         "-q",
                     ],
                     candidate / "artifact.xml",
@@ -529,6 +574,10 @@ class ReleaseManager:
             if native:
                 if not (source / "tests/test_native_code_mode.py").is_file():
                     raise ReleaseError("required native Code Mode pair test is missing")
+                epoch_capability = self._epoch_capability(manifest["installed"])
+                epoch_test = "tests/test_native_service_resource_epochs.py"
+                if epoch_capability and not (source / epoch_test).is_file():
+                    raise ReleaseError("required native Service resource epoch test is missing")
                 commands.append(
                     (
                         "native",
@@ -538,8 +587,9 @@ class ReleaseManager:
                             "pytest",
                             "tests",
                             "--ignore=tests/test_native_code_mode.py",
+                            "--ignore=" + epoch_test,
                             "-m",
-                            "native and not live",
+                            "native and not live and not native_resource_epoch",
                             "-q",
                         ],
                         candidate / "native.xml",
@@ -560,6 +610,17 @@ class ReleaseManager:
                         candidate / "native-pair.xml",
                     )
                 )
+                if epoch_capability:
+                    commands.append(
+                        (
+                            "native_resource_epoch",
+                            [
+                                python, "-m", "pytest", epoch_test,
+                                "-m", "native and native_resource_epoch and not live", "-q",
+                            ],
+                            candidate / "native-resource-epoch.xml",
+                        )
+                    )
             if live:
                 commands.append(
                     (
@@ -589,6 +650,7 @@ class ReleaseManager:
             "codex_sha256": manifest["codex_sha256"],
             "codex_code_mode_host_sha256": manifest["codex_code_mode_host_sha256"],
             "environment_fingerprint": manifest["environment_fingerprint"],
+            "resource_epoch_capability": self._epoch_capability(manifest["installed"]),
             "native_required": native,
             "live_required": live,
             "checks": [asdict(result) for result in results],
@@ -618,6 +680,8 @@ class ReleaseManager:
         report = read_json(report_path)
         required = {"ruff", "unit", "artifact"}
         required.update({"native", "native_pair"})
+        if self._epoch_capability(manifest["installed"]):
+            required.add("native_resource_epoch")
         if report.get("live_required"):
             required.add("live")
         checks = report.get("checks", [])
@@ -634,6 +698,7 @@ class ReleaseManager:
             or report.get("candidate_id") != candidate_id
             or report.get("codex_sha256") != manifest["codex_sha256"]
             or report.get("codex_code_mode_host_sha256") != manifest["codex_code_mode_host_sha256"]
+            or self._epoch_capability(report) != self._epoch_capability(manifest["installed"])
         ):
             raise ReleaseError("candidate required checks did not all pass")
         return candidate, manifest
@@ -641,6 +706,7 @@ class ReleaseManager:
     def _check_data_schema(self, manifest: dict, requested: int | None) -> None:
         # These are database format guards, not a claim that every JSON/document
         # format or future migration can be reversed. No data is overwritten.
+        self._check_resource_epoch_compat(manifest)
         databases = {
             "schedule": self.home / "state/schedules.sqlite3",
             "memory": self.home / "memory-state/sources.sqlite3",
@@ -669,12 +735,54 @@ class ReleaseManager:
         if config_path.exists():
             self._configured_pair(manifest)
 
+    def _check_resource_epoch_compat(self, manifest: dict) -> None:
+        capability = self._epoch_capability(manifest["installed"])
+        path = self.home / "state/runtime.json"
+        if not path.exists():
+            return
+        if path.is_symlink():
+            raise ReleaseError("resource epoch runtime state must not be a symbolic link")
+        try:
+            state = read_json(path)
+            if not isinstance(state, dict):
+                raise ValueError("runtime state must be an object")
+            server = state.get("server")
+            present = "resource_epochs" in state or (
+                isinstance(server, dict) and "resource_epoch_id" in server
+            )
+            if not present:
+                return
+            if capability < 1:
+                raise ReleaseError("runtime resource epochs require an epoch-capable candidate")
+            if type(state.get("version")) is not int or state["version"] != 1:
+                raise ValueError("unsupported runtime state version with resource epochs")
+            # The same pure validator is owned by Service, so release checks
+            # cannot silently drift from the actual crash-recovery protocol.
+            from .service import validate_resource_epoch_journal
+
+            validate_resource_epoch_journal(state)
+        except (ImportError, OSError, TypeError, ValueError) as error:
+            raise ReleaseError(f"invalid resource epoch journal: {error}") from error
+
     def _check_bootstrap_policy(self, manifest: dict) -> None:
         if not (self.home / "state/supervisor.json").exists():
             return
         from .bootstrap import checked_runtime
 
-        bootstrap = checked_runtime(self.home)["manifest"]
+        runtime = checked_runtime(self.home)
+        bootstrap = runtime["manifest"]
+        bootstrap_capability = self._epoch_capability(bootstrap["installed"])
+        bootstrap_python = Path(runtime["python"])
+        if self._probe_epoch_capability(
+            bootstrap_python, bootstrap_python.parents[2]
+        ) != bootstrap_capability:
+            raise ReleaseError("installed bootstrap resource epoch capability metadata changed")
+        if bootstrap_capability < self._epoch_capability(manifest["installed"]):
+            # Reject before the first capable service can introduce its new
+            # journal under a supervisor whose copied code cannot recover it.
+            raise ReleaseError(
+                "stop and uninstall the previous supervisor before introducing resource epochs"
+            )
         if (
             bootstrap.get("release_policy_version") != self.POLICY_VERSION
             or bootstrap.get("codex_sha256") != manifest["codex_sha256"]
@@ -793,6 +901,7 @@ class ReleaseManager:
                 raise ReleaseError("no unfailed previous candidate is available")
             candidate, manifest = self._verified(previous)
             self._check_data_schema(manifest, None)
+            self._check_bootstrap_policy(manifest)
             pointer = {
                 "current": previous,
                 "previous": expected_current,

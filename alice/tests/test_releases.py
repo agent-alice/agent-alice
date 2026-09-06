@@ -16,7 +16,7 @@ from alice_codex.releases import ReleaseError, ReleaseManager, source_fingerprin
 from alice_codex.store import Store
 
 
-def make_wheel(path, version="0.0.1", value="good"):
+def make_wheel(path, version="0.0.1", value="good", *, resource_schema=1, epoch_capability=None):
     """A real minimal wheel: installation/entry execution need no network."""
     filename = path / f"alice_codex-{version}-py3-none-any.whl"
     info = f"alice_codex-{version}.dist-info"
@@ -24,12 +24,14 @@ def make_wheel(path, version="0.0.1", value="good"):
         "alice_codex/__init__.py": f'__version__ = "{version}"\n',
         "alice_codex/store.py": "class Store:\n    SCHEMA_VERSION = 1\n",
         "alice_codex/memory.py": "class MemoryStore:\n    SCHEMA_VERSION = 1\n",
-        "alice_codex/resources.py": "class ResourceLedger:\n    SCHEMA_VERSION = 1\n",
+        "alice_codex/resources.py": f"class ResourceLedger:\n    SCHEMA_VERSION = {resource_schema}\n",
         "alice_codex/probe.py": f'print("{value}")\n',
         "alice_codex/supervisor.py": "BOOTSTRAP_PROTOCOL = 1\n",
         f"{info}/METADATA": f"Metadata-Version: 2.1\nName: alice-codex\nVersion: {version}\n",
         f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: alice-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
     }
+    if epoch_capability is not None:
+        files["alice_codex/service.py"] = f"RESOURCE_EPOCH_CAPABILITY = {epoch_capability!r}\n"
     record = io.StringIO()
     writer = csv.writer(record)
     for name, text in files.items():
@@ -53,7 +55,7 @@ def project(tmp_path):
         "# Minimal test package has no runtime dependencies.\n"
     )
     (source / "pyproject.toml").write_text("""[tool.pytest.ini_options]
-markers = ["artifact: installed candidate", "native: real Codex", "live: model"]
+markers = ["artifact: installed candidate", "native: real Codex", "native_resource_epoch: Service epoch compatibility", "live: model"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
@@ -612,3 +614,21 @@ def test_runtime_verifies_private_pin_after_original_application_changes(
     )
     with pytest.raises(ReleaseError, match="manifest does not match|different Codex binary"):
         manager.checked_current()
+
+
+def test_additional_artifact_failure_cannot_be_omitted_from_gate(tmp_path, project):
+    (project[0] / "tests/test_secondary_artifact.py").write_text('''import pytest
+pytestmark = pytest.mark.artifact
+
+def test_additional_installed_entry_regression():
+    raise AssertionError("additional required artifact behavior failed")
+''')
+    manager, candidate = stage(tmp_path, project)
+    report = manager.verify(candidate, native=True)
+    checks = {item["name"]: item for item in report["checks"]}
+    assert checks["unit"]["status"] == "passed"
+    assert checks["artifact"]["status"] == "failed"
+    assert "additional required artifact behavior failed" in checks["artifact"]["output"]
+    assert report["passed"] is False and report["promotable"] is False
+    with pytest.raises(ReleaseError, match="verification"):
+        manager.activate(candidate)
