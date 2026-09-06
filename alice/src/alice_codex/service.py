@@ -30,7 +30,12 @@ from .control import MAX_MESSAGE
 from .files import SingletonLock, read_json, write_json
 from .memory import MemoryStore
 from .journal import NativeJournal
-from .heartbeat import CollectionSpec, HostHeartbeatAdapter, compare_receipts
+from .heartbeat import (
+    CollectionSpec,
+    HostHeartbeatAdapter,
+    compare_receipts,
+    parse_heartbeat_sources,
+)
 from .identity import (
     IDENTITY_HOOK_COMPAT_VERSION,
     build_identity_bundle,
@@ -316,6 +321,9 @@ class _ResourceEpochListener:
 
 class Service:
     def __init__(self, config: RuntimeConfig):
+        # Validate the complete source configuration before opening business
+        # stores or starting native work, including direct embedded callers.
+        heartbeat_sources = parse_heartbeat_sources(config.heartbeat_sources)
         self.config = config
         self.path = config.root / "state/runtime.json"
         self.state = (
@@ -346,6 +354,10 @@ class Service:
         self._heartbeat_scopes: dict[str, str] = {}
         self._heartbeat_next: dict[str, float] = {}
         self._heartbeat_collection_rejected: dict[str, bool] = {}
+        for source in heartbeat_sources:
+            self.register_heartbeat_source(
+                source.target, source.spec, wait_seconds=source.wait_seconds
+            )
         consumed = self.state.get("heartbeat_consumed", {})
         if not isinstance(consumed, dict):
             raise ValueError("Damaged heartbeat consumption state; preserved for recovery")
@@ -1059,8 +1071,8 @@ class Service:
         """Internal host registration; no control/MCP operation accepts sources.
 
         The interval is explicit and independent of a task's lifetime budget.
-        Production hosts must register again on restart; persisted receipts do
-        not grant permission to contact their old source.
+        Construction restores explicit local configuration once per process;
+        persisted receipts alone never authorize contacting an old source.
         """
         import math
 
