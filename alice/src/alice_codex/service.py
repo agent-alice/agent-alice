@@ -196,6 +196,7 @@ class Service:
         self._resource_refresh_at = 0.0
         self._heartbeat = HostHeartbeatAdapter()
         self._heartbeat_intervals: dict[str, float] = {}
+        self._heartbeat_scopes: dict[str, str] = {}
         self._heartbeat_next: dict[str, float] = {}
         self._heartbeat_collection_rejected: dict[str, bool] = {}
         consumed = self.state.get("heartbeat_consumed", {})
@@ -728,6 +729,7 @@ class Service:
             raise ValueError("Heartbeat wait must be finite and positive")
         self._heartbeat.register(target, spec)
         self._heartbeat_intervals[target] = wait_seconds
+        self._heartbeat_scopes[target] = spec.scope_sha256
         self._heartbeat_next.pop(target, None)
 
     async def observe_heartbeat(self, target: str) -> dict:
@@ -750,9 +752,12 @@ class Service:
                 }
             receipt = await asyncio.to_thread(self._heartbeat.observe, target, now=now)
             state = self.store.record_heartbeat(target, receipt, wait_seconds=interval)
-            rejected = state["latest"]["id"] != receipt["id"]
+            scope_changed = receipt["scope_sha256"] != self._heartbeat_scopes.get(target)
+            rejected = state["latest"]["id"] != receipt["id"] or scope_changed
             self._heartbeat_collection_rejected[target] = rejected
-            self._heartbeat_next[target] = time.monotonic() + interval
+            self._heartbeat_next[target] = time.monotonic() + (
+                0 if scope_changed else self._heartbeat_intervals.get(target, interval)
+            )
             return {**state, "configured": configured, "collection_rejected": rejected}
 
     async def _watch_heartbeats(self) -> None:
@@ -1053,10 +1058,16 @@ class Service:
             return True
         # An acknowledgement can precede native status visibility; ambiguous
         # inputs also reserve their root until reconciliation, never a new ID.
+        stopped_roots = {
+            item["thread_id"]
+            for item in self.state["tasks"].values()
+            if item.get("paused") and item.get("policy_deadline_stopped") is True
+        }
         active = {
             intent["thread_id"]
             for intent in self.state["intents"].values()
             if intent["status"] in {"sending", "unknown", "accepted", "queued"}
+            and intent["thread_id"] not in stopped_roots
         }
         if task and task["thread_id"] in active:
             return True
@@ -1160,6 +1171,7 @@ class Service:
                     or latest is None
                     or latest["latest"]["state"] != "known"
                     or latest["latest"] != heartbeat_receipt
+                    or heartbeat_receipt["scope_sha256"] != self._heartbeat_scopes.get(target)
                     or not self._heartbeat_candidate(target, heartbeat_receipt)
                 ):
                     raise DeferredDispatch("Heartbeat evidence was consumed or superseded")
@@ -1400,6 +1412,7 @@ class Service:
     async def resume(self, target: str | None = None) -> dict:
         await self._stop_resource_paused_tasks()
         await self._enforce_task_deadlines()
+        blocked_tasks = {}
         async with self._lock("admission"):
             revision = self._pause_revision
             keys = (
@@ -1409,6 +1422,10 @@ class Service:
             )
             task_revisions = {key: self._task_pause_revisions.get(key, 0) for key in keys}
             for key in keys:
+                blocked = self._policy_resume_block(key)
+                if target is None and blocked:
+                    blocked_tasks[key] = blocked
+                    continue
                 async with self._lock("input:" + key):
                     self._resuming.add(key)
                     try:
@@ -1426,38 +1443,36 @@ class Service:
                                 and not self.resources.can_dispatch(automatic=True)["allowed"]
                             ):
                                 raise RejectedDispatch("Automatic task resource limit is active")
-                            policy = self.store.task_policy_status(
-                                key, now=time.time(), busy=self._policy_intent_busy(key)
-                            )
-                            if policy and not policy["decision"]["allowed"]:
-                                # A paused, already admitted final attempt may
-                                # continue; this does not purchase another turn.
-                                continuing = (
-                                    policy["usage"] is not None
-                                    and policy["usage"]["last_outcome"] == "running"
-                                    and policy["decision"]["reasons"] == ["task_busy"]
+                            blocked = self._policy_resume_block(key)
+                            if blocked:
+                                raise RejectedDispatch(
+                                    "Task policy blocks resume: " + ", ".join(blocked)
                                 )
-                                if not continuing:
-                                    raise RejectedDispatch(
-                                        "Task policy blocks resume: "
-                                        + ", ".join(policy["decision"]["reasons"])
-                                    )
 
                         check()
                         task = await self.ensure_thread(key)
                         check()
                         queue = await self.codex.queue_list(task["thread_id"], limit=1)
                         check()
-                        if queue.get("data"):
-                            self._check_policy_native_resume(key)
-                            await self.codex.queue_start(task["thread_id"])
-                            check()
                         goal = (
                             await self.rpc.request(
                                 "thread/goal/get", {"threadId": task["thread_id"]}
                             )
                         ).get("goal")
                         check()
+                        if queue.get("data") or (goal and goal.get("status") == "paused"):
+                            try:
+                                self._check_policy_native_resume(key)
+                            except RejectedDispatch:
+                                if target is not None:
+                                    raise
+                                blocked_tasks[key] = [
+                                    "native_work_has_no_confirmed_charged_attempt"
+                                ]
+                                continue
+                        if queue.get("data"):
+                            await self.codex.queue_start(task["thread_id"])
+                            check()
                         if goal and goal.get("status") == "paused":
                             self._check_policy_native_resume(key)
                             await self.rpc.request(
@@ -1472,8 +1487,28 @@ class Service:
                     finally:
                         self._resuming.discard(key)
             if target is None:
+                if self.stopping or self._pause_revision != revision:
+                    raise RejectedDispatch("Resume superseded by a pause")
                 self.store.set_autonomy_paused(False)
-        return {"resumed": target or "autonomy"}
+        return {
+            "resumed": target or "autonomy",
+            **({"blocked_tasks": blocked_tasks} if blocked_tasks else {}),
+        }
+
+    def _policy_resume_block(self, target: str) -> list[str]:
+        policy = self.store.task_policy_status(
+            target, now=time.time(), busy=self._policy_intent_busy(target)
+        )
+        if policy is None or policy["decision"]["allowed"]:
+            return []
+        # An already admitted final attempt can continue; no new input is bought.
+        if (
+            policy["usage"] is not None
+            and policy["usage"]["last_outcome"] == "running"
+            and policy["decision"]["reasons"] == ["task_busy"]
+        ):
+            return []
+        return policy["decision"]["reasons"] or ["task_" + policy["decision"]["state"]]
 
     def _check_policy_native_resume(self, target: str) -> None:
         record = self.store.get_task_policy(target)

@@ -59,6 +59,15 @@ charged attempt. An unused policy or a terminal/unknown attempt cannot activate
 old native work without admission. Explicitly resuming an empty paused root can
 clear its flag without consuming an attempt.
 
+Global resume restores eligible roots and general scheduling, while leaving
+policy-blocked roots paused. Its response includes `blocked_tasks` with each
+blocked target's reasons when any are skipped. A completed or exhausted bounded
+task cannot permanently prevent unrelated main/periodic work from resuming.
+Explicit `resume(target)` continues to reject that blocked target.
+After a confirmed deadline stop, an unresolved business outcome still blocks its
+own target but no longer occupies global execution capacity. A new native start
+invalidates that stop proof, and active native status still consumes capacity.
+
 ## Trusted heartbeat observations
 
 Host code registers `CollectionSpec` with

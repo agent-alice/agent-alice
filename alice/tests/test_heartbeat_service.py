@@ -36,7 +36,9 @@ class HeartbeatRuntime:
         self.native_sequence = 0
         self.codex = Mock()
         self.codex.thread_read = AsyncMock(side_effect=self.read_thread)
-        self.codex.thread_start = AsyncMock(side_effect=AssertionError("fixture root must be reused"))
+        self.codex.thread_start = AsyncMock(
+            side_effect=AssertionError("fixture root must be reused")
+        )
         self.codex.turn_start = AsyncMock(side_effect=self.start_turn)
         self.codex.queue_add = AsyncMock(return_value={"data": []})
         self.codex.queue_list = AsyncMock(return_value={"data": []})
@@ -48,9 +50,13 @@ class HeartbeatRuntime:
         self.service = self.restart()
         self.service.store.acquire_lease("heartbeat-tests", now=0, seconds=100000)
         self.source = CollectionSpec(
-            source_id="fixture-answers", url="https://example.invalid/answers?filter=one",
-            subject="fixture-member", collection="answers", auth_context_version="fixture-v1",
-            required_metrics=("voteup_count",), max_age_seconds=60,
+            source_id="fixture-answers",
+            url="https://example.invalid/answers?filter=one",
+            subject="fixture-member",
+            collection="answers",
+            auth_context_version="fixture-v1",
+            required_metrics=("voteup_count",),
+            max_age_seconds=60,
         )
         self.seed()
         (config.workspace / "HEARTBEAT.md").write_text("Perform the synthetic periodic review.\n")
@@ -64,7 +70,9 @@ class HeartbeatRuntime:
 
     def seed(self):
         task = {
-            "thread_id": "monitor-root", "has_input": True, "paused": False,
+            "thread_id": "monitor-root",
+            "has_input": True,
+            "paused": False,
             "bootstrap": {"version": 1, "thread_id": "monitor-root", "state": "ready"},
         }
         self.service.state["tasks"]["monitor"] = task
@@ -92,9 +100,13 @@ class HeartbeatRuntime:
         self.observation_sequence += 1
         known = self.observation_state == "known"
         return {
-            "version": 1, "id": f"observation-{self.observation_sequence}", "target": target,
-            "source_id": self.source.source_id, "scope_sha256": self.source.scope_sha256,
-            "validator_version": VALIDATOR_VERSION, "observed_at": now,
+            "version": 1,
+            "id": f"observation-{self.observation_sequence}",
+            "target": target,
+            "source_id": self.source.source_id,
+            "scope_sha256": self.source.scope_sha256,
+            "validator_version": VALIDATOR_VERSION,
+            "observed_at": now,
             "state": self.observation_state,
             "content_sha256": digest(self.source.scope_sha256 + self.content) if known else None,
             "evidence_sha256": digest(f"{self.observation_sequence}:{now}:{known}"),
@@ -108,12 +120,18 @@ class HeartbeatRuntime:
     def event(self):
         self.event_sequence += 1
         job = self.service.store.create_job(
-            job_id=f"heartbeat-{self.event_sequence}", name="synthetic heartbeat",
-            target="monitor", kind="heartbeat", prompt="Check the synthetic monitor.",
-            schedule_type="at", schedule_value=self.clock.now, now=self.clock.now - 1,
+            job_id=f"heartbeat-{self.event_sequence}",
+            name="synthetic heartbeat",
+            target="monitor",
+            kind="heartbeat",
+            prompt="Check the synthetic monitor.",
+            schedule_type="at",
+            schedule_value=self.clock.now,
+            now=self.clock.now - 1,
         )
         event = next(
-            event for event in self.service.store.materialize_due("heartbeat-tests", now=self.clock.now)
+            event
+            for event in self.service.store.materialize_due("heartbeat-tests", now=self.clock.now)
             if event.job_id == job.id
         )
         self.service.store.claim_event(event.id, "heartbeat-tests", now=self.clock.now)
@@ -127,16 +145,23 @@ class HeartbeatRuntime:
         return receipt
 
     def complete(self, receipt):
-        self.service._complete_turn(receipt.thread_id, {"id": receipt.turn_id, "status": "completed"})
+        self.service._complete_turn(
+            receipt.thread_id, {"id": receipt.turn_id, "status": "completed"}
+        )
 
 
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
     clock = SimpleNamespace(now=100.0, monotonic=1000.0)
     # Do not replace asyncio's monotonic clock when controlling collection waits.
-    monkeypatch.setattr(service_module, "time", SimpleNamespace(
-        time=lambda: clock.now, monotonic=lambda: clock.monotonic,
-    ))
+    monkeypatch.setattr(
+        service_module,
+        "time",
+        SimpleNamespace(
+            time=lambda: clock.now,
+            monotonic=lambda: clock.monotonic,
+        ),
+    )
     config = RuntimeConfig(str(tmp_path), "/usr/bin/true", "codex-cli fixture", "unused")
     config.prepare_directories()
     item = HeartbeatRuntime(config, clock)
@@ -148,7 +173,9 @@ def runtime(tmp_path, monkeypatch):
     config.socket_dir.rmdir()
 
 
-async def test_unconfigured_source_retains_ordinary_periodic_review_without_fake_consumption(runtime):
+async def test_unconfigured_source_retains_ordinary_periodic_review_without_fake_consumption(
+    runtime,
+):
     first = await runtime.dispatch()
     evidence = runtime.service.store.get_heartbeat_state("monitor")
     assert first.status == "accepted" and evidence["latest"]["state"] == "unconfigured"
@@ -211,7 +238,9 @@ async def test_new_receipt_ids_and_heartbeat_file_edits_do_not_redispatch_consum
         await runtime.dispatch()
     latest = runtime.service.store.get_heartbeat_state("monitor")["latest"]
     assert latest["id"] != consumed["id"] and latest["content_sha256"] == consumed["content_sha256"]
-    (runtime.config.workspace / "HEARTBEAT.md").write_text("A revised synthetic review instruction.\n")
+    (runtime.config.workspace / "HEARTBEAT.md").write_text(
+        "A revised synthetic review instruction.\n"
+    )
     runtime.advance()
     with pytest.raises(RejectedDispatch, match="unchanged"):
         await runtime.dispatch()
@@ -269,11 +298,16 @@ async def test_consumption_and_sending_intent_share_a_durable_save_before_native
     assert (await runtime.dispatch(event)).status == "accepted"
     for snapshot in snapshots:
         if snapshot.get("heartbeat_consumed"):
-            assert snapshot["intents"][event.id]["heartbeat_receipt_id"] == snapshot["heartbeat_consumed"]["monitor"]["id"]
+            assert (
+                snapshot["intents"][event.id]["heartbeat_receipt_id"]
+                == snapshot["heartbeat_consumed"]["monitor"]["id"]
+            )
     assert snapshots[0]["intents"][event.id]["status"] == "sending"
 
 
-async def test_restart_requires_new_registration_and_old_known_does_not_enable_optimization(runtime):
+async def test_restart_requires_new_registration_and_old_known_does_not_enable_optimization(
+    runtime,
+):
     runtime.register()
     first = await runtime.dispatch()
     runtime.complete(first)
@@ -331,7 +365,10 @@ async def test_changed_source_cannot_clear_unknown_native_dispatch(runtime):
         await runtime.dispatch()
     assert runtime.disk["intents"][event.id]["status"] == "unknown"
     assert runtime.disk["heartbeat_consumed"]["monitor"] == consumed
-    assert runtime.service.store.get_heartbeat_state("monitor")["latest"]["content_sha256"] != consumed["content_sha256"]
+    assert (
+        runtime.service.store.get_heartbeat_state("monitor")["latest"]["content_sha256"]
+        != consumed["content_sha256"]
+    )
     runtime.codex.turn_start.assert_awaited_once()
 
 
@@ -422,3 +459,41 @@ async def test_unregistered_restart_during_clock_rollback_keeps_ordinary_review_
 def test_internal_source_registration_requires_explicit_positive_wait(runtime, wait):
     with pytest.raises(ValueError):
         runtime.service.register_heartbeat_source("monitor", runtime.source, wait_seconds=wait)
+
+
+async def test_source_changed_during_collection_requires_a_new_scope_observation(
+    runtime, monkeypatch
+):
+    runtime.register()
+    event = runtime.event()
+
+    async def collect_then_rotate(operation, *args, **kwargs):
+        old_receipt = operation(*args, **kwargs)
+        runtime.register(replace(runtime.source, auth_context_version="rotated-during-fetch"))
+        return old_receipt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service_module.asyncio, "to_thread", collect_then_rotate)
+        with pytest.raises(RejectedDispatch, match="watermark"):
+            await runtime.dispatch(event)
+    assert not runtime.disk.get("heartbeat_consumed")
+    runtime.codex.turn_start.assert_not_called()
+    runtime.advance()
+    assert (await runtime.dispatch(event)).status == "accepted"
+    assert (
+        runtime.disk["heartbeat_consumed"]["monitor"]["scope_sha256"] == runtime.source.scope_sha256
+    )
+
+
+async def test_source_changed_during_native_read_cannot_consume_prior_scope(runtime):
+    runtime.register()
+
+    async def read_then_rotate(thread_id, **kwargs):
+        runtime.register(replace(runtime.source, auth_context_version="rotated-during-read"))
+        return await runtime.read_thread(thread_id, **kwargs)
+
+    runtime.codex.thread_read.side_effect = read_then_rotate
+    with pytest.raises(RejectedDispatch, match="superseded"):
+        await runtime.dispatch()
+    assert not runtime.disk.get("heartbeat_consumed") and not runtime.disk["intents"]
+    runtime.codex.turn_start.assert_not_called()

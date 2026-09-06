@@ -400,6 +400,17 @@ async def test_native_deadline_interrupts_and_persists_usage_across_restart(nati
         "research-attempt-2",
         expected_code=1,
     )
+    # Global resume restores ordinary maintenance without reactivating this
+    # exhausted bounded root. Exercise the installed CLI and real native main.
+    main = await request(runtime.config.control_socket, "thread", {"target": "main"})
+    await runtime.cli("pause", "--target", "main")
+    resumed = await runtime.cli("resume")
+    assert resumed["resumed"] == "autonomy" and target in resumed["blocked_tasks"]
+    status = await runtime.status()
+    assert status["tasks"]["main"]["thread_id"] == main["thread_id"]
+    assert not status["autonomy_paused"] and not status["tasks"]["main"]["paused"]
+    assert status["tasks"][target]["paused"]
+    await runtime.cli("resume", "--target", target, expected_code=1)
     # A changed policy must have a new operation ID. Neither a rejected reuse
     # nor a successful extension resets measured attempts or human pause.
     await runtime.set_policy(
@@ -463,6 +474,63 @@ async def test_native_completion_without_business_receipt_requires_reconciliatio
     )
     assert (await runtime.policy(target))["usage"]["attempts"] == 1
     assert len(runtime.requests) == 1 and not runtime.errors
+    # A completed native turn can retain an unknown business result across
+    # restart. Once a deadline stop is proven it must not monopolize capacity.
+    await runtime.stop()
+    config_path = runtime.home / "config.json"
+    isolated_config = json.loads(config_path.read_text())
+    isolated_config["max_active_tasks"] = 1
+    config_path.write_text(json.dumps(isolated_config))
+    runtime.max_requests = 2
+    await runtime.launch()
+    await runtime.set_policy(target, "unverified-deadline", seconds=0.01, attempts=3, retries=2)
+
+    async def stopped():
+        status = await runtime.status()
+        return status if status["tasks"][target].get("policy_deadline_stopped") else None
+
+    await until(stopped)
+    await request(runtime.config.control_socket, "thread", {"target": "main"})
+    resumed = await runtime.cli("resume")
+    assert target in resumed["blocked_tasks"]
+    main = await request(
+        runtime.config.control_socket,
+        "ask",
+        {
+            "target": "main",
+            "text": "Recorded ordinary periodic maintenance.",
+            "request_id": "main-after-confirmed-stop",
+            "automatic": True,
+        },
+    )
+    assert main["status"] == "accepted"
+
+    async def main_completed():
+        intents = (await request(runtime.config.control_socket, "intents"))["intents"]
+        return next(
+            (
+                item
+                for item in intents
+                if item["id"] == "main-after-confirmed-stop" and item["status"] == "completed"
+            ),
+            None,
+        )
+
+    await until(main_completed)
+    still_unknown = await runtime.policy(target)
+    assert still_unknown["usage"]["last_outcome"] == "unknown"
+    assert still_unknown["usage"]["attempts"] == 1
+    assert (await runtime.status())["tasks"][target]["paused"]
+    await runtime.cli(
+        "ask",
+        "Still cannot replay the unknown work.",
+        "--target",
+        target,
+        "--request-id",
+        "unverified-attempt-3",
+        expected_code=1,
+    )
+    assert len(runtime.requests) == 2 and not runtime.errors
     await runtime.stop()
 
 
