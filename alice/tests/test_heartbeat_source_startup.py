@@ -14,6 +14,7 @@ import pytest
 
 from alice_codex.config import RuntimeConfig, load_config
 from alice_codex.heartbeat import CollectionSpec, HostHeartbeatAdapter
+from alice_codex.memory import MemoryStore
 from alice_codex.scheduler import RejectedDispatch
 from alice_codex.service import Service
 import alice_codex.service as service_module
@@ -50,6 +51,7 @@ def startup(tmp_path, monkeypatch):
     )
     config = RuntimeConfig(str(tmp_path / "alice"), "/usr/bin/true", "synthetic-fixture", "unused")
     config.prepare_directories()
+    MemoryStore(config.root).install_workspace_templates()
     runtimes, registrations = [], []
     real_register = HostHeartbeatAdapter.register
 

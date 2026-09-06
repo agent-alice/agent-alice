@@ -435,6 +435,9 @@ class MemoryStore:
         mappings = {
             "AGENTS.md": "AGENTS.md",
             "autonomy-review.md": ".alice/prompts/autonomy-review.md",
+            "SOUL.md": "SOUL.md",
+            "USER.md": "USER.md",
+            "MEMORY.md": "memory/MEMORY.md",
         }
         package = resources.files("alice_codex").joinpath("templates")
         skill_root = package.joinpath(".agents", "skills")
