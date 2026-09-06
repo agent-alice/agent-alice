@@ -658,6 +658,59 @@ def test_identity_hooks_rebind_candidate_and_preserve_extensions(tmp_path, binar
     assert path.read_bytes() == before
 
 
+def test_direct_serve_identity_refresh_preserves_broken_mcp_and_extensions(tmp_path, binary):
+    import tomlkit
+
+    from alice_codex.identity import build_identity_bundle
+    from alice_codex.memory import MemoryStore
+
+    config = initialize_config(tmp_path / "data", binary)
+    MemoryStore(config.root).install_workspace_templates()
+    identity = build_identity_bundle(config.workspace)
+    path = config.codex_home / "config.toml"
+    document = tomlkit.parse(path.read_text())
+    document["model"] = "operator-model"
+    document["features"]["memories"] = True
+    document["mcp_servers"]["alice"]["command"] = "/usr/bin/false"
+    document["mcp_servers"]["alice"]["args"] = []
+    document["mcp_servers"]["other"] = {"command": "operator-command", "enabled": False}
+    document["plugins"] = {"synthetic@local": {"enabled": True}}
+    path.write_text(
+        "# Operator configuration must survive direct serve\n" + tomlkit.dumps(document)
+    )
+    before = tomllib.loads(path.read_text())
+
+    config.write_identity_config(identity, python="/fixture/new-candidate/python")
+
+    after = tomllib.loads(path.read_text())
+    for key, value in before.items():
+        if key not in {"developer_instructions", "features", "hooks"}:
+            assert after[key] == value
+    assert after["features"] == {**before["features"], "hooks": True}
+    assert after["developer_instructions"] == identity.developer_instructions
+    assert path.read_text().count("/fixture/new-candidate/python -I -m alice_codex.identity") == 3
+    assert "# Operator configuration must survive direct serve" in path.read_text()
+    unchanged = path.read_bytes()
+    config.write_identity_config(identity, python="/fixture/new-candidate/python")
+    assert path.read_bytes() == unchanged
+
+
+@pytest.mark.parametrize("contents", ["invalid = [", 'developer_instructions = "operator rules"\n'])
+def test_identity_refresh_never_resets_conflicting_configuration(tmp_path, binary, contents):
+    from alice_codex.identity import build_identity_bundle
+    from alice_codex.memory import MemoryStore
+
+    config = initialize_config(tmp_path / "data", binary)
+    MemoryStore(config.root).install_workspace_templates()
+    identity = build_identity_bundle(config.workspace)
+    path = config.codex_home / "config.toml"
+    path.write_text(contents)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="original file preserved|original preserved"):
+        config.write_identity_config(identity)
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

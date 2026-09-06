@@ -239,7 +239,7 @@ class Service:
                 prior_identity = read_json(identity_manifest)
                 validate_identity_runtime_manifest(prior_identity)
             identity = build_identity_bundle(self.config.workspace)
-            self.config.write_codex_config(identity=identity)
+            self.config.write_identity_config(identity)
             self.state["lifecycle"] = "starting"
             self.state["server"] = None
             self.save()

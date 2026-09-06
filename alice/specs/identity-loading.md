@@ -115,6 +115,15 @@ the release integration must require this rebinding capability or provide an
 independently verified configuration recovery path. The identity change does not
 weaken release gates or silently modify launchers, bootstrap or release code.
 
+Direct `serve` updates only the identity baseline, owned hooks and `features.hooks`.
+It preserves the other settings, including an explicitly broken required MCP,
+so the existing native failure remains observable. The `start` launcher and
+supervisor retain their existing full Alice configuration reconciliation before
+launch: that is where the selected candidate's MCP interpreter is rebound after
+activation or rollback. The release pointer operation itself does not rewrite
+MCP settings. This change does not claim that every startup entry point preserves
+intentional edits to Alice-owned MCP fields.
+
 ## Acceptance and current state
 
 Unit coverage includes bounded/coherent reads, record trust, revisions, unknown
