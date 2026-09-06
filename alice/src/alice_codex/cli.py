@@ -426,6 +426,8 @@ async def execute(args) -> dict | None:
                     raise ValueError("External archive source prefixes must be unique")
                 external[prefix] = Path(path)
             snapshot_id = args.snapshot_id
+            if snapshot_id == "":
+                raise ValueError("Snapshot identifier must not be empty")
             if snapshot_id is None:
                 snapshot_id = time.strftime("%Y%m%dT%H%M%SZ-", time.gmtime()) + uuid4().hex[:8]
             # Persisted archive/index recovery needs this ID even when the first

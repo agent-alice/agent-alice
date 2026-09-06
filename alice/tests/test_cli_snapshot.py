@@ -79,3 +79,13 @@ def test_duplicate_external_prefix_does_not_silently_drop_a_source(tmp_path, cap
     )
     assert "prefixes must be unique" in capsys.readouterr().err
     assert not list((config.root / "archives").iterdir())
+
+
+def test_explicit_empty_snapshot_id_is_rejected_before_archive_creation(tmp_path, capsys):
+    config, args = fixture_args(tmp_path)
+    assert cli.main([*args, "--snapshot-id", ""]) == 1
+    result = capsys.readouterr()
+    assert "Snapshot identifier must not be empty" in result.err
+    assert '"snapshot_id"' not in result.err
+    assert not result.out
+    assert not list((config.root / "archives").iterdir())
