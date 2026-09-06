@@ -37,7 +37,7 @@ alice init --codex "$ALICE_CODEX" --model gpt-6-astra
 alice doctor
 ```
 
-如果 Codex 不在 PATH 中，将 `ALICE_CODEX` 设为已安装二进制的路径。初始化默认复制并记录二进制 hash，建立独立 `ALICE_HOME/codex`、工作区和数据目录。新实例的自治处于暂停状态，四个默认分层整理任务禁用；身份正文不会被编造。
+如果 Codex 不在 PATH 中，将 `ALICE_CODEX` 设为完整发行包中主程序的路径。初始化默认将主程序与同一发行包的 `codex-code-mode-host` 一起固定，分别记录 hash，建立独立 `ALICE_HOME/codex`、工作区和数据目录。缺失宿主时初始化失败，不从 PATH 补找另一版本。新实例的自治处于暂停状态，四个默认分层整理任务禁用；身份正文不会被编造。
 
 使用原生 Codex 为这份独立 `CODEX_HOME` 登录，或初始化时明确增加 `--login-home "$HOME/.codex"` 来链接已有文件式登录。后一种方式共享登录文件，其他配置和运行数据仍隔离。凭据、身份和原始日志保存在 Git 仓库之外。
 
@@ -66,7 +66,20 @@ alice stop
 alice start
 ```
 
-全局暂停和目标暂停会持久保存，心跳与重启不能自行解除。`resume` 是显式恢复操作；关闭终端不等于停止服务。原生客户端的 `turn/interrupt` 已在真实 Codex 二进制的受控集成测试中验证可转为持久暂停，并在重启后保留。
+全局暂停和目标暂停会持久保存，心跳与重启不能自行解除。`stop` 会暂停自动派发；`start` 恢复进程与原线程后，需要显式执行 `alice resume` 才恢复自动任务。任务自身的 enabled 设置保留，异常恢复也不会默默解除暂停。关闭终端不等于停止服务。原生客户端的 `turn/interrupt` 已在真实 Codex 二进制的受控集成测试中验证可转为持久暂停，并在重启后保留。
+
+## 配对运行时维护
+
+```sh
+alice runtime status
+alice stop
+alice runtime repin --codex /path/to/complete-distribution/codex
+alice doctor
+```
+
+`runtime status` 区分 `verified_files`、`unverified_legacy` 和 `invalid`。文件配对通过不代表原生工具已运行，因此状态的 `native_verified` 保持 false；真实执行证据属于受检候选报告。`doctor` 对缺失或损坏的配对返回非零。
+
+`repin` 仅修复已记录主程序的同版本、同 hash 配对，不是 Codex 升级命令。它先完整复制并验证两份文件，再原子切换配置路径；原文件、未知配置字段和业务数据保留。安装中的 supervisor 即使尚无 control socket 也会阻止维护。维护与启动、停止、版本切换共用生命周期锁，须等本实例确认停止。
 
 ## 持久调度
 
@@ -162,7 +175,7 @@ python tools/check.py --source . --codex-binary "$ALICE_CODEX" --native \
   --report "$ALICE_HOME/checks/candidate.json"
 ```
 
-`tools/check.py` 构建并验证候选，安装产物测试调用独立环境中的真实入口；`--native` 要求显式 Codex 二进制。真实模型测试是单独的 live 范围，需要授权、配置和预算。缺失、跳过、失败、超时或空测试集不能算作必需门槛通过。
+`tools/check.py` 构建并验证候选，安装产物测试调用独立环境中的真实入口；`--native` 要求显式完整 Codex 配对，并单独运行实际 Code Mode 工具门槛。未选 native 时普通检查可以通过，但报告 `promotable=false`，不能激活。真实模型测试是单独的 live 范围，需要授权、配置和预算。缺失、跳过、失败、超时或空测试集不能算作必需门槛通过。
 
 ```sh
 alice release build .
@@ -177,7 +190,17 @@ alice release rollback
 alice start
 ```
 
-只激活同一受检产物。报告绑定源码、依赖、二进制及产物 hash，源码变化需重新验证。回退切换兼容代码版本，保留新增运行数据。
+只激活同一受检产物。policy 5 报告绑定源码、依赖、主程序、Code Mode 宿主及产物 hash。候选保留自己的完整配对，原发行路径仅作来源记录；应用自动更新或原发行目录删除不会改变已固定候选。部署配置选中的实际两份文件必须与候选的两个 hash 一致，宿主漂移不能复用旧工具证据。源码变化需重新构建验证。回退只切换兼容代码版本，保留新增运行数据。
+
+从旧 main-only 候选迁移时，使用包含上述命令的新 CLI，按以下顺序操作：
+
+1. `alice stop`；如已安装 supervisor，执行 `alice service uninstall` 并确认本实例卸载。旧 supervisor 尚安装时不能激活 policy 5，避免它使用旧门禁回退。
+2. `alice runtime repin --codex /path/to/complete-distribution/codex`，再运行 `alice runtime status` 和 `alice doctor`。配对失败会保留原配置，不继续切换。
+3. 构建并以 `--native` 验证新的候选，再激活。旧候选和原报告仍可读取，但须重新构建验收才能作为配对版本激活或回退；不会把旧报告标成新门槛通过。
+4. 再验证、激活第二个兼容的 policy 5 候选，建立可用的 previous，然后 `alice service install` 创建独立的新 supervisor。它同时绑定门禁版本和宿主 hash。
+5. 验证启动与所需工具，再按业务意图显式 `alice resume`。缺少兼容 previous 或启动持续失败时安全停止，不恢复旧数据，也不退回未验收的 main-only 候选。
+
+如果第 2 至 4 步失败，保留候选、报告及业务数据，维持停止状态；不要安装旧 supervisor 绕过新门禁。旧报告是历史证据，不能替代此次配对验收。
 
 macOS 在已有受检且激活的 release 后可使用 `alice service install`、`alice service status`、`alice service uninstall`；Linux 可使用 `alice serve`。部署入口存在不代表所有平台上的服务安装和恢复均已验收。
 

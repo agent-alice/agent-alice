@@ -44,6 +44,9 @@ def parser() -> argparse.ArgumentParser:
     collect.add_argument("--max-age-seconds", type=float)
     for command in ("serve", "start", "status", "stop", "mcp", "intents", "doctor"):
         commands.add_parser(command)
+    runtime = commands.add_parser("runtime").add_subparsers(dest="operation", required=True)
+    runtime.add_parser("status")
+    runtime.add_parser("repin").add_argument("--codex", type=Path, required=True)
     resources = commands.add_parser("resources").add_subparsers(dest="operation", required=True)
     for operation in ("status", "refresh"):
         resources.add_parser(operation)
@@ -309,7 +312,24 @@ async def execute(args) -> dict | None:
             "autonomy_paused": True,
             "snapshot": result,
         }
-    config = load_config(args.home)
+    config = (
+        load_config(args.home, for_maintenance=True)
+        if args.command in {"runtime", "doctor"}
+        else load_config(args.home)
+    )
+    if args.command == "runtime":
+        from .runtime_bundle import runtime_bundle_status
+
+        if args.operation == "status":
+            return runtime_bundle_status(config)
+        from .config import _repin_codex_bundle_locked
+        from .lifecycle import offline_maintenance
+
+        def repin():
+            with offline_maintenance(config):
+                return _repin_codex_bundle_locked(config.root, args.codex)
+
+        return await asyncio.to_thread(repin)
     if args.command == "task-policy":
         params = {"target": args.target}
         if args.operation == "set":
@@ -417,7 +437,19 @@ async def execute(args) -> dict | None:
             await asyncio.sleep(0.1)
         raise TimeoutError("Shutdown not yet confirmed; no stop success claimed")
     if args.command == "doctor":
+        from .runtime_bundle import runtime_bundle_status
+
+        bundle = runtime_bundle_status(config)
+        if bundle["status"] == "invalid":
+            return {"codex_binary_verified": False, "runtime_bundle": bundle, "healthy": False}
         config.verify_binary()
+        config_error = None
+        try:
+            load_config(args.home)
+        except ValueError as error:
+            # Maintenance may preserve fields a newer runtime understands;
+            # that must not turn into a false claim this version can start.
+            config_error = str(error)
         with Store(config.database) as store:
             jobs = len(store.list_jobs())
         result = subprocess.run(
@@ -433,9 +465,12 @@ async def execute(args) -> dict | None:
             )
         return {
             "codex_binary_verified": True,
-            "config_parsed": True,
+            "config_parsed": config_error is None,
+            "config_error": config_error,
             "schedule_database_valid": True,
             "job_count": jobs,
+            "runtime_bundle": bundle,
+            "healthy": bundle["paired"] and config_error is None,
             "service": await running(config),
         }
     if args.command == "chat":
@@ -571,27 +606,15 @@ async def execute(args) -> dict | None:
         if args.operation == "verify":
             return releases.verify(args.candidate_id, native=args.native, live=args.live)
         if args.operation in {"activate", "rollback"}:
-            from .files import SingletonLock
-            from .launchd import _assert_owned_stopped, status as supervisor_status
+            from .lifecycle import offline_maintenance
 
-            # Socket absence does not prove that startup/cleanup is idle. The
-            # same lifecycle lock guards launchd transitions and direct start;
-            # owner locks cover a running or interrupted supervisor/daemon.
-            with (
-                SingletonLock(config.root / "state/lifecycle.lock"),
-                SingletonLock(config.root / "state/bootstrap.lock"),
-                SingletonLock(config.root / "state/service.lock"),
-            ):
-                if (config.root / "state/supervisor.json").exists():
-                    supervision = await asyncio.to_thread(supervisor_status, config)
-                    if supervision["loaded"]:
-                        raise ValueError("Stop the installed supervisor before switching its release")
-                _assert_owned_stopped(config)
-                if await running(config):
-                    raise ValueError("Stop the service before switching its release")
-                if args.operation == "activate":
-                    return releases.activate(args.candidate_id)
-                return releases.rollback()
+            def switch_release():
+                with offline_maintenance(config):
+                    if args.operation == "activate":
+                        return releases.activate(args.candidate_id)
+                    return releases.rollback()
+
+            return await asyncio.to_thread(switch_release)
         return releases.current()
     if args.command == "service":
         from . import launchd
@@ -638,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.command in {"summarize-observation", "collect"} and not result["complete"]:
             return 2
+        if args.command == "doctor" and result.get("healthy") is False:
+            return 1
         return 0
     except (Exception, KeyboardInterrupt) as error:
         print(f"alice: {type(error).__name__}: {error}", file=sys.stderr)
