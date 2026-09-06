@@ -1957,6 +1957,10 @@ class Service:
             return self.memory.prepare_summary(**params)
         if action == "memory_commit":
             return self.memory.commit_summary(**params)
+        if action == "summary_partition_next":
+            return self.memory.summary_partition_next(**params)
+        if action == "commit_summary_partition":
+            return self.memory.commit_summary_partition(**params)
         if action == "resources_status":
             return self.resources.status()
         if action == "resources_refresh":

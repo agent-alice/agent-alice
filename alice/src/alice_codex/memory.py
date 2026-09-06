@@ -74,6 +74,10 @@ class NoSourcesError(SummaryValidationError):
     """The closed period contains no eligible source records."""
 
 
+class _PartitionRequired(SummaryValidationError):
+    """Select the bounded partition protocol without truncating a legacy batch."""
+
+
 def _json(value: Any) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
 
@@ -808,6 +812,11 @@ class MemoryStore:
         with self._db() as db:
             found = db.execute("SELECT * FROM sources WHERE source_id=?", (source_id,)).fetchone()
         if not found:
+            from .summary_partitions import read_source
+
+            fragment = read_source(self, source_id, max_chars=max_chars, offset_chars=offset_chars)
+            if fragment is not None:
+                return fragment
             raise MemoryError("Unknown source identifier")
         row = dict(found)
         path = Path(row["stored_path"])
@@ -1024,6 +1033,34 @@ class MemoryStore:
         now: dt.datetime | None = None,
         timezone: str = "Asia/Shanghai",
     ) -> dict:
+        """Freeze a closed window, automatically partitioning inputs beyond one worker."""
+        try:
+            return self._prepare_legacy_summary(level, period, now=now, timezone=timezone)
+        except _PartitionRequired:
+            from .summary_partitions import prepare
+
+            return prepare(self, level, period, now=now, timezone=timezone)
+
+    def summary_partition_next(self, batch_id: str, limit: int = 4) -> dict:
+        """Return bounded ready work descriptors; repeated queries do not claim work."""
+        from .summary_partitions import next_nodes
+
+        return next_nodes(self, batch_id, limit=limit)
+
+    def commit_summary_partition(self, batch_id: str, node_id: str, candidate: dict) -> dict:
+        """Validate one immutable work unit and finalize only after full root coverage."""
+        from .summary_partitions import commit_node
+
+        return commit_node(self, batch_id, node_id, candidate)
+
+    def _prepare_legacy_summary(
+        self,
+        level: str,
+        period: str,
+        *,
+        now: dt.datetime | None = None,
+        timezone: str = "Asia/Shanghai",
+    ) -> dict:
         """Freeze closed-period source files and return a task for Codex.
 
         L1 period: YYYY-MM-DDTHH:00 (an even hour); L2: YYYY-MM-DD;
@@ -1077,13 +1114,9 @@ class MemoryStore:
                     for line, text, obj, error in _records(path):
                         eligible = _in_period(level, path, obj, start, end)
                         if error == "record_exceeds_parse_limit":
-                            # An unparseable record with no recognizable date
-                            # cannot safely be assigned to a different period.
-                            if eligible or not dated_path(path):
-                                raise SummaryValidationError(
-                                    "Summary source exceeds the bounded record parser; explicit partitioning required"
-                                )
-                            continue
+                            # Its valid timestamp might follow a giant string.
+                            # The streaming scanner must decide eligibility.
+                            raise _PartitionRequired("Summary record needs automatic partitioning")
                         if (
                             level in {"L1", "L2"}
                             and not _valid_record_time(level, obj)
@@ -1094,6 +1127,12 @@ class MemoryStore:
                             )
                         if not eligible:
                             continue
+                        from .summary_partitions import embedded_references
+
+                        if embedded_references(self, path, obj=obj):
+                            raise _PartitionRequired(
+                                "Embedded partition coverage requires the partition protocol"
+                            )
                         source_id = _source_id("workspace", rel, digest, line)
                         if level in {"L1", "L2"} and not _valid_record_time(level, obj):
                             error = error or "missing_or_invalid_timestamp"
@@ -1107,9 +1146,9 @@ class MemoryStore:
                         )
                         total_bytes += len(text.encode())
                         files[rel] = {"path": rel, "sha256": digest, "size": before[2]}
-                        if len(selected) > 10000 or total_bytes > 16 * 1024 * 1024:
-                            raise SummaryValidationError(
-                                "Summary batch needs explicit partitioning; no sources were silently truncated"
+                        if len(selected) > 64 or total_bytes > 128 * 1024 or len(text.encode()) > 65536:
+                            raise _PartitionRequired(
+                                "Summary batch needs automatic partitioning; no sources were silently truncated"
                             )
                     if before != _fingerprint(path):
                         raise SourceChangedError("Summary input changed while selecting records")
@@ -1117,6 +1156,11 @@ class MemoryStore:
                     raise SourceChangedError("Summary source inventory changed while selecting")
                 if not selected:
                     raise NoSourcesError("No source records cover this period")
+                if level != "L1":
+                    from .summary_partitions import has_upstream
+
+                    if has_upstream(self, files):
+                        raise _PartitionRequired("Upstream partition coverage requires the partition protocol")
                 manifest = {
                     "schema_version": 1,
                     "level": level,
@@ -1188,6 +1232,8 @@ class MemoryStore:
     def commit_summary(self, batch_id: str, candidate: dict) -> dict:
         if not re.fullmatch(r"[a-f0-9]{64}", batch_id):
             raise SummaryValidationError("Invalid batch identifier")
+        if _join(self.state, "summary-partitions/" + batch_id).exists():
+            raise SummaryValidationError("Partition plans require commit_summary_partition for each ready node")
         directory = _join(self.batches, batch_id)
         manifest = json.loads(_join(directory, "manifest.json").read_text())
         if manifest.get("schema_version") != 1:
@@ -1252,9 +1298,20 @@ class MemoryStore:
         for path in sorted(commits.glob("*.json")):
             _join(commits, path.name)
             intent = json.loads(path.read_text())
-            if intent.get("schema_version") != 1:
+            version = intent.get("schema_version")
+            if version == 2:
+                from .summary_partitions import recover_plan, validate_summary_commit_header
+
+                try:
+                    validate_summary_commit_header(intent)
+                    recover_plan(self, intent)
+                except SummaryValidationError as exc:
+                    raise MemoryConflictError(str(exc)) from exc
+                if intent["status"] == "partitioning":
+                    continue
+            elif version != 1:
                 raise MemoryConflictError("Unsupported summary commit schema version")
-            if intent.get("manifest", {}).get("schema_version") != 1:
+            if intent.get("manifest", {}).get("schema_version") != version:
                 raise MemoryConflictError("Unsupported summary batch schema version in commit")
             if intent.get("status") not in {"pending", "committed"}:
                 raise MemoryConflictError("Summary commit has an invalid status")
@@ -1434,6 +1491,8 @@ def _render_summary(manifest: dict, candidate: dict, before: bytes | None) -> by
             "source_manifest": manifest["batch_id"],
             "missing": candidate["missing"],
         }
+        if "coverage_ref" in manifest:
+            record["coverage_ref"] = manifest["coverage_ref"]
         return (
             existing
             + ("\n" if existing and not existing.endswith("\n") else "")
@@ -1444,6 +1503,8 @@ def _render_summary(manifest: dict, candidate: dict, before: bytes | None) -> by
     # auto separator. New versions append; consumers can select by batch marker.
     marker = f"<!-- anima-summary:{manifest['batch_id']} -->"
     addition = f"{marker}\n\n{candidate['content'].strip()}\n"
+    if "coverage_ref" in manifest:
+        addition += f"\n<!-- anima-coverage:{manifest['batch_id']}:{manifest['coverage_ref']['sha256']} -->\n"
     if AUTO_SEPARATOR not in existing:
         addition = AUTO_SEPARATOR + "\n\n" + addition
     return (existing + ("\n\n" if existing else "") + addition).encode()
