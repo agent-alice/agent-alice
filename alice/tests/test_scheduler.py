@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from alice_codex.scheduler import RejectedDispatch, Scheduler, next_due
+from alice_codex.scheduler import DeferredDispatch, RejectedDispatch, Scheduler, next_due
 from alice_codex.store import DispatchReceipt, Store, StoreError
 
 
@@ -126,6 +126,87 @@ def test_busy_heartbeat_coalesces_one_pending_across_ticks(store):
     asyncio.run(scheduler.poll())
     assert len(dispatcher.seen) == 1
     assert dispatcher.seen[0].id == events[0].id
+
+
+def test_coalesced_heartbeat_keeps_catchup_flag_on_each_exact_tick(store):
+    store.create_job(
+        name="heartbeat",
+        kind="heartbeat",
+        schedule_type="every",
+        schedule_value=10,
+        catch_up=True,
+        now=0,
+    )
+    clock = Clock(10)
+    scheduler = Scheduler(store, Dispatcher(busy=True), clock=clock)
+    assert asyncio.run(scheduler.poll()) == []
+    first = store.list_events()[0]
+    assert not first.catch_up
+    for instant in (20, 90, 100):
+        clock.now = instant
+        assert asyncio.run(scheduler.poll()) == []
+        event = store.list_events()[0]
+        assert event.id == first.id
+        assert (event.due_at, event.through_at, event.catch_up) == (10, instant, True)
+
+
+def test_pause_after_mark_sending_keeps_same_window_for_restart(tmp_path):
+    path = tmp_path / "deferred.db"
+
+    class Pausing(Dispatcher):
+        async def dispatch(self, event):
+            self.seen.append(event)
+            assert store.get_event(event.id).status == "sending"
+            store.set_autonomy_paused(True)
+            raise DeferredDispatch("paused before native submission")
+
+    with Store(path) as store:
+        store.create_job(
+            name="closed windows",
+            schedule_type="every",
+            schedule_value=10,
+            catch_up=True,
+            now=0,
+        )
+        dispatcher = Pausing()
+        results = asyncio.run(Scheduler(store, dispatcher, clock=Clock(90)).poll())
+        event = results[0]
+        assert (event.status, event.due_at, event.through_at) == ("pending", 10, 90)
+        assert event.receipt is None
+        assert len(dispatcher.seen) == 1
+
+    with Store(path) as store:
+        dispatcher = Dispatcher()
+        scheduler = Scheduler(store, dispatcher, clock=Clock(90))
+        assert store.is_autonomy_paused()
+        assert asyncio.run(scheduler.poll()) == []
+        assert dispatcher.seen == []
+        store.set_autonomy_paused(False)
+        resumed = asyncio.run(scheduler.poll())
+        assert [(e.id, e.status) for e in resumed] == [(event.id, "accepted")]
+        assert [(e.due_at, e.through_at) for e in dispatcher.seen] == [(10, 90)]
+        assert len(store.list_events()) == 1
+
+
+@pytest.mark.parametrize("change", ["update", "disable", "delete"])
+def test_deferred_dispatch_cancels_obsolete_definition(store, change):
+    job = store.create_job(name="once", schedule_type="at", schedule_value=0, now=0)
+
+    class Changed(Dispatcher):
+        async def dispatch(self, event):
+            if change == "delete":
+                store.delete_job(job.id)
+            elif change == "disable":
+                store.update_job(job.id, enabled=False, now=0)
+            else:
+                store.update_job(job.id, prompt="new definition", now=0)
+            raise DeferredDispatch("temporarily busy before native submission")
+
+    outcomes = asyncio.run(Scheduler(store, Changed(), clock=Clock()).poll())
+    assert len(outcomes) == 1
+    assert outcomes[0].status == "cancelled"
+    assert outcomes[0].job == job
+    assert outcomes[0].receipt is None
 
 
 def test_pause_persists_through_restart_and_never_unpauses_on_tick(tmp_path):

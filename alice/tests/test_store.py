@@ -172,6 +172,38 @@ def test_pause_between_claim_and_send_blocks_dispatch(store):
     assert store.get_event(event.id).status == "pending"
 
 
+def test_defer_requires_live_owner_and_never_replays_unknown(store):
+    at(store)
+    event = due(store)
+    assert store.claim_event(event.id, "one", now=10)
+    assert store.mark_sending(event.id, "one", now=10)
+    with pytest.raises(LeaseLost):
+        store.defer_event(event.id, "other", now=10)
+    with pytest.raises(LeaseLost):
+        store.defer_event(event.id, "one", now=40)
+    assert store.get_event(event.id).status == "sending"
+    assert store.acquire_lease("replacement", now=40)
+    assert store.get_event(event.id).status == "unknown"
+    with pytest.raises(ValueError, match="owned sending"):
+        store.defer_event(event.id, "replacement", now=40)
+    assert store.get_event(event.id).status == "unknown"
+
+
+@pytest.mark.parametrize("status", ["pending", "claimed", "accepted", "completed", "failed"])
+def test_defer_cannot_erase_other_delivery_states(store, status):
+    at(store)
+    event = due(store)
+    if status != "pending":
+        assert store.claim_event(event.id, "one", now=10)
+    if status not in {"pending", "claimed"}:
+        assert store.mark_sending(event.id, "one", now=10)
+        store.record_receipt(event.id, DispatchReceipt(status, "thread", "turn"))
+    before = store.get_event(event.id)
+    with pytest.raises(ValueError, match="owned sending"):
+        store.defer_event(event.id, "one", now=10)
+    assert store.get_event(event.id) == before
+
+
 def test_unknown_outcome_blocks_future_periods_until_reconciled(store):
     job = store.create_job(name="effect", schedule_type="every", schedule_value=10, now=0)
     event = due(store)

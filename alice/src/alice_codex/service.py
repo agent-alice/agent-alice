@@ -16,7 +16,13 @@ import time
 import uuid
 
 from .codex import CodexClient
-from .calendar import prepare_dispatch, dispatch_completion, summary_level
+from .calendar import (
+    prepare_dispatch,
+    dispatch_completion,
+    summary_level,
+    summary_dependencies,
+    UnclosedSummaryDependency,
+)
 from .config import RuntimeConfig
 from .control import MAX_MESSAGE
 from .files import SingletonLock, read_json, write_json
@@ -24,13 +30,13 @@ from .memory import MemoryStore
 from .journal import NativeJournal
 from .resources import ResourceLedger
 from .rpc import RpcClient, RpcError
-from .scheduler import Scheduler, RejectedDispatch
+from .scheduler import Scheduler, RejectedDispatch, DeferredDispatch
 from .store import DispatchReceipt, Store
 
 
 def process_identity(pid: int) -> str | None:
     result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="],
+        ["ps", "-ww", "-p", str(pid), "-o", "lstart=", "-o", "command="],
         capture_output=True,
         text=True,
         timeout=5,
@@ -43,6 +49,122 @@ def process_birth(pid: int) -> str | None:
         ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, timeout=5
     )
     return result.stdout.strip() or None
+
+
+async def _stop_native_root(
+    client: CodexClient, config: RuntimeConfig, thread_id: str, *, timeout: float | None = None
+) -> dict:
+    options = {} if timeout is None else {"timeout": timeout}
+    try:
+        return await client.stop_tree(thread_id, **options)
+    except RpcError as error:
+        if error.code != -32600 or str(error) not in {
+            f"thread not loaded: {thread_id}",
+            f"thread not found: {thread_id}",
+        }:
+            raise
+        await client.thread_resume(
+            thread_id,
+            cwd=str(config.workspace),
+            model=config.model,
+            **config.native_permission_params(),
+        )
+        return await client.stop_tree(thread_id, **options)
+
+
+async def recover_owned_server(config: RuntimeConfig, state: dict) -> None:
+    """Stop a recorded orphan without constructing Service or opening business stores.
+
+    The caller must hold service.lock and ensure the previous daemon has exited.
+    Only the server identity and valid task root IDs are read; no runtime schema
+    migration, root replacement, pause change or Alice state write occurs. Native stop
+    failures fall back to termination of the verified owned group; returning does
+    not prove that detached processes or external business effects were undone.
+    """
+    previous = state.get("server")
+    if previous is None:
+        return
+    if not isinstance(previous, dict) or type(previous.get("pid")) is not int:
+        raise RuntimeError("Invalid recorded server identity; refusing recovery")
+    pid = previous["pid"]
+    if pid <= 0:
+        raise RuntimeError("Invalid recorded server identity; refusing recovery")
+    current = process_identity(pid)
+    if not current:
+        return
+    born = process_birth(pid)
+    if born is None:
+        return  # The owned process can exit between observations.
+    same_identity = (
+        born == previous["birth"] if previous.get("birth") else current == previous.get("identity")
+    )
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    if not same_identity or pgid != pid or str(config.codex_socket) not in current:
+        raise RuntimeError("Recorded server identity changed; refusing to signal another process")
+
+    tasks = state.get("tasks")
+    roots = list(
+        dict.fromkeys(
+            task["thread_id"]
+            for task in (tasks.values() if isinstance(tasks, dict) else [])
+            if isinstance(task, dict)
+            and isinstance(task.get("thread_id"), str)
+            and task["thread_id"]
+        )
+    )
+    # An orphan can own native terminals outside its original process group.
+    # Try every known root, even if an earlier empty alias has no saved rollout.
+    recovered_rpc = None
+    try:
+        recovered_rpc = await RpcClient.connect_unix(
+            config.codex_socket, timeout=2, request_timeout=5
+        )
+        await recovered_rpc.initialize(name="alice_recovery")
+        recovered = CodexClient(recovered_rpc, owned_root_ids=roots)
+        try:
+            for thread_id in roots:
+                try:
+                    await _stop_native_root(recovered, config, thread_id, timeout=5)
+                except Exception:
+                    # No failure authorizes a new root or another input attempt.
+                    continue
+        finally:
+            recovered.close()
+    except Exception:
+        pass  # Transport failure still requires verified owned-group cleanup.
+    finally:
+        if recovered_rpc:
+            with suppress(Exception):
+                await recovered_rpc.close()
+
+    def same_group_alive() -> bool:
+        observed_birth = process_birth(pid)
+        if observed_birth is None:
+            return False
+        if observed_birth != born:
+            raise RuntimeError("Owned server identity changed during recovery")
+        try:
+            if os.getpgid(pid) != pid:
+                raise RuntimeError("Owned server process group changed during recovery")
+        except ProcessLookupError:
+            return False
+        return True
+
+    for termination in (signal.SIGTERM, signal.SIGKILL):
+        if not same_group_alive():
+            return
+        try:
+            os.killpg(pid, termination)
+        except ProcessLookupError:
+            return
+        for _ in range(100):
+            if process_birth(pid) != born:
+                return
+            await asyncio.sleep(0.05)
+    raise RuntimeError("Owned orphan server did not exit")
 
 
 class Service:
@@ -84,6 +206,9 @@ class Service:
         self._background: list[asyncio.Task] = []
         self._handlers: set[asyncio.Task] = set()
         self._native_interrupts: dict[str, str] = {}
+        self._resuming: set[str] = set()
+        self._pause_revision = 0  # In-flight resume fence; no resume survives process exit.
+        self._task_pause_revisions: dict[str, int] = {}
         self.scheduler = Scheduler(self.store, self)
 
     def save(self) -> None:
@@ -93,64 +218,7 @@ class Service:
         return self._task_locks.setdefault(key, asyncio.Lock())
 
     async def _recover_orphan(self) -> None:
-        previous = self.state.get("server")
-        if not previous:
-            return
-        pid = previous["pid"]
-        current = process_identity(pid)
-        if not current:
-            return
-        born = process_birth(pid)
-        same_identity = (
-            born == previous["birth"] if previous.get("birth") else current == previous["identity"]
-        )
-        if (
-            not same_identity
-            or os.getpgid(pid) != pid
-            or str(self.config.codex_socket) not in current
-        ):
-            raise RuntimeError(
-                "Recorded server identity changed; refusing to signal another process"
-            )
-        # An orphan can still own terminals in other process groups. Ask its
-        # native runtime to stop them before terminating our original group.
-        recovered_rpc = None
-        try:
-            recovered_rpc = await RpcClient.connect_unix(
-                self.config.codex_socket, timeout=2, request_timeout=5
-            )
-            await recovered_rpc.initialize(name="alice_recovery")
-            recovered = CodexClient(
-                recovered_rpc,
-                owned_root_ids=[task["thread_id"] for task in self.state["tasks"].values()],
-            )
-            try:
-                for task in list(self.state["tasks"].values()):
-                    await recovered.stop_tree(task["thread_id"], timeout=5)
-            finally:
-                recovered.close()
-        except Exception:
-            # Transport failure doesn't authorize another invocation. The only
-            # fallback is termination of this verified, owned process group.
-            pass
-        finally:
-            if recovered_rpc:
-                await recovered_rpc.close()
-        if process_birth(pid) != born or os.getpgid(pid) != pid:
-            raise RuntimeError("Owned server identity changed during recovery")
-        os.killpg(pid, signal.SIGTERM)
-        for _ in range(100):
-            if process_birth(pid) != born:
-                return
-            await asyncio.sleep(0.05)
-        # Only the same verified process group, never a PID found by name alone.
-        if process_birth(pid) == born and os.getpgid(pid) == pid:
-            os.killpg(pid, signal.SIGKILL)
-        for _ in range(100):
-            if process_birth(pid) != born:
-                return
-            await asyncio.sleep(0.05)
-        raise RuntimeError("Owned orphan server did not exit")
+        await recover_owned_server(self.config, self.state)
 
     async def run(self) -> None:
         self.config.prepare_directories()
@@ -241,9 +309,9 @@ class Service:
             except Exception as error:
                 self.error = f"Pause persistence failed: {type(error).__name__}"
             if self.codex:
-                for task in list(self.state["tasks"].values()):
+                for key in list(self.state["tasks"]):
                     try:
-                        await self.codex.stop_tree(task["thread_id"], timeout=8)
+                        await self._stop_task(key, timeout=8)
                     except Exception as error:
                         self.error = (
                             f"Shutdown required owned-server termination: {type(error).__name__}"
@@ -294,6 +362,21 @@ class Service:
         }:
             return
         params = event.get("params", {})
+        if event["method"] == "turn/started" or (
+            event["method"] == "item/completed"
+            and params.get("item", {}).get("type") == "userMessage"
+        ):
+            try:
+                changed = False
+                for task in self.state["tasks"].values():
+                    if task["thread_id"] == params.get("threadId") and not task.get("has_input"):
+                        task["has_input"] = True
+                        changed = True
+                if changed:
+                    self.save()  # Direct TUI input must survive before archive-worker scheduling.
+            except Exception:
+                self._fail("Native input ownership could not be persisted")
+                return
         if event["method"] in {"thread/tokenUsage/updated", "account/rateLimits/updated"}:
             try:
                 # Keep receiving accounting through native interruption, even
@@ -308,6 +391,7 @@ class Service:
                     if limit_id:
                         observed["rateLimitsByLimitId"] = {limit_id: snapshot}
                     self.resources.record_rate_limits(observed)
+                    self._mark_resource_pauses()
             except Exception:
                 self._fail("Native resource observations could not be persisted")
             return
@@ -331,10 +415,13 @@ class Service:
         # The TUI can interrupt a turn that never passed through Alice.submit.
         # Persist before the next await so a due heartbeat cannot revive it.
         for key, task in list(self.state["tasks"].items()):
-            if task["thread_id"] == thread and not task.get("paused"):
+            if task["thread_id"] == thread and (not task.get("paused") or key in self._resuming):
                 task["paused"] = True
                 if key == "main":
+                    self._pause_revision += 1
                     self.store.set_autonomy_paused(True)
+                else:
+                    self._task_pause_revisions[key] = self._task_pause_revisions.get(key, 0) + 1
                 self.save()
                 return key
         return None
@@ -425,6 +512,7 @@ class Service:
                     raise RuntimeError("Owned Codex connection was lost")
                 if time.monotonic() >= self._resource_refresh_at:
                     await self.refresh_resources()
+                await self._stop_resource_paused_tasks()
                 await self.reconcile()
                 await self.scheduler.poll()
                 await asyncio.sleep(self.config.poll_seconds)
@@ -444,7 +532,33 @@ class Service:
             self.resources.record_rate_limits(None)
         else:
             self.resources.record_rate_limits(result)
+        self._mark_resource_pauses()
+        await self._stop_resource_paused_tasks()
         return self.resources.status()
+
+    def _mark_resource_pauses(self) -> None:
+        if self.resources.can_dispatch(automatic=True)["allowed"]:
+            return
+        changed = False
+        for key, task in self.state["tasks"].items():
+            if (
+                task.get("automatic") is True
+                and (not task.get("paused") or key in self._resuming)
+                and not task.get("resource_pause_pending")
+            ):
+                task.update(paused=True, resource_pause_pending=True)
+                self._task_pause_revisions[key] = self._task_pause_revisions.get(key, 0) + 1
+                changed = True
+        if changed:
+            self.save()  # Persist admission and unfinished stop before the next await.
+
+    async def _stop_resource_paused_tasks(self) -> None:
+        async with self._lock("resource-stops"):
+            for key, task in list(self.state["tasks"].items()):
+                if task.get("resource_pause_pending"):
+                    await self.pause(key)  # Includes native Goal, input queue and descendants.
+                    task.pop("resource_pause_pending", None)
+                    self.save()
 
     async def ensure_thread(self, key: str) -> dict:
         if not isinstance(key, str) or not key or len(key) > 150:
@@ -453,7 +567,23 @@ class Service:
             task = self.state["tasks"].get(key)
             if task:
                 try:
-                    result = await self.codex.thread_read(task["thread_id"])
+                    try:
+                        result = await self.codex.thread_read(task["thread_id"])
+                    except RpcError as error:
+                        if (
+                            error.code != -32600
+                            or str(error) != f"thread not loaded: {task['thread_id']}"
+                        ):
+                            raise
+                        # This is not proof of absent history. Resume the exact
+                        # ID first; only an explicit no-rollout error below can
+                        # authorize replacement of an untouched empty thread.
+                        result = await self.codex.thread_resume(
+                            task["thread_id"],
+                            cwd=str(self.config.workspace),
+                            model=self.config.model,
+                            **self.config.native_permission_params(),
+                        )
                     status = result["thread"].get("status", {}).get("type")
                     if status == "notLoaded":
                         await self.codex.thread_resume(
@@ -472,11 +602,10 @@ class Service:
                         raise
                     # Codex intentionally doesn't persist an unused empty thread.
                     # Never use this fallback after any acknowledged/unknown input.
-                    self.state.setdefault("replaced_empty_threads", []).append(task["thread_id"])
-                    del self.state["tasks"][key]
-                    self.save()
+                    # Retain the old alias and its pause flags until replacement
+                    # succeeds, including if this process dies during thread/start.
             if self.stopping:
-                raise RejectedDispatch("Service is stopping")
+                raise DeferredDispatch("Service is stopping")
             result = await self.codex.thread_start(
                 cwd=str(self.config.workspace),
                 model=self.config.model,
@@ -490,9 +619,14 @@ class Service:
                     "Only explicit user goals authorize creating a persistent Goal."
                 ),
             )
+            if task:
+                if task.get("has_input"):
+                    raise RpcError("Input was observed while replacing an empty thread")
+                self.state.setdefault("replaced_empty_threads", []).append(task["thread_id"])
             task = {
+                **(task or {}),
                 "thread_id": result["thread"]["id"],
-                "paused": False,
+                "paused": bool(task and task.get("paused")),
                 "created_at": time.time(),
                 "has_input": False,
             }
@@ -508,23 +642,38 @@ class Service:
         task = self.state["tasks"].get(target)
         if task and task.get("paused"):
             return True
-        if target.startswith("summary:L"):
-            rank = {"L1": 1, "L2": 2, "L3": 3, "L4": 4}
-            level = target.removeprefix("summary:")
-            if level not in rank:
-                raise ValueError("Unknown summary level")
-            for event in self.store.list_events():
-                lower = summary_level(event.job)
-                if lower and rank[lower] < rank[level] and event.status != "completed":
-                    return True  # Staggering clocks is not proof that lower summaries committed.
-        active = 0
+        # An acknowledgement can precede native status visibility; ambiguous
+        # inputs also reserve their root until reconciliation, never a new ID.
+        active = {
+            intent["thread_id"]
+            for intent in self.state["intents"].values()
+            if intent["status"] in {"sending", "unknown", "accepted", "queued"}
+        }
+        if task and task["thread_id"] in active:
+            return True
         task_snapshot = list(self.state["tasks"].items())
         task_ids = {(name, item["thread_id"]) for name, item in task_snapshot}
         for name, item in task_snapshot:
             if item.get("reconcile_error") == "native_history_missing":
                 continue
             try:
-                thread = (await self.codex.thread_read(item["thread_id"]))["thread"]
+                try:
+                    thread = (await self.codex.thread_read(item["thread_id"]))["thread"]
+                except RpcError as error:
+                    if (
+                        error.code != -32600
+                        or str(error) != f"thread not loaded: {item['thread_id']}"
+                    ):
+                        raise
+                    if item.get("paused"):
+                        # No loaded executor exists here. An automatic capacity
+                        # query must not resume a different manually paused root.
+                        continue
+                    previous_id = item["thread_id"]
+                    item = await self.ensure_thread(name)
+                    task_ids.discard((name, previous_id))
+                    task_ids.add((name, item["thread_id"]))
+                    thread = (await self.codex.thread_read(item["thread_id"]))["thread"]
             except RpcError as error:
                 if "no rollout found" in str(error):
                     if item.get("has_input"):
@@ -535,10 +684,10 @@ class Service:
                     continue
                 raise
             if thread.get("status", {}).get("type") == "active":
-                active += 1
+                active.add(item["thread_id"])
                 if name == target:
                     return True
-        return active >= self.config.max_active_tasks or task_ids != {
+        return len(active) >= self.config.max_active_tasks or task_ids != {
             (name, item["thread_id"]) for name, item in self.state["tasks"].items()
         }
 
@@ -554,25 +703,44 @@ class Service:
     ) -> dict:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Task input cannot be empty")
+        if type(automatic) is not bool:
+            raise ValueError("automatic must be boolean")
+        if not isinstance(target, str) or not target or len(target) > 150:
+            raise ValueError("Task name must contain 1–150 characters")
+        if intent_id is not None and (not isinstance(intent_id, str) or not intent_id):
+            raise ValueError("Request ID must be a nonempty string")
         intent_id = intent_id or str(uuid.uuid4())
         fingerprint = hashlib.sha256((target + "\0" + text).encode()).hexdigest()
-        async with self._lock("input:" + target):
-            if self.stopping or (
-                automatic
-                and (
-                    self.store.is_autonomy_paused()
-                    or not self.resources.can_dispatch(automatic=True)["allowed"]
-                )
-            ):
-                raise RejectedDispatch("Autonomy is paused")
+        # All entry points share the request namespace and capacity boundary.
+        # Hold admission only through the bounded native acknowledgement, never
+        # through model execution. Pause persists flags before waiting for input.
+        async with self._lock("admission"), self._lock("input:" + target):
             if intent_id in self.state["intents"]:
                 prior = self.state["intents"][intent_id]
                 if prior.get("input_sha256") != fingerprint:
                     raise ValueError("Request ID already identifies different input")
                 return prior
+            if self.stopping or (automatic and await self.is_busy(target)):
+                raise DeferredDispatch("Automatic dispatch is paused or busy")
             task = await self.ensure_thread(target)
             if task.get("paused"):
-                raise RejectedDispatch("Task is paused; resume it explicitly")
+                raise DeferredDispatch("Task is paused; resume it explicitly")
+            native = (await self.codex.thread_read(task["thread_id"]))["thread"]
+            if (
+                self.stopping
+                or task.get("paused")
+                or (
+                    automatic
+                    and (
+                        self.store.is_autonomy_paused()
+                        or not self.resources.can_dispatch(automatic=True)["allowed"]
+                        or native.get("status", {}).get("type") == "active"
+                    )
+                )
+            ):
+                # No input was sent, so retain the occurrence without inventing
+                # a failed durable intent that would poison its stable retry ID.
+                raise DeferredDispatch("Dispatch paused or busy before input was sent")
             intent = {
                 "id": intent_id,
                 "target": target,
@@ -581,27 +749,16 @@ class Service:
                 "event_id": event_id,
                 "created_at": time.time(),
                 "input_sha256": fingerprint,
+                "automatic": automatic,
             }
             if summary_plan:
                 intent["summary_plan"] = summary_plan
             self.state["intents"][intent_id] = intent
+            # A manual follow-up can share a native root with an autonomous
+            # Goal/queue. It cannot revoke ownership of that still-running tree.
+            task["automatic"] = automatic or task.get("automatic") is True
             self.save()  # Save intent before any RPC can start side effects.
             try:
-                native = (await self.codex.thread_read(task["thread_id"]))["thread"]
-                if (
-                    self.stopping
-                    or task.get("paused")
-                    or (
-                        automatic
-                        and (
-                            self.store.is_autonomy_paused()
-                            or not self.resources.can_dispatch(automatic=True)["allowed"]
-                        )
-                    )
-                ):
-                    intent["status"] = "failed"
-                    self.save()
-                    raise RejectedDispatch("Dispatch paused before input was sent")
                 if native.get("status", {}).get("type") == "active":
                     result = await self.codex.queue_add(
                         task["thread_id"], text, client_message_id=intent_id
@@ -630,6 +787,12 @@ class Service:
         )
         summary_plan = None
         if summary_level(event.job):
+            try:
+                dependencies = summary_dependencies(event, self.store.list_events())
+            except UnclosedSummaryDependency as error:
+                raise DeferredDispatch(str(error)) from error
+            if dependencies:
+                raise DeferredDispatch("Required lower summary windows are not completed")
             plan = prepare_dispatch(event, self.memory)
             if not plan["prepared"]:
                 return DispatchReceipt(
@@ -721,11 +884,13 @@ class Service:
 
     async def pause(self, target: str | None = None) -> dict:
         if target is None:
+            self._pause_revision += 1
             self.store.set_autonomy_paused(True)
             keys = list(self.state["tasks"])
         else:
             if target not in self.state["tasks"]:
                 raise ValueError("Unknown task")
+            self._task_pause_revisions[target] = self._task_pause_revisions.get(target, 0) + 1
             keys = [target]
         for key in keys:
             self.state["tasks"][key]["paused"] = True
@@ -734,13 +899,91 @@ class Service:
         for key in keys:
             async with self._lock("input:" + key):
                 try:
-                    results[key] = await self.codex.stop_tree(self.state["tasks"][key]["thread_id"])
+                    results[key] = await self._stop_task(key)
                 except Exception:
                     self._fail("Task tree pause could not be proven")
                     raise RuntimeError(
                         "Could not prove task tree paused; stopping the owned Codex server"
                     )
         return {"paused": True, "tasks": results}
+
+    async def _stop_task(self, key: str, *, codex=None, timeout: float | None = None) -> dict:
+        client = codex or self.codex
+        task = self.state["tasks"][key]
+        thread_id = task["thread_id"]
+        try:
+            return await _stop_native_root(client, self.config, thread_id, timeout=timeout)
+        except RpcError as error:
+            untouched = not task.get("has_input") and not any(
+                intent["thread_id"] == thread_id for intent in self.state["intents"].values()
+            )
+            if (
+                not untouched
+                or error.code != -32600
+                or str(error) != f"no rollout found for thread id {thread_id}"
+            ):
+                raise
+            # Native explicitly confirms an unused alias has no execution to
+            # stop. Keep that paused alias; stopping must not create a new root.
+            return {"stopped": [], "absent_empty_thread": thread_id}
+
+    async def resume(self, target: str | None = None) -> dict:
+        await self._stop_resource_paused_tasks()
+        async with self._lock("admission"):
+            revision = self._pause_revision
+            keys = (
+                [target]
+                if target
+                else [name for name, task in self.state["tasks"].items() if task.get("paused")]
+            )
+            task_revisions = {key: self._task_pause_revisions.get(key, 0) for key in keys}
+            for key in keys:
+                async with self._lock("input:" + key):
+                    self._resuming.add(key)
+                    try:
+
+                        def check():
+                            self._mark_resource_pauses()
+                            if (
+                                self.stopping
+                                or self._pause_revision != revision
+                                or self._task_pause_revisions.get(key, 0) != task_revisions[key]
+                            ):
+                                raise RejectedDispatch("Resume superseded by a pause")
+                            if (
+                                self.state["tasks"].get(key, {}).get("automatic") is True
+                                and not self.resources.can_dispatch(automatic=True)["allowed"]
+                            ):
+                                raise RejectedDispatch("Automatic task resource limit is active")
+
+                        check()
+                        task = await self.ensure_thread(key)
+                        check()
+                        queue = await self.codex.queue_list(task["thread_id"], limit=1)
+                        check()
+                        if queue.get("data"):
+                            await self.codex.queue_start(task["thread_id"])
+                            check()
+                        goal = (
+                            await self.rpc.request(
+                                "thread/goal/get", {"threadId": task["thread_id"]}
+                            )
+                        ).get("goal")
+                        check()
+                        if goal and goal.get("status") == "paused":
+                            await self.rpc.request(
+                                "thread/goal/set",
+                                {"threadId": task["thread_id"], "status": "active"},
+                            )
+                            check()
+                        task["paused"] = False
+                        task.pop("reconcile_error", None)
+                        self.save()
+                    finally:
+                        self._resuming.discard(key)
+            if target is None:
+                self.store.set_autonomy_paused(False)
+        return {"resumed": target or "autonomy"}
 
     async def handle(self, action: str, params: dict) -> dict:
         if action == "status":
@@ -762,30 +1005,7 @@ class Service:
         if action == "pause":
             return await self.pause(params.get("target"))
         if action == "resume":
-            target = params.get("target")
-            keys = (
-                [target]
-                if target
-                else [name for name, task in self.state["tasks"].items() if task.get("paused")]
-            )
-            for key in keys:
-                task = await self.ensure_thread(key)
-                queue = await self.codex.queue_list(task["thread_id"], limit=1)
-                if queue.get("data"):
-                    await self.codex.queue_start(task["thread_id"])
-                goal = (
-                    await self.rpc.request("thread/goal/get", {"threadId": task["thread_id"]})
-                ).get("goal")
-                if goal and goal.get("status") == "paused":
-                    await self.rpc.request(
-                        "thread/goal/set", {"threadId": task["thread_id"], "status": "active"}
-                    )
-                task["paused"] = False
-                task.pop("reconcile_error", None)
-                self.save()
-            if target is None:
-                self.store.set_autonomy_paused(False)
-            return {"resumed": target or "autonomy"}
+            return await self.resume(params.get("target"))
         if action == "thread":
             return await self.ensure_thread(params.get("target", "main"))
         if action == "ask":

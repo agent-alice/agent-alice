@@ -4,15 +4,18 @@ from dataclasses import replace
 import datetime as dt
 import json
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from alice_codex.calendar import (
     CalendarError,
+    UnclosedSummaryDependency,
     closed_periods,
     dispatch_completion,
     prepare_dispatch,
     register_default_jobs,
+    summary_dependencies,
     summary_level,
 )
 from alice_codex.memory import MemoryStore, SourceChangedError, SummaryValidationError
@@ -22,18 +25,19 @@ from alice_codex.store import DispatchEvent, Job, Store
 NOW = dt.datetime(2027, 1, 10, tzinfo=dt.timezone.utc)
 
 
-def occurrence(level, first, last=None):
+def occurrence(level, first, last=None, *, timezone="Asia/Shanghai", status="sending"):
     job = Job(
         "test-" + level,
         "summary:" + level,
         "cron",
         "5 */2 * * *",
-        timezone="Asia/Shanghai",
+        timezone=timezone,
         target="summary:" + level,
     )
-    begin = dt.datetime.fromisoformat(first + "+08:00").timestamp()
-    end = dt.datetime.fromisoformat((last or first) + "+08:00").timestamp()
-    return DispatchEvent("event-" + level, job.id, job, begin, end, end > begin, "sending")
+    zone = ZoneInfo(timezone)
+    begin = dt.datetime.fromisoformat(first).replace(tzinfo=zone).timestamp()
+    end = dt.datetime.fromisoformat(last or first).replace(tzinfo=zone).timestamp()
+    return DispatchEvent("event-" + level, job.id, job, begin, end, end > begin, status)
 
 
 @pytest.mark.parametrize(
@@ -165,3 +169,115 @@ def test_no_sources_plan_is_explicitly_skipped_without_model_work(tmp_path):
     assert plan["prepared"] == []
     assert plan["skipped"] == [{"period": "2026-08", "reason": "no_sources", "status": "skipped"}]
     assert dispatch_completion(plan, memory)["complete"]
+
+
+def test_dependencies_only_block_actual_target_windows_not_historical_failures():
+    target = occurrence("L2", "2026-09-02T00:15:00")
+    old = occurrence("L1", "2026-08-31T02:05:00", status="failed")
+    before = occurrence("L1", "2026-09-01T00:05:00", status="failed")
+    related = occurrence("L1", "2026-09-02T00:05:00", status="failed")
+    after = occurrence("L1", "2026-09-02T02:05:00", status="failed")
+    assert summary_dependencies(target, [old, before, related, after], now=NOW) == [related]
+    completed = replace(related, event_id="completed-retry", status="completed")
+    assert summary_dependencies(target, [old, before, related, completed, after], now=NOW) == []
+
+
+@pytest.mark.parametrize("status", ["pending", "claimed", "sending", "unknown", "accepted", "queued"])
+def test_active_dependency_is_not_hidden_by_a_completed_copy(status):
+    target = occurrence("L2", "2026-09-02T00:15:00")
+    active = occurrence("L1", "2026-09-01T02:05:00", status=status)
+    completed = replace(active, event_id="old-completion", status="completed")
+    assert summary_dependencies(target, [active, completed], now=NOW) == [active]
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+def test_coalesced_dependency_requires_completion_of_every_relevant_period(status):
+    target = occurrence("L2", "2026-09-02T00:15:00")
+    failed = occurrence("L1", "2026-09-01T02:05:00", "2026-09-01T06:05:00", status=status)
+    first = occurrence("L1", "2026-09-01T02:05:00", status="completed")
+    last = occurrence("L1", "2026-09-01T06:05:00", status="completed")
+    middle = occurrence("L1", "2026-09-01T04:05:00", status="completed")
+    assert summary_dependencies(target, [failed, first, last], now=NOW) == [failed]
+    assert summary_dependencies(target, [failed, first, last, middle], now=NOW) == []
+
+
+def test_dependency_comparison_uses_instants_across_timezones():
+    target = occurrence("L2", "2026-09-02T00:15:00")
+    same_label_outside = occurrence(
+        "L1", "2026-09-01T20:05:00", timezone="UTC", status="failed"
+    )
+    different_label_inside = occurrence(
+        "L1", "2026-08-31T18:05:00", timezone="UTC", status="failed"
+    )
+    assert summary_dependencies(
+        target, [same_label_outside, different_label_inside], now=NOW
+    ) == [different_label_inside]
+
+
+def test_overlapping_completed_period_does_not_cover_full_failed_period():
+    target = occurrence("L2", "2026-09-02T00:15:00", timezone="UTC")
+    failed = occurrence("L1", "2026-09-01T02:05:00", timezone="UTC", status="failed")
+    shifted = occurrence(
+        "L1", "2026-09-01T02:05:00", timezone="Europe/London", status="completed"
+    )
+    assert summary_dependencies(target, [failed, shifted], now=NOW) == [failed]
+    full = occurrence("L1", "2026-09-01T02:05:00", timezone="UTC", status="completed")
+    assert summary_dependencies(target, [failed, shifted, full], now=NOW) == []
+
+
+def test_weekly_dependency_crosses_iso_year_boundary():
+    target = occurrence("L3", "2026-01-05T00:25:00")
+    before = occurrence("L2", "2025-12-29T00:15:00", status="failed")
+    inside = occurrence("L2", "2026-01-01T00:15:00", status="failed")
+    final_day = occurrence("L2", "2026-01-05T00:15:00", status="failed")
+    after = occurrence("L2", "2026-01-06T00:15:00", status="failed")
+    assert summary_dependencies(target, [before, inside, final_day, after], now=NOW) == [
+        inside,
+        final_day,
+    ]
+
+
+@pytest.mark.parametrize(
+    "level,due",
+    [("L1", "2026-03-31T00:05:00"), ("L2", "2026-03-31T00:15:00"), ("L3", "2026-04-06T00:25:00")],
+)
+def test_monthly_dependency_includes_complete_overlapping_weeks(level, due):
+    # April 2026 includes weeks spanning March 30 through May 4.
+    target = occurrence("L4", "2026-05-01T00:35:00")
+    outside = occurrence("L2", "2026-03-30T00:15:00", status="failed")
+    beginning = occurrence(level, due, status="failed")
+    ending = occurrence("L2", "2026-05-04T00:15:00", status="failed")
+    assert summary_dependencies(target, [outside, beginning, ending], now=NOW) == [
+        beginning,
+        ending,
+    ]
+
+
+def test_monthly_dependency_waits_for_open_tail_week_even_without_persisted_event():
+    target = occurrence("L4", "2026-05-01T00:35:00")
+    with pytest.raises(UnclosedSummaryDependency, match="remains open") as error:
+        summary_dependencies(target, [], now=dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc))
+    assert error.value.available_at == dt.datetime(2026, 5, 3, 16, tzinfo=dt.timezone.utc)
+    assert summary_dependencies(target, [], now=error.value.available_at) == []
+    aligned = occurrence("L4", "2026-06-01T00:35:00")
+    assert summary_dependencies(
+        aligned, [], now=dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc)
+    ) == []
+
+
+def test_dependency_intervals_include_dst_transition_day():
+    target = occurrence("L2", "2026-11-02T00:15:00", timezone="America/New_York")
+    # The closed November 1 day has 25 hours, ending at 05:00 UTC November 2.
+    tail = occurrence("L1", "2026-11-02T06:05:00", timezone="UTC", status="failed")
+    after = occurrence("L1", "2026-11-02T08:05:00", timezone="UTC", status="failed")
+    assert summary_dependencies(target, [tail, after], now=NOW) == [tail]
+
+
+def test_dependency_calendar_preserves_explicit_range_partition_limit():
+    target = occurrence("L2", "2026-09-02T00:15:00")
+    oversized = occurrence("L1", "2026-09-01T02:05:00", "2026-09-01T06:05:00")
+    with pytest.raises(CalendarError, match="partitioning"):
+        summary_dependencies(target, [oversized], now=NOW, max_periods=2)
+    assert summary_dependencies(oversized, [target], now=NOW) == []
+    unrelated = occurrence("L1", "2025-01-01T00:05:00", "2026-08-01T00:05:00", status="failed")
+    assert summary_dependencies(target, [unrelated], now=NOW, max_periods=2) == []

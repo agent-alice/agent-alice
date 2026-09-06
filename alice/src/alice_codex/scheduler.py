@@ -132,6 +132,14 @@ class RejectedDispatch(Exception):
     """The receiver definitively did not accept the operation."""
 
 
+class DeferredDispatch(RejectedDispatch):
+    """Nothing was sent, and a temporary admission condition permits retry.
+
+    Use only before an external request can have been accepted. An uncertain
+    transport result must remain unknown and requires reconciliation.
+    """
+
+
 class Scheduler:
     def __init__(
         self,
@@ -229,6 +237,11 @@ class Scheduler:
                             ),
                         )
                         raise
+                    except DeferredDispatch:
+                        outcomes.append(
+                            self.store.defer_event(event.id, self.owner, now=self.clock())
+                        )
+                        continue
                     except RejectedDispatch as exc:
                         receipt = DispatchReceipt("failed", detail=str(exc))
                     except Exception as exc:

@@ -5,18 +5,27 @@ Its persisted plan is a bounded task manifest, not a Codex input queue.
 """
 
 from dataclasses import asdict
+from collections.abc import Iterable
 import datetime as dt
 import hashlib
 import json
 import math
 from zoneinfo import ZoneInfo
 
-from .memory import MemoryStore, NoSourcesError, _atomic, _join
+from .memory import MemoryStore, NoSourcesError, _atomic, _join, _period_bounds
 from .store import DispatchEvent, Job, Store
 
 
 class CalendarError(ValueError):
     """A summary calendar cannot be interpreted without losing periods."""
+
+
+class UnclosedSummaryDependency(CalendarError):
+    """A closed month still needs its overlapping final week to close."""
+
+    def __init__(self, available_at: dt.datetime):
+        self.available_at = available_at
+        super().__init__(f"Summary dependency period remains open until {available_at.isoformat()}")
 
 
 SCHEDULES = {"L1": "5 */2 * * *", "L2": "15 0 * * *", "L3": "25 0 * * 1", "L4": "35 0 1 * *"}
@@ -137,6 +146,82 @@ def closed_periods(
             )
         end = _move(level, end, 1)
     return result
+
+
+def summary_dependencies(
+    event: DispatchEvent,
+    events: Iterable[DispatchEvent],
+    *,
+    now: dt.datetime | None = None,
+    max_periods: int = 4096,
+) -> list[DispatchEvent]:
+    """Return persisted lower-level work blocking this event's source windows.
+
+    Compare actual half-open time intervals, never dispatch deadlines or all
+    historical failures. Monthly inputs include whole overlapping weeks, just
+    as MemoryStore selects weekly sources. An open final week must defer even
+    when its occurrence has not yet been created.
+
+    Completed occurrences can cover failed/cancelled occurrences only for each
+    entire relevant lower-level period. In-flight work always blocks freezing;
+    an older completion cannot prove its new writes are finished. This checks
+    persisted occurrences, not source versions or the existence of every
+    expected historical occurrence. The caller must retain pending work when
+    UnclosedSummaryDependency is raised and independently verify commit receipts.
+    """
+    level = summary_level(event.job)
+    if level is None:
+        return []
+    current = now or dt.datetime.now(dt.timezone.utc)
+    periods = closed_periods(event, now=current, max_periods=max_periods)
+    if level == "L1":
+        return []
+    start = _period_bounds(level, periods[0], event.job.timezone)[0]
+    end = _period_bounds(level, periods[-1], event.job.timezone)[1]
+    if level == "L4":
+        start = _floor_end("L3", start)
+        week_end = _floor_end("L3", end)
+        end = week_end if end == week_end else _move("L3", week_end, 1)
+        if end.timestamp() > current.timestamp():
+            raise UnclosedSummaryDependency(end.astimezone(dt.timezone.utc))
+    target_start, target_end = start.timestamp(), end.timestamp()
+    rank = {name: index for index, name in enumerate(SCHEDULES)}
+    relevant = []
+    completed: dict[str, set[tuple[float, float]]] = {}
+    for candidate in events:
+        lower = summary_level(candidate.job)
+        if lower is None or rank[lower] >= rank[level]:
+            continue
+        if (
+            math.isfinite(candidate.due_at)
+            and math.isfinite(candidate.through_at)
+            and candidate.through_at >= candidate.due_at
+        ):
+            zone = ZoneInfo(candidate.job.timezone)
+            first = _floor_end(lower, dt.datetime.fromtimestamp(candidate.due_at, zone))
+            last = _floor_end(lower, dt.datetime.fromtimestamp(candidate.through_at, zone))
+            # Exclude unrelated ranges before expanding them: an old oversized
+            # catch-up must not exhaust the current window's partition budget.
+            if _move(lower, first, -1).timestamp() >= target_end or last.timestamp() <= target_start:
+                continue
+        windows = set()
+        for period in closed_periods(candidate, now=current, max_periods=max_periods):
+            bounds = _period_bounds(lower, period, candidate.job.timezone)
+            begin, finish = (value.timestamp() for value in bounds)
+            if begin < target_end and finish > target_start:
+                windows.add((begin, finish))
+        if not windows:
+            continue
+        if candidate.status == "completed":
+            completed.setdefault(lower, set()).update(windows)
+        else:
+            relevant.append((candidate, lower, windows))
+    return [
+        candidate
+        for candidate, lower, windows in relevant
+        if candidate.status not in {"failed", "cancelled"}
+        or not windows <= completed.get(lower, set())
+    ]
 
 
 def prepare_dispatch(

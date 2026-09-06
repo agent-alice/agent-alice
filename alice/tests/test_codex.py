@@ -292,6 +292,37 @@ class CodexTests(unittest.IsolatedAsyncioTestCase):
         self.rpc.request = lagging_list
         self.assertEqual((await self.codex.stop_tree("main"))["stopped"], ["child", "main"])
 
+    async def test_fresh_adapter_discovers_archived_parent_of_live_descendant(self):
+        self.rpc.threads["child"]["status"] = {"type": "notLoaded"}
+        self.rpc.threads["grandchild"] = {
+            "id": "grandchild",
+            "parentThreadId": "child",
+            "status": {"type": "active"},
+            "canAcceptDirectInput": False,
+        }
+        original = self.rpc.request
+        views = []
+
+        async def split_archive_views(method, params):
+            if method == "thread/list":
+                views.append(params.get("archived", False))
+                ids = ["child"] if params.get("archived") else ["main", "other"]
+                return {
+                    "data": [copy.deepcopy(self.rpc.threads[key]) for key in ids],
+                    "nextCursor": None,
+                }
+            return await original(method, params)
+
+        self.rpc.request = split_archive_views
+        self.assertEqual(self.codex._parents, {}, "recovery starts without cached ancestry")
+        result = await self.codex.stop_tree("main")
+        self.assertEqual(result["stopped"], ["child", "grandchild", "main"])
+        self.assertEqual(self.rpc.threads["grandchild"]["status"]["type"], "idle")
+        self.assertIn(True, views)
+        self.assertIn(False, views)
+        self.assertFalse(any(method == "thread/resume" for method, _ in self.rpc.calls))
+        self.assertEqual(self.rpc.threads["other"]["status"]["type"], "active")
+
 
 if __name__ == "__main__":
     unittest.main()
