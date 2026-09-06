@@ -73,6 +73,29 @@ def test_installed_behavior():
     binary = tmp_path / "codex"
     binary.write_text('#!/bin/sh\nprintf "codex-cli test-fixture\\n"\n')
     binary.chmod(0o700)
+    host = tmp_path / "codex-code-mode-host"
+    host.write_text('#!/bin/sh\nprintf "synthetic-host-fixture\\n"\n')
+    host.chmod(0o700)
+    # These are synthetic release-gate contracts, not real Codex capability
+    # evidence. The repository's separate native fixture exercises Code Mode.
+    (source / "tests/test_native.py").write_text("""import os
+import subprocess
+import pytest
+pytestmark = pytest.mark.native
+def test_fixture_binary():
+    result = subprocess.run([os.environ["ALICE_TEST_CODEX_BINARY"], "--version"], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "codex-cli test-fixture"
+""")
+    (source / "tests/test_native_code_mode.py").write_text("""import os
+import subprocess
+import pytest
+from pathlib import Path
+pytestmark = pytest.mark.native
+def test_fixture_companion_contract():
+    host = Path(os.environ["ALICE_TEST_CODEX_BINARY"]).parent / "codex-code-mode-host"
+    result = subprocess.run([str(host)], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "synthetic-host-fixture"
+""")
     return source, binary
 
 
@@ -95,6 +118,103 @@ def test_unverified_candidate_cannot_replace_active_pointer(tmp_path, project):
     assert manager.current() is None
 
 
+def test_non_native_checks_can_pass_without_authorizing_runtime_promotion(tmp_path, project):
+    manager, candidate = stage(tmp_path, project)
+    report = manager.verify(candidate, native=False)
+    assert report["passed"] and report["promotable"] is False
+    with pytest.raises(ReleaseError, match="required checks"):
+        manager.activate(candidate)
+    assert manager.current() is None
+
+
+def test_candidate_uses_fixed_pair_after_original_distribution_disappears(tmp_path, project):
+    manager, candidate = stage(tmp_path, project)
+    _, manifest = manager._manifest(candidate)
+    source_binary = project[1]
+    source_binary.unlink()
+    (source_binary.parent / "codex-code-mode-host").unlink()
+    report = manager.verify(candidate, native=True)
+    assert report["promotable"], report
+    assert manager.activate(candidate)["current"] == candidate
+    assert manifest["codex_source_binary"] == str(source_binary)
+    assert Path(manifest["codex_binary"]).is_file()
+
+
+def test_companion_drift_cannot_reuse_successful_native_tool_evidence(tmp_path, project):
+    manager, candidate = stage(tmp_path, project)
+    assert manager.verify(candidate, native=True)["promotable"]
+    _, manifest = manager._manifest(candidate)
+    host = Path(manifest["codex_code_mode_host"])
+    host.write_text("changed after actual fixture execution")
+    with pytest.raises(ReleaseError, match="Code Mode host changed"):
+        manager.activate(candidate)
+
+
+@pytest.mark.parametrize("change", ["deleted", "modified", "different_valid_pair"])
+def test_runtime_host_must_match_actual_candidate_tool_evidence(tmp_path, project, change):
+    from alice_codex.config import initialize_config
+    from alice_codex.runtime_bundle import HOST_NAME, verify_runtime_bundle
+
+    manager, candidate = stage(tmp_path, project)
+    assert manager.verify(candidate, native=True)["promotable"]
+    if change == "different_valid_pair":
+        # A self-consistent newly pinned pair with the same main executable
+        # cannot inherit the previously tested host's execution receipt.
+        (project[1].parent / HOST_NAME).write_text("#!/bin/sh\nexit 78\n")
+    config = initialize_config(manager.home, project[1])
+    host = Path(config.codex_binary).parent / HOST_NAME
+    if change == "different_valid_pair":
+        assert verify_runtime_bundle(config, require=True)["paired"]
+    elif change == "deleted":
+        host.unlink()
+    else:
+        host.write_text("damaged configured companion")
+    with pytest.raises(ReleaseError, match="host|companion"):
+        manager.activate(candidate)
+    assert manager.current() is None
+    assert manager.current() is None
+
+
+def test_legacy_candidate_stays_readable_but_cannot_reuse_or_overwrite_old_report(tmp_path, project):
+    manager, candidate = stage(tmp_path, project)
+    assert manager.verify(candidate, native=True)["promotable"]
+    pointer = manager.activate(candidate)
+    folder, manifest = manager._manifest(candidate)
+    manifest["policy_version"] = 4
+    (folder / "candidate.json").write_text(json.dumps(manifest))
+    before = (folder / "verification.json").read_bytes()
+    assert manager.current() == pointer
+    assert manager._manifest(candidate)[1]["policy_version"] == 4
+    with pytest.raises(ReleaseError, match="legacy candidate"):
+        manager.checked_current()
+    with pytest.raises(ReleaseError, match="legacy candidate"):
+        manager.verify(candidate, native=True)
+    assert (folder / "verification.json").read_bytes() == before
+    assert manager.current() == pointer
+
+
+def test_old_installed_bootstrap_must_be_uninstalled_before_pair_policy_activation(tmp_path, project):
+    from alice_codex.bootstrap import install_runtime
+
+    manager, candidate = stage(tmp_path, project)
+    assert manager.verify(candidate, native=True)["promotable"]
+    pointer = manager.activate(candidate)
+    bootstrap = install_runtime(manager)
+    metadata = manager.home / "bootstrap" / bootstrap["generation"] / "bootstrap.json"
+    value = json.loads(metadata.read_text())
+    value.pop("release_policy_version")
+    value.pop("codex_code_mode_host_sha256")
+    metadata.write_text(json.dumps(value))
+    installed = manager.home / "state/supervisor.json"
+    installed.parent.mkdir(exist_ok=True)
+    installed.write_text('{"version":2}')
+    with pytest.raises(ReleaseError, match="uninstall the previous supervisor"):
+        manager.activate(candidate)
+    assert manager.current() == pointer
+    installed.unlink()
+    assert manager.activate(candidate)["activation_epoch"] != pointer["activation_epoch"]
+
+
 def test_candidate_install_honors_constraints_and_rejects_missing_lock(tmp_path, project):
     source, _ = project
     (source / "requirements.lock").unlink()
@@ -109,9 +229,15 @@ def test_candidate_install_honors_constraints_and_rejects_missing_lock(tmp_path,
 
 def test_actual_installed_artifact_passes_and_activation_keeps_same_wheel(tmp_path, project):
     manager, candidate = stage(tmp_path, project)
-    report = manager.verify(candidate)
+    report = manager.verify(candidate, native=True)
     assert report["passed"], report
-    assert {check["name"] for check in report["checks"]} == {"ruff", "unit", "artifact"}
+    assert {check["name"] for check in report["checks"]} == {
+        "ruff",
+        "unit",
+        "artifact",
+        "native",
+        "native_pair",
+    }
     pointer = manager.activate(candidate, data_schema=1)
     assert pointer["current"] == candidate
     assert pointer["wheel_sha256"] == report["wheel_sha256"]
@@ -125,7 +251,7 @@ def test_actual_installed_artifact_passes_and_activation_keeps_same_wheel(tmp_pa
 
 def test_broken_installed_artifact_blocks_release_even_when_unit_tests_pass(tmp_path, project):
     manager, candidate = stage(tmp_path, project, value="broken")
-    report = manager.verify(candidate)
+    report = manager.verify(candidate, native=True)
     checks = {item["name"]: item for item in report["checks"]}
     assert checks["unit"]["status"] == "passed"
     assert checks["artifact"]["status"] == "failed"
@@ -137,7 +263,7 @@ def test_broken_installed_artifact_blocks_release_even_when_unit_tests_pass(tmp_
 
 def test_post_verification_wheel_or_environment_changes_are_rejected(tmp_path, project):
     manager, candidate = stage(tmp_path, project)
-    assert manager.verify(candidate)["passed"]
+    assert manager.verify(candidate, native=True)["passed"]
     directory, manifest = manager._manifest(candidate)
     wheel = directory / manifest["wheel"]
     original = wheel.read_bytes()
@@ -153,10 +279,10 @@ def test_post_verification_wheel_or_environment_changes_are_rejected(tmp_path, p
 
 def test_rollback_keeps_new_data_and_rejects_incompatible_schema(tmp_path, project):
     manager, first = stage(tmp_path, project)
-    assert manager.verify(first)["passed"]
+    assert manager.verify(first, native=True)["passed"]
     manager.activate(first)
     _, second = stage(tmp_path, project, manager=manager, version="0.0.2")
-    assert manager.verify(second)["passed"]
+    assert manager.verify(second, native=True)["passed"]
     manager.activate(second)
     database = manager.home / "state/schedules.sqlite3"
     with Store(database) as store:
@@ -179,7 +305,7 @@ def test_missing_required_smoke_cannot_be_reported_as_passed(tmp_path, project):
     source, _ = project
     (source / "tests/test_artifact_smoke.py").unlink()
     manager, candidate = stage(tmp_path, project)
-    report = manager.verify(candidate)
+    report = manager.verify(candidate, native=True)
     assert not report["passed"]
     assert "smoke test is missing" in report["checks"][0]["detail"]
 
@@ -192,7 +318,7 @@ def test_business_schema_guard_preserves_new_data_and_blocks_future_format(
     tmp_path, project, name, path
 ):
     manager, candidate = stage(tmp_path, project)
-    assert manager.verify(candidate)["passed"]
+    assert manager.verify(candidate, native=True)["passed"]
     index = manager.home / path
     index.parent.mkdir()
     with sqlite3.connect(index) as db:
@@ -214,7 +340,7 @@ def test_business_schema_guard_preserves_new_data_and_blocks_future_format(
 def test_source_change_since_build_requires_new_candidate(tmp_path, project):
     manager, candidate = stage(tmp_path, project)
     (project[0] / "tests/test_unit.py").write_text("def test_regression():\n    assert False\n")
-    report = manager.verify(candidate)
+    report = manager.verify(candidate, native=True)
     assert not report["passed"]
     assert "changed since" in report["checks"][0]["detail"]
 
@@ -370,10 +496,10 @@ def test_check_subprocess_keeps_explicit_proxies_but_not_model_credentials(tmp_p
 
 def test_automatic_rollback_is_conditional_and_never_revisits_failed_candidate(tmp_path, project):
     manager, first = stage(tmp_path, project)
-    assert manager.verify(first)["passed"]
+    assert manager.verify(first, native=True)["passed"]
     manager.activate(first)
     _, second = stage(tmp_path, project, manager=manager, version="0.0.2")
-    assert manager.verify(second)["passed"]
+    assert manager.verify(second, native=True)["passed"]
     promoted = manager.activate(second)
     marker = manager.home / "new-evidence.json"
     marker.write_text('{"new":true}')
@@ -404,7 +530,7 @@ def test_independent_bootstrap_survives_damaged_candidate_and_rejects_own_damage
     from alice_codex.bootstrap import checked_runtime, install_runtime
 
     manager, candidate = stage(tmp_path, project)
-    assert manager.verify(candidate)["passed"]
+    assert manager.verify(candidate, native=True)["passed"]
     manager.activate(candidate)
     bootstrap = install_runtime(manager)
     independent = Path(bootstrap["python"])
@@ -455,20 +581,14 @@ def test_runtime_verifies_private_pin_after_original_application_changes(
     tmp_path, project, original_change
 ):
     from dataclasses import asdict
-    from alice_codex.config import RuntimeConfig
+    from alice_codex.config import initialize_config
     from alice_codex.files import write_json
 
     manager, candidate = stage(tmp_path, project)
-    report = manager.verify(candidate)
+    report = manager.verify(candidate, native=True)
     assert report["passed"]
-    private = manager.home / "bin/codex"
-    private.parent.mkdir()
-    private.write_bytes(project[1].read_bytes())
-    private.chmod(0o700)
-    config = RuntimeConfig(
-        str(manager.home), str(private), "codex-cli test-fixture", report["codex_sha256"]
-    )
-    write_json(manager.home / "config.json", asdict(config))
+    config = initialize_config(manager.home, project[1])
+    private = Path(config.codex_binary)
     pointer = manager.activate(candidate)
     if original_change == "modified":
         project[1].write_text("updated original application")
@@ -477,10 +597,11 @@ def test_runtime_verifies_private_pin_after_original_application_changes(
     assert manager.checked_current() == pointer
     # Original path and original verified SHA remain unchanged historical evidence.
     _, manifest = manager._manifest(candidate)
-    assert manifest["codex_binary"] == str(project[1])
+    assert manifest["codex_source_binary"] == str(project[1])
+    assert manifest["codex_binary"] != str(project[1])
     assert manifest["codex_sha256"] == report["codex_sha256"]
     private.write_text("changed private runtime")
-    with pytest.raises(ReleaseError, match="Codex binary changed"):
+    with pytest.raises(ReleaseError, match="Codex executable changed"):
         manager.checked_current()
     write_json(
         manager.home / "config.json",
@@ -489,5 +610,5 @@ def test_runtime_verifies_private_pin_after_original_application_changes(
             "codex_sha256": hashlib.sha256(private.read_bytes()).hexdigest(),
         },
     )
-    with pytest.raises(ReleaseError, match="different Codex binary"):
+    with pytest.raises(ReleaseError, match="manifest does not match|different Codex binary"):
         manager.checked_current()

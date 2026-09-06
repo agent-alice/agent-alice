@@ -123,6 +123,8 @@ def install_runtime(manager: ReleaseManager) -> dict:
         "base_python_sha256": sha256_file(base),
         "installed": manifest["installed"],
         "codex_sha256": manifest["codex_sha256"],
+        "codex_code_mode_host_sha256": manifest["codex_code_mode_host_sha256"],
+        "release_policy_version": manifest["policy_version"],
         "probe": probe,
     }
     write_json(target / "bootstrap.json", metadata)
