@@ -4,7 +4,9 @@ Alice is a persistent agent built on the public interfaces of Codex CLI. Codex p
 
 ## Current status
 
-The initial migration is being integrated and verified locally. This repository is the collaboration space; production cutover is not complete. Component tests do not establish autonomous task capability.
+The migration candidate, synthetic tests and CI workflow are in [`alice/`](alice/README.md). Production cutover is not complete. Component tests do not establish autonomous task capability.
+
+See [installation and commands](alice/README.md), [development and verification rules](alice/specs/development.md), and [parallel task instructions](docs/parallel-tasks.md).
 
 ## Development workflow
 
@@ -14,7 +16,7 @@ The initial migration is being integrated and verified locally. This repository 
 4. Integration verifies the installed artifact, including startup, MCP calls, interruption, restart and recovery.
 5. Only a verified candidate can replace the running release. Rollback must retain new runtime data.
 
-CI and required-check enforcement are pending setup. An agent reporting success is not a substitute for integration evidence.
+CI builds and verifies an installed candidate on macOS and Linux with Python 3.11 and 3.14. Check the actual workflow results for evidence; required-check enforcement remains pending. The default CI does not call a real model. An agent reporting success is not a substitute for integration evidence.
 
 ## Data boundary
 
