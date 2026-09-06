@@ -16,6 +16,7 @@ class CodexClient:
         self.rpc = rpc
         self.owned_root_ids = set(owned_root_ids or [])
         self._parents: dict[str, str] = {}
+        self._invalid_ancestry: set[str] = set()
         self._active_turns: dict[str, str] = {}
         self._statuses: dict[str, str] = {}
         self._direct_input: dict[str, bool | None] = {}
@@ -33,6 +34,8 @@ class CodexClient:
     def owns(self, thread_id: str) -> bool:
         seen = set()
         while thread_id not in seen:
+            if thread_id in self._invalid_ancestry:
+                return False
             if thread_id in self.owned_root_ids:
                 return True
             seen.add(thread_id)
@@ -43,20 +46,48 @@ class CodexClient:
         if not self.owns(thread_id):
             raise OwnershipError(f"Thread {thread_id} is not owned by this Alice runtime")
 
+    def _reject_ancestry(self, thread_id: str) -> None:
+        # Listener exceptions are isolated by RpcClient. Quarantine first so
+        # neither accounting nor controls can continue using an old edge.
+        self._invalid_ancestry.add(thread_id)
+        # Retain the prior edge only to identify a root whose stop cannot be
+        # verified anymore. owns() rejects this node and every descendant.
+        self._active_turns.pop(thread_id, None)
+        self._statuses.pop(thread_id, None)
+        self._direct_input.pop(thread_id, None)
+        raise OwnershipError("Contradictory native thread ancestry")
+
+    def _remember_parent(self, thread_id: str, parent: str) -> None:
+        if not isinstance(parent, str) or not parent:
+            self._reject_ancestry(thread_id)
+        old_parent = self._parents.get(thread_id)
+        if thread_id in self._invalid_ancestry or (old_parent and old_parent != parent):
+            self._reject_ancestry(thread_id)
+        seen = {thread_id}
+        ancestor = parent
+        while ancestor:
+            if ancestor in seen or ancestor in self._invalid_ancestry:
+                self._reject_ancestry(thread_id)
+            seen.add(ancestor)
+            ancestor = self._parents.get(ancestor)
+        self._parents[thread_id] = parent
+
     def _remember_thread(self, thread: dict) -> None:
         thread_id, parent = thread.get("id"), thread.get("parentThreadId")
-        if not thread_id:
+        if not isinstance(thread_id, str) or not thread_id:
             return
         # Older persisted subagent records express their parent through source.
         source = thread.get("source")
-        if not parent and isinstance(source, dict):
+        parents = [parent] if parent is not None else []
+        if isinstance(source, dict):
             subagent = source.get("subAgent", {})
             if isinstance(subagent, dict):
                 spawn = subagent.get("thread_spawn", {})
                 if isinstance(spawn, dict):
-                    parent = spawn.get("parentThreadId") or spawn.get("parent_thread_id")
-        if parent:
-            self._parents[thread_id] = parent
+                    parents.extend(spawn[key] for key in ("parentThreadId", "parent_thread_id")
+                                   if spawn.get(key) is not None)
+        for parent in parents:
+            self._remember_parent(thread_id, parent)
         if self.owns(thread_id):
             self._direct_input[thread_id] = thread.get("canAcceptDirectInput")
             status = thread.get("status", {})
@@ -76,7 +107,15 @@ class CodexClient:
         thread_id = params.get("threadId")
         if not thread_id or not self.owns(thread_id):
             return
-        if method == "turn/started":
+        if method == "item/completed":
+            item = params.get("item", {})
+            child = item.get("agentThreadId")
+            if (item.get("type") == "subAgentActivity" and item.get("kind") == "started"
+                    and isinstance(child, str) and child):
+                # V2 reports the child's start as a typed item on its native
+                # parent; it need not emit thread/started for that child.
+                self._remember_parent(child, thread_id)
+        elif method == "turn/started":
             self._active_turns[thread_id] = params["turn"]["id"]
         elif method == "turn/completed":
             if self._active_turns.get(thread_id) == params.get("turn", {}).get("id"):
@@ -138,8 +177,32 @@ class CodexClient:
         result = await self.rpc.request(
             "thread/read", {"threadId": thread_id, "includeTurns": include_turns}
         )
+        if result["thread"].get("id") != thread_id:
+            raise RpcError("Codex read a different thread")
         self._remember_thread(result["thread"])
         return result
+
+    async def reconcile_ownership(self, thread_id: str, *, max_depth: int = 16) -> bool:
+        """Read only this observed ID and its native parents, without loading it.
+
+        Lists can omit V2 children after reconnect. A known ID from a token
+        notification can still be read through the public API. No root is ever
+        inferred or registered by this reconciliation.
+        """
+        seen = set()
+        for _ in range(max_depth):
+            if self.owns(thread_id):
+                return True
+            if thread_id in seen or thread_id in self._invalid_ancestry:
+                return False
+            seen.add(thread_id)
+            if thread_id not in self._parents:
+                await self.thread_read(thread_id)
+            parent = self._parents.get(thread_id)
+            if not parent:
+                return False
+            thread_id = parent
+        return self.owns(thread_id)
 
     async def thread_list(self, **params: Any) -> dict:
         result = await self.rpc.request("thread/list", params)
@@ -266,6 +329,7 @@ class CodexClient:
         result = await self.rpc.request("thread/goal/get", {"threadId": thread_id})
         goal = result.get("goal")
         if goal and goal.get("status") == "active":
+            self._require_owned(thread_id)
             return await self.rpc.request(
                 "thread/goal/set", {"threadId": thread_id, "status": "paused"}
             )
@@ -314,6 +378,8 @@ class CodexClient:
                 child for child, parent in self._parents.items() if parent in descendants
             }
             if expanded == descendants:
+                if any(not self.owns(thread) for thread in descendants):
+                    raise OwnershipError("Cannot verify a tree with contradictory native ancestry")
                 return descendants
             descendants = expanded
 
@@ -397,6 +463,7 @@ class CodexClient:
                         and thread_id not in cleaned
                         and self._statuses.get(thread_id) != "notLoaded"
                     ):
+                        self._require_owned(thread_id)
                         await self.rpc.request(
                             "thread/backgroundTerminals/clean", {"threadId": thread_id}
                         )

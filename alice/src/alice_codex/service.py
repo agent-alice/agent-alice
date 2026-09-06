@@ -17,7 +17,7 @@ import sys
 import time
 import uuid
 
-from .codex import CodexClient
+from .codex import CodexClient, OwnershipError
 from .calendar import (
     prepare_dispatch,
     dispatch_completion,
@@ -248,6 +248,8 @@ class _ResourceEpochListener:
 
     MAX_PENDING = 256
     MAX_BYTES = 1024 * 1024
+    RECONCILE_TIMEOUT = 5
+    RECONCILE_CLOSE_TIMEOUT = 1
 
     def __init__(self, service, rpc, codex, epoch_id, durable_roots):
         self.codex, self.epoch_id = codex, epoch_id
@@ -255,6 +257,10 @@ class _ResourceEpochListener:
         self._pending = []
         self._bytes = 0
         self._service = service
+        self._reconcile_ready = False
+        self._resolver = None
+        self._attempted = set()
+        self._closing = self._closed = False
 
         # These closures capture this process's epoch/client, never the next
         # values of Service.rpc, Service.codex or runtime.json's active server.
@@ -278,7 +284,62 @@ class _ResourceEpochListener:
         self._roots.update(roots)
         self.flush()
 
+    def start_reconciliation(self):
+        """Enable public reads only after this connection's initialize completes."""
+        self._reconcile_ready = True
+        self._schedule_reconciliation()
+
+    def _schedule_reconciliation(self):
+        if not self._reconcile_ready or self._closing or self._closed:
+            return
+        if self._resolver is not None and not self._resolver.done():
+            return
+        if any(params.get("threadId") not in self._attempted for params, _ in self._pending):
+            self._resolver = asyncio.create_task(self._reconcile(), name="alice-resource-ancestry")
+
+    async def _reconcile(self):
+        # One coalesced worker per captured client/epoch, never an RPC request
+        # inside the reader callback or a task per token. A still-unresolved ID
+        # gets one bounded attempt while pending; fresh native evidence can
+        # always resolve it synchronously. The original buffer bounds remain.
+        while not self._closing:
+            thread_id = next((params.get("threadId") for params, _ in self._pending
+                              if params.get("threadId") not in self._attempted), None)
+            if thread_id is None:
+                return
+            self._attempted.add(thread_id)
+            try:
+                await asyncio.wait_for(
+                    self.codex.reconcile_ownership(thread_id), timeout=self.RECONCILE_TIMEOUT
+                )
+            except (RpcError, OwnershipError, TimeoutError):
+                # Absence, contradictory metadata and unavailable reads are
+                # not ownership evidence. Retain observations for native events
+                # or explicit history discovery, and fail on the existing cap.
+                pass
+            except Exception:
+                self._service._fail("Native resource ancestry reconciliation failed")
+                return
+            self.flush()
+
+    async def close(self):
+        """After reader-tail drain, settle or cancel/await every captured read."""
+        self._closing = True
+        task = self._resolver
+        try:
+            if task is not None:
+                await asyncio.wait({task}, timeout=self.RECONCILE_CLOSE_TIMEOUT)
+        finally:
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self.flush()
+            self._closed = True
+
     def flush(self):
+        if self._closed:
+            return
         remaining = []
         for index, (params, size) in enumerate(self._pending):
             try:
@@ -294,8 +355,12 @@ class _ResourceEpochListener:
                 self._service._fail("Native resource observations could not be persisted")
                 return
         self._pending = remaining
+        self._attempted.intersection_update(params.get("threadId") for params, _ in remaining)
+        self._schedule_reconciliation()
 
     def receive(self, event):
+        if self._closed:
+            return
         try:
             method = event.get("method")
             if method == "thread/tokenUsage/updated":
@@ -311,6 +376,12 @@ class _ResourceEpochListener:
             elif method == "thread/started":
                 # CodexClient's listener runs first and remembers native ancestry.
                 self.flush()
+            elif method == "item/completed":
+                item = event.get("params", {}).get("item", {})
+                if item.get("type") == "subAgentActivity" and item.get("kind") == "started":
+                    self.flush()
+                if self._current():
+                    self._service._on_notification(event)
             elif self._current():
                 # Stale transport callbacks must not update a newer task lifecycle.
                 self._service._on_notification(event)
@@ -554,6 +625,7 @@ class Service:
                 self._attach_resource_listener(self.rpc, self.codex, epoch_id)
                 self.journal = NativeJournal(self.memory, self.rpc, self.codex.owns)
                 await self.rpc.initialize()
+                self._resource_observer.start_reconciliation()
                 if self.stopping:
                     raise RuntimeError(self.error or "Native resource startup failed")
                 listing = await self.rpc.request(
@@ -616,6 +688,9 @@ class Service:
         # Shutdown must retain this epoch's transport and ancestry listener,
         # even if a later connection replaces the Service's current fields.
         rpc, codex, process = self.rpc, self.codex, self.process
+        observer = self._resource_observer
+        if observer is not None and observer.codex is not codex:
+            observer = None
         starting_epoch = self._starting_resource_epoch
         spawn_attempted = self._spawn_attempted
         cancelled_while_reaping = False
@@ -688,8 +763,12 @@ class Service:
                                 log.write(f"Alice resource shutdown: {reason}\n".encode())
                 finally:
                     try:
-                        if codex:
-                            codex.close()
+                        try:
+                            if observer:
+                                await observer.close()
+                        finally:
+                            if codex:
+                                codex.close()
                     finally:
                         if rpc:
                             with suppress(Exception):

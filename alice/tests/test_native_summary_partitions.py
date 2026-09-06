@@ -19,6 +19,7 @@ import subprocess
 import pytest
 
 from alice_codex.rpc import RpcError
+from test_native_service_resource_epochs import NativeResourceRuntime, required_environment
 from test_native_task_policy import NativePolicyRuntime
 
 
@@ -75,6 +76,26 @@ class PartitionRuntime(NativePolicyRuntime):
         self.native_reads = {}
         self.sequence = 0
         self.raw_source = b""
+        self.resource_receipts = os.environ.get("ALICE_SUMMARY_RESOURCE_RECEIPTS") == "1"
+        if self.resource_receipts:
+            # This stricter evidence mode always starts a new installed candidate
+            # with its explicit Codex/Code Mode pair, before any native work.
+            required_environment("ALICE_ARTIFACT_PYTHON")
+            self.binary = Path(required_environment("ALICE_TEST_CODEX_BINARY")).resolve()
+            self.host_binary = Path(required_environment("ALICE_TEST_CODEX_HOST_BINARY")).resolve()
+            self.expected_hashes = {
+                "codex": required_environment("ALICE_TEST_CODEX_SHA256"),
+                "codex-code-mode-host": required_environment("ALICE_TEST_CODEX_HOST_SHA256"),
+            }
+            NativeResourceRuntime.verify_pair(self)
+            NativeResourceRuntime.verify_installed_source(self)
+            self.receipt_log = self.root / "native-resource-receipts.jsonl"
+            self.env["ALICE_NATIVE_RESOURCE_RECEIPTS"] = str(self.receipt_log)
+            wrapper = Path(__file__).parent / "fixtures/native_resource_receipt_service.py"
+            self.host_command = [self.runtime_python, "-I", str(wrapper), str(self.home)]
+
+    def resource_epoch(self):
+        return json.loads((self.home / "state/runtime.json").read_text())["server"]["resource_epoch_id"]
 
     def call(self, body, name, arguments=None, code=None):
         matches = [item for item in advertised(body) if item.get("name") == name]
@@ -424,10 +445,13 @@ async def test_native_children_complete_large_partition_and_resume_after_leaf_re
         assert not (Path(runtime.batch["manifest_path"]).parent / "coverage.jsonl").exists()
         first_refs = child_references(await native_threads(runtime), parent_id)
         assert set(first_refs) == set(runtime.node_results)
+        first_epoch = runtime.resource_epoch()
         runtime.remember_mcp()
         request_count = len(runtime.requests)
         await runtime.stop()
         restarted = await runtime.launch()
+        second_epoch = runtime.resource_epoch()
+        assert second_epoch != first_epoch
         assert restarted["tasks"]["main"]["thread_id"] == parent_id
         assert len(runtime.requests) == request_count
         assert child_references(await native_threads(runtime), parent_id) == first_refs
@@ -477,5 +501,35 @@ async def test_native_children_complete_large_partition_and_resume_after_leaf_re
         record_testsuite_property("partition_native_references_sha256", hashlib.sha256(json.dumps(references, sort_keys=True).encode()).hexdigest())
         runtime.remember_mcp()
         await runtime.stop()
+        if runtime.resource_receipts:
+            from test_native_resource_receipts import validate_native_resource_receipts
+
+            assert len(references) == 12
+            children = {row["thread_id"] for row in references.values()}
+            first_children = {row["thread_id"] for row in first_refs.values()}
+            proof = validate_native_resource_receipts(
+                runtime.receipt_log, runtime.home / "state/resources.sqlite3",
+                expected_child_thread_ids=children,
+                expected_epoch_threads={
+                    first_epoch: {parent_id, *first_children},
+                    second_epoch: {parent_id, *(children - first_children)},
+                },
+            )
+            proof["localhost_responses"] = len(runtime.requests)
+            proof["paid_model_calls"] = 0
+            proof["native_code_mode_host_sha256"] = runtime.expected_hashes["codex-code-mode-host"]
+            resources = await runtime.cli("resources", "status")
+            assert resources["virtual_budget_enabled"] is False
+            assert resources["money_receipts"] == {}
+            assert resources["tokens"]["actual_usage_total"] is None
+            assert resources["tokens"]["cost_microusd"] is None
+            assert resources["tokens"]["unknown_or_out_of_order_events"] == 0
+            proof["sum_epoch_high_water_marks"] = resources["tokens"]["sum_epoch_high_water_marks"]
+            proof["actual_usage_total"] = resources["tokens"]["actual_usage_total"]
+            proof["money_receipts"] = resources["money_receipts"]
+            proof["virtual_budget_enabled"] = resources["virtual_budget_enabled"]
+            proof["account_limits"] = resources["account_limits"]
+            (runtime.root / "native-resource-receipt-summary.json").write_text(json.dumps(proof))
+            record_testsuite_property("partition_resource_receipts", json.dumps(proof, sort_keys=True))
     finally:
         await runtime.close()
