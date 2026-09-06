@@ -12,6 +12,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import uuid
 
@@ -28,6 +29,12 @@ from .control import MAX_MESSAGE
 from .files import SingletonLock, read_json, write_json
 from .memory import MemoryStore
 from .journal import NativeJournal
+from .identity import (
+    IDENTITY_HOOK_COMPAT_VERSION,
+    build_identity_bundle,
+    validate_identity_hooks,
+    validate_identity_runtime_manifest,
+)
 from .resources import ResourceLedger
 from .rpc import RpcClient, RpcError
 from .scheduler import Scheduler, RejectedDispatch, DeferredDispatch
@@ -227,6 +234,12 @@ class Service:
             if self.state["lifecycle"] in {"new", "running", "starting", "stopping"}:
                 self.store.set_autonomy_paused(True)
             await self._recover_orphan()
+            identity_manifest = self.config.root / "state/identity-runtime.json"
+            if identity_manifest.exists():
+                prior_identity = read_json(identity_manifest)
+                validate_identity_runtime_manifest(prior_identity)
+            identity = build_identity_bundle(self.config.workspace)
+            self.config.write_codex_config(identity=identity)
             self.state["lifecycle"] = "starting"
             self.state["server"] = None
             self.save()
@@ -270,6 +283,35 @@ class Service:
                         raise TimeoutError("Owned Codex App Server did not become ready")
                     await asyncio.sleep(0.1)
                 await self.rpc.initialize()
+                listing = await self.rpc.request(
+                    "hooks/list", {"cwds": [str(self.config.workspace)]}
+                )
+                self.config.trust_identity_hooks(listing)
+                trusted_hashes = validate_identity_hooks(
+                    await self.rpc.request("hooks/list", {"cwds": [str(self.config.workspace)]}),
+                    self.config.codex_home / "config.toml",
+                    self.config.workspace,
+                    self.config.identity_hooks(),
+                    require_trusted=True,
+                )
+                write_json(
+                    identity_manifest,
+                    {
+                        "version": 1,
+                        "hook_compat_version": IDENTITY_HOOK_COMPAT_VERSION,
+                        "python": sys.executable,
+                        "workspace": str(self.config.workspace),
+                        "config_path": str(self.config.codex_home / "config.toml"),
+                        "bundle": identity.metadata(),
+                        "hook_state": trusted_hashes,
+                    },
+                )
+                self.state["identity"] = {
+                    **identity.metadata(),
+                    "canonical": "configured",
+                    "hooks": "trusted_before_thread_load",
+                }
+                self.save()
                 self.codex = CodexClient(
                     self.rpc,
                     owned_root_ids=[task["thread_id"] for task in self.state["tasks"].values()],
@@ -638,6 +680,7 @@ class Service:
         if not isinstance(key, str) or not key or len(key) > 150:
             raise ValueError("Task name must contain 1–150 characters")
         async with self._lock("thread:" + key):
+            identity = build_identity_bundle(self.config.workspace)
             task = self.state["tasks"].get(key)
             if task:
                 try:
@@ -656,6 +699,7 @@ class Service:
                             task["thread_id"],
                             cwd=str(self.config.workspace),
                             model=self.config.model,
+                            developerInstructions=identity.developer_instructions,
                             **self.config.native_permission_params(),
                         )
                     status = result["thread"].get("status", {}).get("type")
@@ -664,6 +708,7 @@ class Service:
                             task["thread_id"],
                             cwd=str(self.config.workspace),
                             model=self.config.model,
+                            developerInstructions=identity.developer_instructions,
                             **self.config.native_permission_params(),
                         )
                 except RpcError as error:
@@ -697,13 +742,7 @@ class Service:
                 model=self.config.model,
                 approvalPolicy="never",
                 **self.config.native_permission_params(),
-                developerInstructions=(
-                    "You are Alice. Read AGENTS.md, SOUL.md, USER.md and "
-                    "memory/MEMORY.md before substantive work. Retrieve older experience on demand "
-                    "using alice memory tools; do not fill context with the archive. "
-                    "Use native Codex execution, compaction and collaboration. "
-                    "Only explicit user goals authorize creating a persistent Goal."
-                ),
+                developerInstructions=identity.developer_instructions,
             )
             if task:
                 if self._thread_has_input(task):
@@ -714,6 +753,7 @@ class Service:
                 "thread_id": result["thread"]["id"],
                 "paused": bool(task and task.get("paused")),
                 "created_at": time.time(),
+                "identity": {**identity.metadata(), "canonical": "new_thread_requested"},
                 "has_input": False,
                 "bootstrap": {
                     "version": 1,

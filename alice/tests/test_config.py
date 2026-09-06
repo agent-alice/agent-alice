@@ -606,3 +606,73 @@ async def test_native_start_and_resume_use_the_generated_alice_profile(tmp_path)
                 http.close()
                 await http.wait_closed()
             assert process.returncode == 0
+
+
+def synthetic_identity_listing(config, python):
+    from alice_codex.identity import HOOK_STATUS
+
+    hooks = []
+    for event, groups in config.identity_hooks(python=python).items():
+        group, handler = groups[0], groups[0]["hooks"][0]
+        hooks.append(
+            {
+                "key": str(config.codex_home / "config.toml") + ":" + event,
+                "eventName": event[0].lower() + event[1:],
+                "handlerType": "command",
+                "command": handler["command"],
+                "async": False,
+                "matcher": group.get("matcher"),
+                "timeoutSec": 10,
+                "statusMessage": HOOK_STATUS,
+                "additionalContextLimit": handler.get("additionalContextLimit"),
+                "source": "user",
+                "sourcePath": str(config.codex_home / "config.toml"),
+                "enabled": True,
+                "currentHash": "sha256:" + "a" * 64,
+                "trustStatus": "untrusted",
+            }
+        )
+    return {"data": [{"cwd": str(config.workspace), "warnings": [], "errors": [], "hooks": hooks}]}
+
+
+def test_identity_hooks_rebind_candidate_and_preserve_extensions(tmp_path, binary):
+    config = initialize_config(tmp_path / "data", binary)
+    path = config.codex_home / "config.toml"
+    path.write_text(
+        "# Keep this custom extension\n[[hooks.UserPromptSubmit]]\n"
+        '[[hooks.UserPromptSubmit.hooks]]\ntype="command"\ncommand="custom-check"\n'
+    )
+    original_config = (config.root / "config.json").read_bytes()
+    config.write_codex_config(python="/fixture/candidate-a/python")
+    listing = synthetic_identity_listing(config, "/fixture/candidate-a/python")
+    config.trust_identity_hooks(listing, python="/fixture/candidate-a/python")
+    config.write_codex_config(python="/fixture/candidate-b/python")
+    body = path.read_text()
+    assert "Keep this custom extension" in body and "custom-check" in body
+    assert "/fixture/candidate-a/python" not in body
+    assert body.count("/fixture/candidate-b/python -I -m alice_codex.identity") == 3
+    assert (config.root / "config.json").read_bytes() == original_config
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="changed after listing"):
+        config.trust_identity_hooks(listing, python="/fixture/candidate-a/python")
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("source", "project"),
+        ("eventName", "preToolUse"),
+        ("command", "unowned-command"),
+        ("enabled", False),
+    ],
+)
+def test_identity_trust_never_authorizes_other_handlers(tmp_path, binary, field, value):
+    config = initialize_config(tmp_path / "data", binary)
+    listing = synthetic_identity_listing(config, sys.executable)
+    listing["data"][0]["hooks"][0][field] = value
+    path = config.codex_home / "config.toml"
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        config.trust_identity_hooks(listing)
+    assert path.read_bytes() == before
