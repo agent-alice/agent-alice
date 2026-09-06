@@ -1,12 +1,14 @@
 """Legacy schedule migration tests never touch production sources or send data."""
 
 import copy
+from contextlib import contextmanager
 import json
 from pathlib import Path
 
 import pytest
 
 from alice_codex.legacy import LegacyPlanError, export_legacy_plan, import_legacy_plan
+from alice_codex.memory import SourceChangedError
 from alice_codex.store import Store
 
 
@@ -73,15 +75,15 @@ def test_private_export_classifies_real_intent_without_reading_scripts_or_creden
 ):
     old = tmp_path / "old"
     fixture(old)
-    original = Path.read_bytes
+    original = Path.open
     reads = []
 
-    def guarded(path):
+    def guarded(path, *args, **kwargs):
         assert path.suffix not in {".env", ".py"}
         reads.append(path.relative_to(old).as_posix())
-        return original(path)
+        return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", guarded)
+    monkeypatch.setattr(Path, "open", guarded)
     plan = export_legacy_plan(old)
     assert reads == ["cron/jobs.json", ".runtime/nanobot-anima/config.json"]
     assert plan["summary"] == {
@@ -191,3 +193,72 @@ def test_duplicate_ids_and_invalid_schedules_are_visible(tmp_path):
     plan = export_legacy_plan(old)
     assert plan["entries"][0]["action"] == "needs_review"
     assert plan["entries"][0]["proposed_schedule"] is None
+
+
+@pytest.mark.parametrize("header", [{}, {"version": 1}])
+def test_legacy_cron_missing_or_version_one_remains_compatible(tmp_path, header):
+    old = tmp_path / "old"
+    jobs = fixture(old)
+    (old / "cron/jobs.json").write_text(json.dumps({**header, "jobs": jobs}))
+    assert export_legacy_plan(old)["summary"]["legacy_job_count"] == len(jobs)
+
+
+@pytest.mark.parametrize("version", [2, 99, "1", None, True])
+def test_unknown_explicit_legacy_cron_version_is_rejected(tmp_path, version):
+    old = tmp_path / "old"
+    jobs = fixture(old)
+    source = old / "cron/jobs.json"
+    source.write_text(json.dumps({"version": version, "jobs": jobs}))
+    before = source.read_bytes()
+    with pytest.raises(LegacyPlanError, match="version"):
+        export_legacy_plan(old)
+    assert source.read_bytes() == before
+    assert not (old / "legacy-imports").exists()
+
+
+def test_legacy_source_review_limit_accepts_boundary_and_rejects_larger_file(tmp_path):
+    old = tmp_path / "old"
+    (old / "cron").mkdir(parents=True)
+    source = old / "cron/jobs.json"
+    body = b'{"version":1,"jobs":[]}'
+    limit = 16 * 1024 * 1024
+    source.write_bytes(body + b" " * (limit - len(body)))
+    assert export_legacy_plan(old)["summary"]["legacy_job_count"] == 0
+    with source.open("ab") as stream:
+        stream.write(b" ")
+    with pytest.raises(LegacyPlanError, match="review limit"):
+        export_legacy_plan(old)
+    assert source.stat().st_size == limit + 1
+
+
+def test_legacy_source_growth_uses_bounded_read_and_fails_without_export(tmp_path, monkeypatch):
+    old = tmp_path / "old"
+    (old / "cron").mkdir(parents=True)
+    source = old / "cron/jobs.json"
+    source.write_text('{"version":1,"jobs":[]}')
+    original = Path.open
+    reads = []
+
+    @contextmanager
+    def growing(path, mode="r", *args, **kwargs):
+        with original(path, mode, *args, **kwargs) as stream:
+            if path != source or mode != "rb":
+                yield stream
+                return
+
+            class GrowingReader:
+                def read(self, size=-1):
+                    reads.append(size)
+                    assert size == 16 * 1024 * 1024 + 1
+                    with original(source, "ab") as writer:
+                        for _ in range(17):
+                            writer.write(b" " * 1024 * 1024)
+                    return stream.read(size)
+
+            yield GrowingReader()
+
+    monkeypatch.setattr(Path, "open", growing)
+    with pytest.raises(SourceChangedError, match="changed while exporting"):
+        export_legacy_plan(old)
+    assert reads == [16 * 1024 * 1024 + 1]
+    assert source.stat().st_size > 16 * 1024 * 1024

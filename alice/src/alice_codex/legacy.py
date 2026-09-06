@@ -31,7 +31,10 @@ def _read(path: Path) -> tuple[dict, str]:
     before = path.stat()
     if before.st_size > 16 * 1024 * 1024:
         raise LegacyPlanError("Legacy source exceeds the review limit")
-    raw = path.read_bytes()
+    # A source can grow after stat; bound the read itself as well as the
+    # inventory check so a running old writer cannot cause an unbounded read.
+    with path.open("rb") as stream:
+        raw = stream.read(16 * 1024 * 1024 + 1)
     after = path.stat()
     if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
         after.st_ino,
@@ -40,6 +43,8 @@ def _read(path: Path) -> tuple[dict, str]:
         after.st_ctime_ns,
     ):
         raise SourceChangedError("Legacy schedule changed while exporting")
+    if len(raw) > 16 * 1024 * 1024:
+        raise LegacyPlanError("Legacy source exceeds the review limit")
     try:
         value = json.loads(raw)
     except (ValueError, UnicodeError) as exc:
@@ -139,6 +144,9 @@ def export_legacy_plan(source_root: str | Path) -> dict:
         raise LegacyPlanError("Legacy cron store is missing; refusing an empty migration")
     jobs_path = paths[0]
     container, jobs_hash = _read(jobs_path)
+    version = container.get("version", 1)
+    if type(version) is not int or version != 1:
+        raise LegacyPlanError("Unsupported legacy cron version; original preserved")
     jobs = container.get("jobs")
     if not isinstance(jobs, list):
         raise LegacyPlanError("Legacy cron store has no jobs list")
