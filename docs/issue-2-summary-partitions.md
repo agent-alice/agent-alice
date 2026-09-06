@@ -30,9 +30,15 @@
 
 后续层级若读取带分区证明的来源，仍使用分区协议。`upstream_ref` 追溯前层证明，`has_inherited_gaps` 保留祖先缺口；当前层片段数量与祖先片段数量不混成一个总数。来源目录保留多版本和手记，证明不表示重复资料已在语义上去重，也不证明模型的解释正确。
 
+导入的 JSONL `coverage_ref` 与 Markdown `<!-- anima-coverage:batch:sha -->` 都属于输入契约：须能核验本地已提交计划和完整证明；缺失或不一致时明确拒绝，不能降级成普通来源并清除未知缺口。有效 Markdown 即使复制到其他日期，后续层仍保留引用。巨型 JSONL 的顶层引用键由流式扫描器识别；超过 1 MiB 的携引用记录明确拒绝，避免无界反序列化。此处不自动重建丢失的证明。
+
+恢复除核对证明 hash，还独立重算记录、连续片段及缺口数量。最终提交先保存不可变的 `final-before.bin` 和 `finalization.json`，再写可重放 intent；重启从固定前像和根候选重新生成正文，不能只靠一起改动的 intent 正文与 after hash 授权写入。原目标存在时保留其完整前像，后续并发写入仍由前后 hash 冲突保护处理。
+
+这是首次交付 schema 2；未部署的早期 Draft schema 2 状态若没有上述 finalization 证据，会保留原数据并拒绝恢复，不从可变 intent 猜测可信前像。schema 1 批次、数据库、旧事件和来源 ID 不迁移。回退只可选择能读取已产生状态的候选；不得删除新状态或用旧快照覆盖记录以迁就旧读取器。最终候选选择门槛由发布负责人组合验收。
+
 ## 流式扫描的实现依据
 
-普通 `json.loads` 构造完整对象。已静态核对的 [ijson Python 后端](https://github.com/ICRAR/ijson/blob/master/src/ijson/backends/python.py) 会累计字符串 token 后再解析，也不提供本任务要求的连续原始字节范围；这不是对全部 ijson 后端的实测结论。因此使用独立的完整 JSON 语法扫描器，只保留短顶层时间元数据，不新增依赖，不使用前缀猜测。读取块至多 65,536 字节，嵌套深度至多 128，时间元数据至多 256 个字符；超限、重复时间键、坏尾、非法 UTF-8 明确报告。
+普通 `json.loads` 构造完整对象。已静态核对的 [ijson Python 后端](https://github.com/ICRAR/ijson/blob/master/src/ijson/backends/python.py) 会累计字符串 token 后再解析，也不提供本任务要求的连续原始字节范围；这不是对全部 ijson 后端的实测结论。因此使用独立的完整 JSON 语法扫描器，只保留短顶层时间元数据及顶层覆盖引用是否存在，不新增依赖，不使用前缀猜测。读取块至多 65,536 字节，嵌套深度至多 128，时间元数据至多 256 个字符；超限、重复时间键、坏尾、非法 UTF-8 明确报告。
 
 扫描器初始提交为 `29d4d9877242e48ad10dffbc74475a1922229832`，CR 兼容修复提交为 `54c4be45a8c524dda7038cf09d8f804cac485e91`。专测包括 367 个固定种子的合法/非法变体（120 合法、247 非法），在三种读取块大小下与标准 `json.loads` 独立对照；另有旧读取器分行、行号与来源 ID 对照。扫描器 94 项源码合成测试通过，不替代最终同 wheel 验收。
 
@@ -62,6 +68,6 @@
 python -m pytest alice/tests/test_summary_stream.py alice/tests/test_summary_partitions.py alice/tests/test_summary_partition_recovery.py alice/tests/test_summary_partition_review.py alice/tests/test_summary_partition_wiring.py alice/tests/test_memory.py alice/tests/test_memory_bounds.py alice/tests/test_memory_archive_acceptance.py alice/tests/test_memory_summary_acceptance.py alice/tests/test_legacy.py alice/tests/test_journal.py alice/tests/test_calendar.py alice/tests/test_config.py -q
 ```
 
-结果：294 passed，exit 0，41.72 秒；Python 3.13.9。存在一条 FastMCP/Pydantic 的既有未解析注解警告。范围为源码合成行为与实际 MCP 注册/转发，不包含付费模型、真实私有资料或最终产物激活。
+早期 DAG 提交 `e5a5ca1955053b57cfb5ff89fd2d055ed1d5a7d8` 的结果：294 passed，exit 0，41.72 秒；Python 3.13.9。存在一条 FastMCP/Pydantic 的既有未解析注解警告。范围为源码合成行为与实际 MCP 注册/转发，不套用于后续修复或其他产物，不包含付费模型、真实私有资料或最终产物激活。
 
 全量私人来源的最终停写归档、真实模型摘要质量、日历统筹任务中断后的自动重派、最终组合候选及部署仍由集成验收。存储开销随冻结来源及证明数量增长；写入失败会明确失败并保留持久证据，不设置丢弃原文的磁盘配额。已有最终目标渲染仍沿用完整追加与前后 hash 恢复机制，巨型目标文件的渲染成本未在此重写。
