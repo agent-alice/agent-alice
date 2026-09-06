@@ -284,3 +284,21 @@ async def test_cleanup_failure_prevents_starting_another_candidate(runtime, monk
         await value.run()
     assert value.manager.fallbacks == []
     assert len([row for row in records(runtime) if row["kind"] == "started"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_supervisor_cannot_interrupt_first_owned_daemon(runtime):
+    value = supervisor(runtime, {"A": "good", "B": "good"})
+    task = asyncio.create_task(value.run())
+    try:
+        await eventually(lambda: value.status())
+        child = dict(value.state["child"])
+        other = supervisor(runtime, {"A": "good", "B": "good"})
+        with pytest.raises(RuntimeError, match="owns this data directory"):
+            await other.run()
+        assert process_birth(child["pid"]) == child["birth"]
+        await stop_ready(value)
+        assert await asyncio.wait_for(task, 5) == 0
+    finally:
+        value.stop_event.set()
+        await asyncio.gather(task, return_exceptions=True)

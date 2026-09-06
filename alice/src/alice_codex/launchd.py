@@ -71,15 +71,19 @@ def status(config: RuntimeConfig) -> dict:
     supervisor = None
     report = config.root / "state/bootstrap-state.json"
     failure = config.root / "state/bootstrap-failure.json"
-    if report.exists():
-        value = read_json(report)
-        supervisor = {
-            key: value.get(key) for key in ("lifecycle", "error", "candidate", "observed_at")
-        }
-    if failure.exists():
-        value = read_json(failure)
-        if not supervisor or value.get("observed_at", 0) > (supervisor.get("observed_at") or 0):
-            supervisor = {"lifecycle": "blocked", **value}
+    try:
+        if report.exists():
+            value = read_json(report)
+            supervisor = {
+                key: value.get(key) for key in ("lifecycle", "error", "candidate", "observed_at")
+            }
+        if failure.exists():
+            value = read_json(failure)
+            if not supervisor or value.get("observed_at", 0) > (supervisor.get("observed_at") or 0):
+                supervisor = {"lifecycle": "blocked", **value}
+    except (OSError, ValueError, AttributeError, TypeError) as error:
+        # A damaged report must not prevent stopping the correctly identified label.
+        supervisor = {"lifecycle": "blocked", "error": str(error), "observed_at": time.time()}
     if supervisor and (supervisor.get("observed_at") or 0) < record.get(
         "last_start_requested_at", 0
     ):
@@ -147,11 +151,11 @@ def _assert_owned_stopped(config: RuntimeConfig) -> None:
         value = read_json(path).get(key) if path.exists() else None
         if not value:
             continue
-        alive = (
-            process_birth(value["pid"]) == value["birth"]
-            if value.get("birth")
-            else process_identity(value["pid"]) == value.get("identity")
-        )
+        if value.get("birth"):
+            alive = process_birth(value["pid"]) == value["birth"]
+        else:
+            identity = process_identity(value["pid"])
+            alive = bool(identity) and identity == value.get("identity")
         if alive:
             raise RuntimeError("Supervisor exited but a recorded owned process remains")
 
@@ -183,8 +187,7 @@ def uninstall(config: RuntimeConfig) -> dict:
     state = status(config)
     if not state["installed"]:
         return state
-    if state["loaded"]:
-        _command("bootout", service_target(config))
+    stop(config)
     path = Path(state["plist"])
     if path.name != f"{label(config)}.plist":
         raise ValueError("Unexpected supervisor plist path; preserved")
