@@ -826,8 +826,12 @@ class ReleaseManager:
                         *command, f"--junitxml={junit}",
                         f"--basetemp={verification_run / name}",
                     ]
+                check_env = (
+                    {**env, "ALICE_SUMMARY_RESOURCE_RECEIPTS": "1"}
+                    if name == "native_summary" else env
+                )
                 result = run_check(
-                    name, command, cwd=source, env=env, timeout=timeout, junit=junit,
+                    name, command, cwd=source, env=check_env, timeout=timeout, junit=junit,
                     # Structured evidence must be parsed before any display
                     # truncation. The fixed probe reports per-stage metrics.
                     output_limit=None if name == "summary_boundary" else 12000,

@@ -45,6 +45,8 @@ import pytest
 pytestmark = pytest.mark.native
 
 def test_synthetic_installed_format_contract():
+    assert os.environ.get("ALICE_SUMMARY_RESOURCE_RECEIPTS") {"== '1'" if expected == 2 else "is None"}
+    assert "ALICE_SUMMARY_DIAGNOSTICS" not in os.environ
     result = subprocess.run([os.environ["ALICE_ARTIFACT_PYTHON"], "-I", "-c", "from alice_codex.{module} import {constant}; print({constant})"], capture_output=True, text=True, check=True)
     assert result.stdout.strip() == "{expected}"
 ''')
@@ -144,7 +146,11 @@ def test_missing_even_zero_metadata_or_report_never_inherits_previous_receipt(tm
     assert manager.current() is None
 
 
-def test_full_format_gate_selects_each_native_group_once_and_binds_actual_capabilities(tmp_path, project):
+def test_full_format_gate_selects_each_native_group_once_and_binds_actual_capabilities(tmp_path, project, monkeypatch):
+    # Parent-shell flags cannot disable strict receipts or select a diagnostic
+    # wrapper in the actual native-summary verification subprocess.
+    monkeypatch.setenv("ALICE_SUMMARY_RESOURCE_RECEIPTS", "0")
+    monkeypatch.setenv("ALICE_SUMMARY_DIAGNOSTICS", "1")
     evidence = boundary_report()
     evidence["synthetic_metrics_padding"] = "x" * 13000
     prepare_format_gates(project[0], evidence=evidence)
