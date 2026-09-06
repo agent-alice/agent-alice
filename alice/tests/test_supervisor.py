@@ -242,6 +242,54 @@ async def test_explicit_stop_during_startup_never_restarts(runtime):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_three_short_normal_stops_do_not_consume_startup_failure_budget(runtime, explicit):
+    manager = Candidates({"A": "good", "B": "good"})
+    for _ in range(3):
+        value = supervisor(runtime, manager.modes)
+        value.manager = manager
+        value.healthy_seconds = 60
+        task = asyncio.create_task(value.run())
+        try:
+
+            async def running():
+                return value.state.get("lifecycle") == "running"
+
+            await eventually(running)
+            await request(runtime.control_socket, "shutdown")
+            if explicit:
+                value.stop_event.set()
+            assert await asyncio.wait_for(task, 5) == 0
+        finally:
+            value.stop_event.set()
+            await asyncio.gather(task, return_exceptions=True)
+        assert value.state["attempts"]["B"] == 0
+        assert manager.current()["current"] == "B"
+        assert manager.fallbacks == []
+    assert len([row for row in records(runtime) if row["kind"] == "started"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_during_failed_attempt_cleanup_resets_counter(runtime, monkeypatch):
+    value = supervisor(runtime, {"A": "good", "B": "bad"})
+    original = value.clean_orphan
+    calls = 0
+
+    async def cleanup():
+        nonlocal calls
+        calls += 1
+        await original()
+        if calls == 2:
+            value.stop_event.set()
+
+    monkeypatch.setattr(value, "clean_orphan", cleanup)
+    assert await asyncio.wait_for(value.run(), 5) == 0
+    assert value.state["attempts"]["B"] == 0
+    assert value.manager.fallbacks == []
+    assert len([row for row in records(runtime) if row["kind"] == "started"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_healthy_runtime_resets_old_failure_count_before_a_later_crash(runtime):
     value = supervisor(runtime, {"A": "bad", "B": "good"})
     value.state.update(activation_epoch="explicit-1", attempts={"B": 1})

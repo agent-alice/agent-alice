@@ -278,11 +278,16 @@ class Supervisor:
                     # Complete cleanup before switching code or starting another copy.
                     await self.terminate_child()
                     await self.clean_orphan()
-                if outcome == "stopped":
+                if outcome == "stopped" or self.stop_event.is_set():
+                    # Operator stop and a ready service's clean exit are not
+                    # startup failures, including a stop received during cleanup.
+                    self.state["attempts"][candidate] = 0
                     self.save("stopped", error=None)
                     return 0
                 self.save("retry_wait", error="candidate exited unsuccessfully")
                 await self.delay(self.retry_delay)
+                if self.stop_event.is_set():
+                    self.state["attempts"][candidate] = 0
             self.save("stopped", error=None)
             return 0
 
