@@ -36,6 +36,11 @@ from .scheduler import Scheduler, RejectedDispatch, DeferredDispatch
 from .store import DispatchReceipt, Store
 
 
+# Release guards must inspect the installed candidate, not infer compatibility
+# from runtime.version or ResourceLedger's schema alone.
+RESOURCE_EPOCH_CAPABILITY = 1
+
+
 def process_identity(pid: int) -> str | None:
     result = subprocess.run(
         ["ps", "-ww", "-p", str(pid), "-o", "lstart=", "-o", "command="],

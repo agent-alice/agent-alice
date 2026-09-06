@@ -32,10 +32,12 @@ token 可能早于 `thread/start` 返回，或早于宿主成功保存线程 ali
 
 ## 兼容、回退与验证
 
-这是显式协调的 additive runtime 字段扩展，不重新编号已有 ID，不覆盖旧 token。旧 Service 保存未知 JSON 字段时会保留这些记录，但回退候选还必须兼容资源 schema 2，并明确其能否继续分代采集。停止写入并核对进程来源后才能切换代码；禁止用旧 `runtime.json` 或数据库快照覆盖新增记录。本改动不迁移活动库或部署，previous 双候选由集成负责人准备验证。
+这是显式协调的 additive runtime 字段扩展，不重新编号已有 ID，不覆盖旧 token。模块常量 `alice_codex.service.RESOURCE_EPOCH_CAPABILITY = 1` 声明此 Service 理解 prepared/bound/aborted 的启动语义。**此声明本身不是激活或回退门槛**；发布负责人另行从已安装候选读取能力并接线拒绝逻辑，缺失声明视为 0，未知或损坏的数据也须拒绝。组合验证完成前不声称安全回退。
+
+仅能读写 ResourceLedger schema 2 不足以成为 previous：受控反例中，旧 Service 虽保留未知 JSON 字段，仍忽略 `prepared` 并到达下一次 spawn 边界；当前 Service 则拒绝启动且保留待对账记录。安全 previous 必须同时具有新 Service 分代语义、资源 schema 2 兼容性，并通过安装产物的原生生命周期验证和独立发布门槛。停止写入并核对进程来源后才能切换代码；禁止用旧 `runtime.json` 或数据库快照覆盖新增记录。本改动不迁移活动库或部署，previous 双候选由集成负责人准备验证。
 
 `tests/test_service_resource_epochs.py` 用真实 ResourceLedger/CodexClient 与合成进程、RPC、故障边界验证保存顺序、早到/迟到、重连、去重、所有权、缓冲上限和拒绝路径。`tests/test_native_service_resource_epochs.py` 则必须提供明确固定的 Codex 与 sibling `codex-code-mode-host` 路径及各自 SHA256，以及安装当前源码的隔离解释器；缺失配置失败，不算跳过通过。
 
-native 案例运行未包装的已安装 CLI/Service，使用隔离 HOME/CODEX_HOME、只被 localhost provider 接受的合成 Bearer 和有限 Responses SSE。普通重启、Service SIGKILL、Codex SIGKILL 各运行 4 个受控响应：每代两个 total 为 80、90 和 30、40；原生观察峰值为 170、70，第一份之后的变化为 90、40。观察峰值和 240、变化和 130 均不是账户账单。另保留合成 legacy 999，验证不会混入分代和。双外部 RPC 订阅只核对通知，并不伪称 Service 必然收到重复；重复投递另由合成 listener 测试注入。
+native 案例运行未包装的已安装 CLI/Service，使用隔离 HOME/CODEX_HOME、只被 localhost provider 接受的合成 Bearer 和有限 Responses SSE。普通重启、Service SIGKILL、Codex SIGKILL 各运行 4 个受控响应：provider 单次 total 为 80、90、30、40。此固定二进制恢复会话时报告继承的累计快照，因此第一代观察为 80→170，第二代为 170→200→240；第一份之后的变化分别为 90、70。观察峰值和 410、变化和 160 均不是账户账单，也不能把继承的 170 当作新消费；其它进程重启后计数降低的变体由合成用例单独验证，不从此 native 案例推断。另保留合成 legacy 999，验证不会混入分代和。双外部 RPC 订阅只核对通知，并不伪称 Service 必然收到重复；重复投递另由合成 listener 测试注入。
 
 测试源码与候选包一致、固定 pair 双 hash、用量数和退出状态分别记录。付费模型请求为零，不读取真实账户凭据或向真实网站发布。此层证明公开协议和 Service 生命周期，不能证明真实模型能力、业务学习或正式迁移完成。

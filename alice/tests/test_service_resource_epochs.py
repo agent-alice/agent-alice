@@ -1,14 +1,17 @@
 """Host epoch wiring with synthetic transport and real resource persistence.
 
-No Codex process or model is started. The fake transport retains notifications
+No Codex process or model is started. One cleanup case owns a sleeping Python
+child; the fake transport retains notifications
 and swallows listener exceptions like RpcClient, so persistence failures must
 explicitly stop the service rather than disappear into transport diagnostics.
 """
 
 from collections import deque
 from copy import deepcopy
+import asyncio
 import inspect
 import json
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -152,12 +155,27 @@ def test_listener_cannot_attach_before_process_binding_is_persisted(host):
 async def test_prepare_save_failure_prevents_spawn(host, monkeypatch):
     host.config.verify_binary = Mock()
     host._recover_orphan = AsyncMock()
-    host.save = Mock(side_effect=OSError("synthetic disk full"))
+    save = host.save
+    injected = False
+
+    def save_except_prepared():
+        nonlocal injected
+        if any(
+            entry["state"] == "prepared"
+            for entry in host.state.get("resource_epochs", {}).values()
+        ):
+            injected = True
+            raise OSError("synthetic disk full at prepare")
+        save()
+
+    host.save = save_except_prepared
     spawn = AsyncMock()
     monkeypatch.setattr(service_module.asyncio, "create_subprocess_exec", spawn)
     with pytest.raises(OSError, match="synthetic disk full"):
         await host.run()
+    assert injected
     spawn.assert_not_awaited()
+    assert "resource_epochs" not in json.loads(host.path.read_text())
     assert_no_tokens(host)
 
 
@@ -173,6 +191,47 @@ def test_bind_save_failure_does_not_authorize_an_observer(host):
         host._attach_resource_listener(rpc, codex, epoch)
     assert getattr(host, "_resource_observer", None) is None
     assert_no_tokens(host)
+
+
+async def test_bind_save_failure_stops_and_waits_for_owned_child(host, monkeypatch):
+    host.config.verify_binary = Mock()
+    host._recover_orphan = AsyncMock()
+    save = host.save
+    injected = False
+
+    def save_except_binding():
+        nonlocal injected
+        if any(
+            entry["state"] == "bound"
+            for entry in host.state.get("resource_epochs", {}).values()
+        ):
+            injected = True
+            raise OSError("synthetic disk full at bind")
+        save()
+
+    child = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(120)", start_new_session=True
+    )
+    try:
+        host.save = save_except_binding
+        monkeypatch.setattr(
+            service_module.asyncio, "create_subprocess_exec", AsyncMock(return_value=child)
+        )
+        connect = AsyncMock()
+        monkeypatch.setattr(service_module.RpcClient, "connect_unix", connect)
+        with pytest.raises(OSError, match="synthetic disk full at bind"):
+            await host.run()
+        assert injected and child.returncode is not None
+        connect.assert_not_awaited()
+        assert host._resource_observer is None
+        saved = json.loads(host.path.read_text())
+        assert saved["server"] is None and saved["lifecycle"] == "stopped"
+        assert list(saved["resource_epochs"].values()) == [{"state": "aborted", "server": None}]
+        assert_no_tokens(host)
+    finally:
+        if child.returncode is None:
+            child.kill()
+        await child.wait()
 
 
 def test_unbound_notification_fails_closed_without_legacy_fallback(host):

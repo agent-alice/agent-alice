@@ -1,6 +1,8 @@
 """Fixed Codex/host pair, real Service restarts, and localhost usage receipts.
 
 Every case uses four recorded Responses requests and two native process epochs.
+The resumed epoch inherits the prior cumulative baseline: its high-water sum is
+an observation with overlapping history, not actual usage or a monetary bill.
 The provider accepts only a synthetic Bearer credential. No real model or account
 is contacted. External observers repeat subscriptions; synthetic Service tests
 separately inject duplicate delivery to its accounting listener.
@@ -88,9 +90,11 @@ class NativeResourceRuntime(NativePolicyRuntime):
         # so an interpreter pointing to a different editable tree fails preflight.
         probe = textwrap.dedent("""
             import hashlib, importlib.util, json, pathlib, sys
+            import alice_codex.service as service
             package = pathlib.Path(importlib.util.find_spec('alice_codex').origin).parent
             print(json.dumps({
                 'isolated_environment': sys.prefix != sys.base_prefix,
+                'resource_epoch_capability': getattr(service, 'RESOURCE_EPOCH_CAPABILITY', 0),
                 'files': {
                     str(path.relative_to(package)): hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in sorted(package.rglob('*.py'))
@@ -108,6 +112,10 @@ class NativeResourceRuntime(NativePolicyRuntime):
         )
         installed = json.loads(result.stdout)
         assert installed["isolated_environment"], "Candidate requires an independent interpreter"
+        capability = installed["resource_epoch_capability"]
+        assert type(capability) is int and capability >= 1, (
+            "Installed Service lacks resource epochs"
+        )
         package = Path(__file__).resolve().parents[1] / "src" / "alice_codex"
         expected = {
             str(path.relative_to(package)): file_hash(path)
@@ -271,24 +279,62 @@ class NativeResourceRuntime(NativePolicyRuntime):
         )
         assert accepted["thread_id"] == thread_id
 
+        latest_turns, latest_resources = [], None
+
+        def diagnostics():
+            return json.dumps(
+                {
+                    "turn_id": accepted["turn_id"],
+                    "expected_high_water": expected_total,
+                    "native_turns": latest_turns,
+                    "epoch_record": (
+                        latest_resources["tokens"]["epochs"].get(epoch, {}).get(thread_id)
+                        if latest_resources
+                        else None
+                    ),
+                    "observer_totals": [
+                        [
+                            [
+                                event.get("tokenUsage", {}).get("total", {}).get("totalTokens")
+                                for event in events
+                            ]
+                            for events in observers
+                        ]
+                        for observers in self.native_events
+                    ],
+                    "fixture_requests": len(self.requests),
+                    "fixture_errors": self.errors,
+                },
+                sort_keys=True,
+            )
+
         async def completed():
+            nonlocal latest_turns
             native = await self.rpc.request(
                 "thread/read", {"threadId": thread_id, "includeTurns": True}
             )
-            matching = [
-                turn for turn in native["thread"]["turns"] if turn["id"] == accepted["turn_id"]
+            latest_turns = [
+                {"id": turn["id"], "status": turn["status"]} for turn in native["thread"]["turns"]
             ]
+            matching = [turn for turn in latest_turns if turn["id"] == accepted["turn_id"]]
             return matching if matching and matching[0]["status"] == "completed" else None
 
-        await until(completed, timeout=20)
+        try:
+            await until(completed, timeout=20)
+        except TimeoutError:
+            pytest.fail(f"Native turn completion timed out: {diagnostics()}")
 
         async def accounted():
-            resources = await self.resources()
+            nonlocal latest_resources
+            resources = latest_resources = await self.resources()
             record = resources["tokens"]["epochs"].get(epoch, {}).get(thread_id, {})
             high = record.get("high_water")
             return resources if high and high["totalTokens"] == expected_total else None
 
-        result = await until(accounted, timeout=15)
+        try:
+            result = await until(accounted, timeout=15)
+        except TimeoutError:
+            pytest.fail(f"Native token accounting timed out: {diagnostics()}")
         self.remember_mcp()
         assert not self.errors
         return result
@@ -334,6 +380,7 @@ async def test_native_service_keeps_process_scoped_usage_across_restart(
         assert len(runtime.requests) == 2
         first_record = first_resources["tokens"]["epochs"][first_epoch][thread_id]
         assert first_record["first_observed"]["totalTokens"] == 80
+        assert first_record["high_water"]["totalTokens"] == 170
         assert first_record["observed_increase_after_first"]["totalTokens"] == 90
         assert first_record["event_count"] == 2
         await runtime.close_observers()
@@ -371,31 +418,44 @@ async def test_native_service_keeps_process_scoped_usage_across_restart(
         ] == first_record
         await runtime.cli("resume", "--target", "main")
         second_observers = await runtime.observe(thread_id)
-        await runtime.turn(thread_id, second_epoch, 3, 30)
-        resources = await runtime.turn(thread_id, second_epoch, 4, 70)
+        # Real thread resume reports the inherited 170 baseline before new work.
+        await runtime.turn(thread_id, second_epoch, 3, 200)
+        resources = await runtime.turn(thread_id, second_epoch, 4, 240)
         tokens = resources["tokens"]
         second_record = tokens["epochs"][second_epoch][thread_id]
-        assert second_record["first_observed"]["totalTokens"] == 30
-        assert second_record["observed_increase_after_first"]["totalTokens"] == 40
-        assert second_record["event_count"] == 2
+        assert second_record["first_observed"]["totalTokens"] == 170
+        assert second_record["high_water"]["totalTokens"] == 240
+        assert second_record["observed_increase_after_first"]["totalTokens"] == 70
+        assert second_record["event_count"] == 3
         assert tokens["epochs"][first_epoch][thread_id] == first_record
         assert tokens["threads"][thread_id]["totalTokens"] == 999
         assert tokens["legacy_unscoped"] is True
-        assert tokens["sum_epoch_high_water_marks"]["totalTokens"] == 240
-        assert tokens["sum_observed_increases_after_first"]["totalTokens"] == 130
+        assert tokens["sum_epoch_high_water_marks"]["totalTokens"] == 410
+        assert tokens["sum_observed_increases_after_first"]["totalTokens"] == 160
         assert tokens["actual_usage_total"] is None and tokens["cost_microusd"] is None
         assert resources["virtual_budget_enabled"] is False and resources["money_receipts"] == {}
         assert tokens["unknown_or_out_of_order_events"] == 0
-        for observers, expected in ((first_observers, [80, 170]), (second_observers, [30, 70])):
+        for observers, expected in (
+            (first_observers, [80, 170]),
+            (second_observers, [170, 200, 240]),
+        ):
+            unique_observers = []
             for events in observers:
-                assert [event["tokenUsage"]["total"]["totalTokens"] for event in events] == expected
+                snapshots = {}
+                for event in events:
+                    counters = event["tokenUsage"]["total"]
+                    snapshots.setdefault(json.dumps(counters, sort_keys=True), counters)
+                unique = list(snapshots.values())
+                assert [counters["totalTokens"] for counters in unique] == expected
+                unique_observers.append(unique)
+            assert unique_observers[0] == unique_observers[1], "Native observers disagree on usage"
         assert len(runtime.requests) == 4 and not runtime.errors
         await runtime.stop()
         runtime.verify_pair()
         record_property("restart_mode", restart)
         record_property("localhost_fixture_responses", len(runtime.requests))
-        record_property("native_epoch_high_water_sum", 240)
-        record_property("native_increase_after_first_sum", 130)
+        record_property("native_epoch_high_water_sum", 410)
+        record_property("native_increase_after_first_sum", 160)
         record_property("paid_model_requests", 0)
         record_property("fixed_pair_sha256", json.dumps(runtime.expected_hashes, sort_keys=True))
     finally:
