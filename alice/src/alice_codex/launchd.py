@@ -11,7 +11,7 @@ import time
 
 from .bootstrap import checked_runtime, install_runtime
 from .config import RuntimeConfig
-from .files import atomic_write, read_json, write_json
+from .files import SingletonLock, atomic_write, read_json, write_json
 from .releases import ReleaseManager
 from .service import process_birth, process_identity
 
@@ -98,6 +98,11 @@ def status(config: RuntimeConfig) -> dict:
 
 
 def install(config: RuntimeConfig, *, directory: Path | None = None) -> dict:
+    with SingletonLock(config.root / "state/lifecycle.lock"):
+        return _install(config, directory=directory)
+
+
+def _install(config: RuntimeConfig, *, directory: Path | None = None) -> dict:
     manager = ReleaseManager(config.root)
     current = manager.checked_current()
     if not current:
@@ -130,6 +135,11 @@ def install(config: RuntimeConfig, *, directory: Path | None = None) -> dict:
 
 
 def start(config: RuntimeConfig) -> None:
+    with SingletonLock(config.root / "state/lifecycle.lock"):
+        _start(config)
+
+
+def _start(config: RuntimeConfig) -> None:
     state = status(config)
     if not state["installed"]:
         raise ValueError("Alice has no installed user service")
@@ -166,6 +176,11 @@ def stop(config: RuntimeConfig) -> dict:
     The plist and metadata stay installed. Bootout also cancels any already
     scheduled launch after an entry-point failure; explicit start bootstraps it.
     """
+    with SingletonLock(config.root / "state/lifecycle.lock"):
+        return _stop(config)
+
+
+def _stop(config: RuntimeConfig) -> dict:
     state = status(config)
     if not state["loaded"]:
         _assert_owned_stopped(config)
@@ -184,10 +199,15 @@ def stop(config: RuntimeConfig) -> dict:
 
 
 def uninstall(config: RuntimeConfig) -> dict:
+    with SingletonLock(config.root / "state/lifecycle.lock"):
+        return _uninstall(config)
+
+
+def _uninstall(config: RuntimeConfig) -> dict:
     state = status(config)
     if not state["installed"]:
         return state
-    stop(config)
+    _stop(config)
     path = Path(state["plist"])
     if path.name != f"{label(config)}.plist":
         raise ValueError("Unexpected supervisor plist path; preserved")

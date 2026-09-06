@@ -197,6 +197,18 @@ async def start(config) -> dict:
                 next_supervisor_check = time.monotonic() + 1
             await asyncio.sleep(0.2)
         raise TimeoutError("User service startup unconfirmed; inspect private launchd.log")
+    from .files import SingletonLock
+
+    with SingletonLock(config.root / "state/lifecycle.lock"):
+        return await _start_unsupervised(config)
+
+
+async def _start_unsupervised(config) -> dict:
+    # Serialize process creation with release switching, including the interval
+    # before the daemon has acquired service.lock or created a control socket.
+    status = await running(config)
+    if status and status.get("ready"):
+        return status
     if status:
         # Another caller already started the daemon. A responsive control socket
         # is not readiness, and launching a second daemon cannot fix initialization.
@@ -558,12 +570,28 @@ async def execute(args) -> dict | None:
             return {"candidate_id": releases.build(args.source, codex_binary=config.codex_binary)}
         if args.operation == "verify":
             return releases.verify(args.candidate_id, native=args.native, live=args.live)
-        if args.operation in {"activate", "rollback"} and await running(config):
-            raise ValueError("Stop the service before switching its release")
-        if args.operation == "activate":
-            return releases.activate(args.candidate_id)
-        if args.operation == "rollback":
-            return releases.rollback()
+        if args.operation in {"activate", "rollback"}:
+            from .files import SingletonLock
+            from .launchd import _assert_owned_stopped, status as supervisor_status
+
+            # Socket absence does not prove that startup/cleanup is idle. The
+            # same lifecycle lock guards launchd transitions and direct start;
+            # owner locks cover a running or interrupted supervisor/daemon.
+            with (
+                SingletonLock(config.root / "state/lifecycle.lock"),
+                SingletonLock(config.root / "state/bootstrap.lock"),
+                SingletonLock(config.root / "state/service.lock"),
+            ):
+                if (config.root / "state/supervisor.json").exists():
+                    supervision = await asyncio.to_thread(supervisor_status, config)
+                    if supervision["loaded"]:
+                        raise ValueError("Stop the installed supervisor before switching its release")
+                _assert_owned_stopped(config)
+                if await running(config):
+                    raise ValueError("Stop the service before switching its release")
+                if args.operation == "activate":
+                    return releases.activate(args.candidate_id)
+                return releases.rollback()
         return releases.current()
     if args.command == "service":
         from . import launchd
