@@ -283,6 +283,9 @@ class TaskPolicy:
         exhausted has task_time_exhausted, task_attempts_exhausted and/or
         task_retries_exhausted, or task_time_insufficient_for_wait. All exhausted
         decisions require explicit recovery and preserve the supplied usage.
+        Attempt/retry limits only restrict the next dispatch: the final admitted
+        attempt can stay busy until its time budget expires. An active task whose
+        clock watermark has reached the deadline remains exhausted after rollback.
 
         next_attempt_at is present for a scheduled wait, absent for busy or blocked
         states. remaining reports time, total attempts, and additional consecutive
@@ -324,12 +327,16 @@ class TaskPolicy:
 
         if usage.last_outcome == "complete":
             return decision("complete")
+        if busy and remaining["seconds"] == 0:
+            return decision("exhausted", "task_time_exhausted", recovery_required=True)
         if usage.last_outcome == "unknown" or (usage.last_outcome == "running" and not busy):
             return decision(
                 "reconciliation_required", "attempt_outcome_unknown", recovery_required=True
             )
         if now < observed_at:
             return decision("waiting", "clock_before_task_evidence", next_attempt_at=observed_at)
+        if busy:
+            return decision("waiting", "task_busy")
         exhausted = []
         if remaining["seconds"] == 0:
             exhausted.append("task_time_exhausted")
@@ -339,8 +346,6 @@ class TaskPolicy:
             exhausted.append("task_retries_exhausted")
         if exhausted:
             return decision("exhausted", *exhausted, recovery_required=True)
-        if busy:
-            return decision("waiting", "task_busy")
         delays = {
             "failed": (self.retry_wait_seconds, "retry_wait"),
             "unchanged": (self.unchanged_wait_seconds, "unchanged_wait"),

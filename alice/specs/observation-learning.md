@@ -47,6 +47,7 @@ python -m alice_codex.evaluation \
 
 - `ready` 允许派发，但仍须同时满足旧 `ResourceLedger.can_dispatch` 和原授权。
 - `waiting` 表示忙碌、时钟回拨、失败重试等待或无变化等待；不消耗新尝试。
+- 次数/重试限额只限制下一次派发：派发前扣除后，最后一次合法运行在尚有时间时仍返回 `waiting/task_busy`。忙碌任务的时间水位到达 deadline 时返回 `exhausted/task_time_exhausted`，即使系统时钟回拨也须停止；不能用次数已归零提前杀掉已准入运行。
 - `exhausted` 表示时间、尝试、连续重试限制或剩余时间不足完成等待，需显式恢复。
 - `reconciliation_required` 表示 unknown 或没有活动进程却仍为 running；延长限额也不能跳过对账。
 - `complete` 保留已独立确认的完成事实，不再派发。
