@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -353,6 +354,62 @@ async def test_second_supervisor_cannot_interrupt_first_owned_daemon(runtime):
     finally:
         value.stop_event.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+def test_unreaped_exited_child_is_not_mistaken_for_a_changed_live_identity(runtime):
+    from alice_codex.service import process_identity
+
+    # Keep a real exited child deliberately unreaped to make the Linux child
+    # watcher race deterministic. The child executes only async-signal-safe OS
+    # calls after fork; no model, service, or Python worker is started there.
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(write_fd)
+        os.setsid()
+        os.read(read_fd, 1)
+        os._exit(0)
+    os.close(read_fd)
+    try:
+        child = {"pid": pid, "birth": process_birth(pid), "identity": process_identity(pid)}
+        assert child["birth"]
+        os.write(write_fd, b"x")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True, check=True
+            ).stdout.strip()
+            if status.startswith("Z"):
+                break
+            time.sleep(0.01)
+        assert status.startswith("Z"), "fixture child was not observed as an unreaped zombie"
+        assert process_birth(pid) == child["birth"]
+        value = supervisor(runtime, {"A": "good", "B": "good"})
+        assert value._signalable_child(child) is False
+    finally:
+        os.close(write_fd)
+        os.waitpid(pid, 0)
+
+
+def test_changed_live_child_identity_is_still_rejected(runtime):
+    from alice_codex.service import process_identity
+
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        record = {
+            "pid": child.pid,
+            "birth": process_birth(child.pid),
+            "identity": process_identity(child.pid),
+        }
+        value = supervisor(runtime, {"A": "good", "B": "good"})
+        with pytest.raises(RuntimeError, match="identity changed"):
+            value._signalable_child(record)
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
 
 
 @pytest.mark.asyncio

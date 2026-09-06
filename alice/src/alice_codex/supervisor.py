@@ -6,6 +6,7 @@ from contextlib import suppress
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
 
@@ -104,6 +105,18 @@ class Supervisor:
             or str(self.config.root) not in identity
             or "alice_codex" not in identity
         ):
+            # Linux can expose the original birth and pgid with a defunct argv
+            # before asyncio's child watcher reaps a just-exited direct child.
+            # A zombie cannot execute; do not signal it or mistake it for an
+            # unrelated live process. terminate_child still waits for our child.
+            state = subprocess.run(
+                ["ps", "-p", str(child["pid"]), "-o", "stat="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            if not self._same_child(child) or state.startswith("Z"):
+                return False
             raise RuntimeError("Recorded daemon identity changed; refusing to signal")
         return self._same_child(child)
 
