@@ -32,10 +32,13 @@ Playwright IPC uses a separate short private socket directory; its
 `PWTEST_SOCKETS_DIR` setting avoids Unix socket-length failures when Alice's
 data-directory path is long. It does not point at a Desktop browser bridge.
 
-Installation requires a stopped Alice service. It holds the same lifetime lock
-used by the service, probes a remaining control socket, and rejects both a live
-response and an uncertain response. A remaining native socket also requires
-diagnosis. It does not stop a running instance or treat a timeout as stopped.
+Installation requires a stopped Alice service and an unloaded supervisor. It
+holds the lifecycle, bootstrap and service locks throughout installation and
+verification, so a supervisor starting before its control socket exists cannot
+race the configuration update. A remaining control socket is probed and both a
+live response and an uncertain response are rejected. A remaining native socket
+also requires diagnosis. Installation does not stop a running instance or treat
+a timeout as stopped.
 
 The runtime is created outside the writable workspace. Before writing the MCP
 configuration, an owned App Server with a fresh authentication-free Codex home

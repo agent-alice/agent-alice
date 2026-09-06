@@ -5,7 +5,6 @@ another process with this user's filesystem permissions. Installation is a
 synchronous operation and must run off an asyncio event loop.
 """
 
-import asyncio
 from datetime import datetime, timezone
 import hashlib
 from importlib.resources import files
@@ -20,8 +19,8 @@ import tomlkit
 from tomlkit.exceptions import ParseError
 
 from .browser_verify import verify
-from .control import request
-from .files import SingletonLock, atomic_write, private_dir, read_json, sha256_file, write_json
+from .files import atomic_write, private_dir, read_json, sha256_file, write_json
+from .lifecycle import offline_maintenance
 
 
 SERVER = "alice_browser"
@@ -229,19 +228,7 @@ def install(config, *, node: Path, npm_cli: Path, browser_executable: Path) -> d
         raise ValueError("Browser installation requires a canonical Alice home")
     _directory(config.root / "state")
     _directory(config.codex_home)
-    if (config.root / "state/service.lock").is_symlink():
-        raise ValueError("Alice service lock must not be a symbolic link")
-    with SingletonLock(config.root / "state/service.lock"):
-        if config.control_socket.exists():
-            try:
-                asyncio.run(request(config.control_socket, "status", timeout=2))
-            except Exception as error:
-                raise RuntimeError(
-                    "Alice control state is uncertain; diagnose/stop before installing"
-                ) from error
-            raise RuntimeError("Stop Alice before installing its browser")
-        if config.codex_socket.exists():
-            raise RuntimeError("Alice native socket remains; diagnose/stop before installing")
+    with offline_maintenance(config):
         original, document, current = _config(config)
         previous = _manifest(config)
         if current is not None and (previous is None or current != previous.get("settings")):
@@ -325,9 +312,14 @@ def install(config, *, node: Path, npm_cli: Path, browser_executable: Path) -> d
                 raise RuntimeError(
                     f"Browser native verification failed; inspect {final / 'verification.json'}"
                 )
-            if _artifact_digest(final) != artifact or any(
-                sha256_file(inputs[name]) != value["sha256"] for name, value in dependencies.items()
-            ) or _codex_identity(config) != codex:
+            if (
+                _artifact_digest(final) != artifact
+                or any(
+                    sha256_file(inputs[name]) != value["sha256"]
+                    for name, value in dependencies.items()
+                )
+                or _codex_identity(config) != codex
+            ):
                 raise RuntimeError(
                     "Browser artifacts changed during verification; original config preserved"
                 )

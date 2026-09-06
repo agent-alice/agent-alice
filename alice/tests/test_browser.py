@@ -2,11 +2,13 @@
 
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tomllib
 
 import pytest
 
-from alice_codex import browser
+from alice_codex import browser, launchd, lifecycle
 from alice_codex.config import RuntimeConfig
 from alice_codex.files import SingletonLock, sha256_file
 
@@ -192,6 +194,50 @@ def test_active_service_lock_rejects_install(setup):
     assert calls == []
 
 
+@pytest.mark.parametrize("name", ["lifecycle.lock", "bootstrap.lock"])
+def test_startup_without_socket_rejects_browser_install(setup, name):
+    config, arguments, calls = setup
+    original = (config.codex_home / "config.toml").read_bytes()
+    with SingletonLock(config.root / "state" / name):
+        with pytest.raises(RuntimeError, match="owns this data directory"):
+            browser.install(config, **arguments)
+    assert calls == []
+    assert (config.codex_home / "config.toml").read_bytes() == original
+
+
+def test_loaded_supervisor_without_child_rejects_browser_install(setup, monkeypatch):
+    config, arguments, calls = setup
+    (config.root / "state/supervisor.json").write_text("{}")
+    monkeypatch.setattr(launchd, "status", lambda config: {"loaded": True})
+    with pytest.raises(ValueError, match="Stop the installed supervisor"):
+        browser.install(config, **arguments)
+    assert calls == []
+
+
+def test_browser_verification_keeps_startup_and_owner_locks_held(setup, monkeypatch):
+    config, arguments, _ = setup
+
+    def verify(*_):
+        for name in ("lifecycle.lock", "bootstrap.lock", "service.lock"):
+            attempt = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    "import fcntl,sys; f=open(sys.argv[1],'a'); "
+                    "fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)",
+                    str(config.root / "state" / name),
+                ],
+                capture_output=True,
+                timeout=5,
+            )
+            assert attempt.returncode != 0, name + " allowed concurrent startup"
+        return {"status": "passed", "model_calls": 0, "remaining_owned_processes": []}
+
+    monkeypatch.setattr(browser, "verify", verify)
+    assert browser.install(config, **arguments)["native_verified"]
+
+
 @pytest.mark.parametrize("responds", [True, False])
 def test_control_presence_is_checked_and_uncertainty_is_not_stopped(setup, monkeypatch, responds):
     config, arguments, calls = setup
@@ -204,9 +250,9 @@ def test_control_presence_is_checked_and_uncertainty_is_not_stopped(setup, monke
             raise TimeoutError("synthetic unresponsive control")
         return {"ready": True}
 
-    monkeypatch.setattr(browser, "request", request)
+    monkeypatch.setattr(lifecycle, "request", request)
     try:
-        with pytest.raises(RuntimeError, match="Stop Alice|uncertain"):
+        with pytest.raises((RuntimeError, ValueError), match="Stop Alice|uncertain"):
             browser.install(config, **arguments)
         assert checked == [(config.control_socket, "status")]
         assert calls == []
