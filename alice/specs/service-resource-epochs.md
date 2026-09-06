@@ -36,7 +36,11 @@ token 可能早于 `thread/start` 返回，或早于宿主成功保存线程 ali
 
 仅能读写 ResourceLedger schema 2 不足以成为 previous：受控反例中，旧 Service 虽保留未知 JSON 字段，仍忽略 `prepared` 并到达下一次 spawn 边界；当前 Service 则拒绝启动且保留待对账记录。安全 previous 必须同时具有新 Service 分代语义、资源 schema 2 兼容性，并通过安装产物的原生生命周期验证和独立发布门槛。停止写入并核对进程来源后才能切换代码；禁止用旧 `runtime.json` 或数据库快照覆盖新增记录。本改动不迁移活动库或部署，previous 双候选由集成负责人准备验证。
 
+发布侧可复用 `validate_resource_epoch_journal(state: dict) -> None`：正常返回，坏结构抛 `ValueError`，不打开数据库、不读写文件、不修改入参。它仅校验分代字段及顶层 server 的分代引用；runtime version、tasks、intents 等完整外壳仍由调用方验证。缺失映射按 legacy 空映射读取，显式 null/list 拒绝。epoch 必须为非空白字符串、长度不超过 2000；每条记录必须有合法 state 和 server 键。bound 要求正整数 pid（拒绝 bool）以及非空白 birth/identity，prepared/aborted 要求 server 为 null。当前 server 若携带 resource_epoch_id，必须引用 bound 且三项身份完全一致；未知 additive 字段保留。结构合法的 prepared 不代表可以重新 spawn，运行时另行强制对账。
+
 `tests/test_service_resource_epochs.py` 用真实 ResourceLedger/CodexClient 与合成进程、RPC、故障边界验证保存顺序、早到/迟到、重连、去重、所有权、缓冲上限和拒绝路径。`tests/test_native_service_resource_epochs.py` 则必须提供明确固定的 Codex 与 sibling `codex-code-mode-host` 路径及各自 SHA256，以及安装当前源码的隔离解释器；缺失配置失败，不算跳过通过。
+
+该原生文件同时标记 `native` 和 `native_resource_epoch`。发布侧应从普通 native 选择器排除后者，再对能力 1 候选单独选择 `native_resource_epoch` 为必需门槛，拒绝文件缺失、空测试集、失败和跳过。输入为 `ALICE_ARTIFACT_PYTHON`、`ALICE_TEST_CODEX_BINARY`、`ALICE_TEST_CODEX_SHA256`、`ALICE_TEST_CODEX_HOST_BINARY`、`ALICE_TEST_CODEX_HOST_SHA256`；本 PR 提供测试入口和声明，发布门槛接线由独立工作项验证。
 
 native 案例运行未包装的已安装 CLI/Service，使用隔离 HOME/CODEX_HOME、只被 localhost provider 接受的合成 Bearer 和有限 Responses SSE。普通重启、Service SIGKILL、Codex SIGKILL 各运行 4 个受控响应：provider 单次 total 为 80、90、30、40。此固定二进制恢复会话时报告继承的累计快照，因此第一代观察为 80→170，第二代为 170→200→240；第一份之后的变化分别为 90、70。观察峰值和 410、变化和 160 均不是账户账单，也不能把继承的 170 当作新消费；其它进程重启后计数降低的变体由合成用例单独验证，不从此 native 案例推断。另保留合成 legacy 999，验证不会混入分代和。双外部 RPC 订阅只核对通知，并不伪称 Service 必然收到重复；重复投递另由合成 listener 测试注入。
 

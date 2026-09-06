@@ -20,7 +20,7 @@ import pytest
 from alice_codex.codex import CodexClient
 from alice_codex.config import RuntimeConfig
 from alice_codex.rpc import Event
-from alice_codex.service import Service
+from alice_codex.service import Service, validate_resource_epoch_journal
 import alice_codex.service as service_module
 
 
@@ -142,6 +142,73 @@ def assert_no_tokens(host):
     assert tokens["threads"] == {} and tokens["epochs"] == {}
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        {},
+        {"resource_epochs": {}},
+        {"resource_epochs": {"epoch": {"state": "prepared", "server": None}}},
+        {"resource_epochs": {"epoch": {"state": "aborted", "server": None}}},
+        {
+            "resource_epochs": {
+                "epoch": {
+                    "state": "bound",
+                    "server": {"pid": 1, "identity": "fixture", "birth": "fixture"},
+                }
+            },
+            "server": {
+                "pid": 1,
+                "identity": "fixture",
+                "birth": "fixture",
+                "resource_epoch_id": "epoch",
+            },
+            "unrelated_additive_data": {"preserve": True},
+        },
+    ],
+)
+def test_shared_journal_validator_accepts_without_mutation_or_io(state, monkeypatch):
+    before = deepcopy(state)
+    for name in ("Store", "ResourceLedger", "read_json", "write_json"):
+        monkeypatch.setattr(
+            service_module, name, Mock(side_effect=AssertionError("Unexpected I/O"))
+        )
+    assert validate_resource_epoch_journal(state) is None
+    assert state == before
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        [],
+        {"resource_epochs": None},
+        {"resource_epochs": []},
+        {"resource_epochs": {"": {"state": "prepared", "server": None}}},
+        {"resource_epochs": {"epoch": []}},
+        {"resource_epochs": {"epoch": {"state": [], "server": None}}},
+        {"resource_epochs": {"epoch": {"state": "unknown", "server": None}}},
+        {"resource_epochs": {"epoch": {"state": "prepared"}}},
+        {"resource_epochs": {"epoch": {"state": "prepared", "server": {}}}},
+        {"resource_epochs": {"epoch": {"state": "bound", "server": None}}},
+        {
+            "resource_epochs": {
+                "epoch": {
+                    "state": "bound",
+                    "server": {"pid": True, "identity": "fixture", "birth": "fixture"},
+                }
+            }
+        },
+        {"server": []},
+        {"server": {"resource_epoch_id": []}},
+        {"server": {"resource_epoch_id": "missing"}},
+    ],
+)
+def test_shared_journal_validator_rejects_corruption_with_value_error(state):
+    before = deepcopy(state)
+    with pytest.raises(ValueError):
+        validate_resource_epoch_journal(state)
+    assert state == before
+
+
 def test_listener_cannot_attach_before_process_binding_is_persisted(host):
     epoch = host._prepare_resource_epoch()
     rpc = FakeRpc()
@@ -161,8 +228,7 @@ async def test_prepare_save_failure_prevents_spawn(host, monkeypatch):
     def save_except_prepared():
         nonlocal injected
         if any(
-            entry["state"] == "prepared"
-            for entry in host.state.get("resource_epochs", {}).values()
+            entry["state"] == "prepared" for entry in host.state.get("resource_epochs", {}).values()
         ):
             injected = True
             raise OSError("synthetic disk full at prepare")
@@ -202,8 +268,7 @@ async def test_bind_save_failure_stops_and_waits_for_owned_child(host, monkeypat
     def save_except_binding():
         nonlocal injected
         if any(
-            entry["state"] == "bound"
-            for entry in host.state.get("resource_epochs", {}).values()
+            entry["state"] == "bound" for entry in host.state.get("resource_epochs", {}).values()
         ):
             injected = True
             raise OSError("synthetic disk full at bind")

@@ -29,7 +29,7 @@ from alice_codex.rpc import RpcClient
 from test_native_service import process_is_alive
 from test_native_task_policy import NativePolicyRuntime, process_identity, until
 
-pytestmark = pytest.mark.native
+pytestmark = [pytest.mark.native, pytest.mark.native_resource_epoch]
 
 SYNTHETIC_CREDENTIAL = "alice-localhost-resource-epoch-fixture-not-an-account-key"
 RESPONSE_TOTALS = (80, 90, 30, 40)
@@ -295,7 +295,9 @@ class NativeResourceRuntime(NativePolicyRuntime):
                     "observer_totals": [
                         [
                             [
-                                event.get("tokenUsage", {}).get("total", {}).get("totalTokens")
+                                ((event.get("tokenUsage") or {}).get("total") or {}).get(
+                                    "totalTokens"
+                                )
                                 for event in events
                             ]
                             for events in observers

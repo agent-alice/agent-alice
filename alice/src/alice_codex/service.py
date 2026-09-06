@@ -41,6 +41,61 @@ from .store import DispatchReceipt, Store
 RESOURCE_EPOCH_CAPABILITY = 1
 
 
+def validate_resource_epoch_journal(state: dict) -> None:
+    """Validate only the additive journal and its current-server reference.
+
+    No I/O or mutation; unrelated runtime fields and unknown additive keys are
+    left to their owners. A valid prepared record is accepted structurally;
+    Service startup separately refuses another spawn until it is reconciled.
+    """
+    if not isinstance(state, dict):
+        raise ValueError("Resource epoch validation requires a runtime object")
+    epochs = state.get("resource_epochs", {})
+    if not isinstance(epochs, dict):
+        raise ValueError("Invalid resource epoch journal; preserved for reconciliation")
+
+    def valid_server(server):
+        return (
+            isinstance(server, dict)
+            and type(server.get("pid")) is int
+            and server["pid"] > 0
+            and all(
+                isinstance(server.get(key), str) and server[key].strip()
+                for key in ("birth", "identity")
+            )
+        )
+
+    for epoch, record in epochs.items():
+        if (
+            not isinstance(epoch, str)
+            or not epoch.strip()
+            or len(epoch) > 2000
+            or not isinstance(record, dict)
+            or not isinstance(record.get("state"), str)
+            or record["state"] not in {"prepared", "bound", "aborted"}
+            or "server" not in record
+        ):
+            raise ValueError("Invalid resource epoch record; preserved for reconciliation")
+        if record["state"] == "bound":
+            if not valid_server(record["server"]):
+                raise ValueError("Invalid resource epoch binding; preserved for reconciliation")
+        elif record["server"] is not None:
+            raise ValueError("Unbound resource epoch has a server identity")
+    current = state.get("server")
+    if current is not None and not isinstance(current, dict):
+        raise ValueError("Invalid active server in resource epoch journal")
+    if isinstance(current, dict) and "resource_epoch_id" in current:
+        epoch_id = current["resource_epoch_id"]
+        record = epochs.get(epoch_id) if isinstance(epoch_id, str) else None
+        if (
+            not record
+            or record["state"] != "bound"
+            or not valid_server(current)
+            or any(record["server"][key] != current[key] for key in ("pid", "birth", "identity"))
+        ):
+            raise ValueError("Active resource epoch binding conflicts with server identity")
+
+
 def process_identity(pid: int) -> str | None:
     result = subprocess.run(
         ["ps", "-ww", "-p", str(pid), "-o", "lstart=", "-o", "command="],
@@ -318,44 +373,7 @@ class Service:
         write_json(self.path, self.state)
 
     def _validate_resource_epochs(self):
-        epochs = self.state.get("resource_epochs", {})
-        if not isinstance(epochs, dict):
-            raise ValueError("Invalid resource epoch journal; preserved for reconciliation")
-        for epoch, record in epochs.items():
-            if (
-                not isinstance(epoch, str)
-                or not epoch.strip()
-                or len(epoch) > 2000
-                or not isinstance(record, dict)
-                or record.get("state") not in {"prepared", "bound", "aborted"}
-            ):
-                raise ValueError("Invalid resource epoch record; preserved for reconciliation")
-            server = record.get("server")
-            if record["state"] == "bound":
-                if (
-                    not isinstance(server, dict)
-                    or type(server.get("pid")) is not int
-                    or server["pid"] <= 0
-                    or any(
-                        not isinstance(server.get(key), str) or not server[key].strip()
-                        for key in ("birth", "identity")
-                    )
-                ):
-                    raise ValueError("Invalid resource epoch binding; preserved for reconciliation")
-            elif server is not None:
-                raise ValueError("Unbound resource epoch has a server identity")
-        current = self.state.get("server")
-        if isinstance(current, dict) and "resource_epoch_id" in current:
-            record = epochs.get(current["resource_epoch_id"])
-            if (
-                not record
-                or record["state"] != "bound"
-                or any(
-                    record["server"][key] != current.get(key)
-                    for key in ("pid", "birth", "identity")
-                )
-            ):
-                raise ValueError("Active resource epoch binding conflicts with server identity")
+        validate_resource_epoch_journal(self.state)
 
     def _prepare_resource_epoch(self):
         epochs = self.state.get("resource_epochs", {})
