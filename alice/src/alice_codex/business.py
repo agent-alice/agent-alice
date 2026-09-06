@@ -7,9 +7,11 @@ data. Counts describe the declared collection, never an entire account.
 """
 
 import argparse
+from datetime import datetime
 import hashlib
 import html
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -18,6 +20,31 @@ import unicodedata
 
 MAX_INPUT_BYTES = 2 * 1024 * 1024
 MAX_ITEMS = 20000
+COLLECTION_ERRORS = frozenset(
+    {
+        "pagination_cycle",
+        "time_budget",
+        "unexpected_http_status",
+        "unsupported_content_encoding",
+        "response_too_large",
+        "total_byte_limit",
+        "truncated_response",
+        "redirect_rejected",
+        "http_error",
+        "transport_error",
+        "invalid_json",
+        "invalid_collection_shape",
+        "item_limit",
+        "pagination_metadata_missing",
+        "next_page_missing",
+        "next_page_origin_rejected",
+        "next_page_scope_rejected",
+        "page_limit",
+        "permission_denied",
+        "stale_cache",
+        "cache_metadata_invalid",
+    }
+)
 
 
 def _text(value, field: str) -> str:
@@ -30,6 +57,93 @@ def _count(value) -> bool:
     return type(value) is int and value >= 0
 
 
+def _seconds(value, field: str) -> float:
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError(f"{field} must be a finite nonnegative number")
+    return value
+
+
+def _timestamp(value, field: str) -> datetime:
+    _text(value, field)
+    try:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"{field} must be an ISO 8601 timestamp with a timezone") from None
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError(f"{field} must include a timezone")
+    return result
+
+
+def _freshness_policy(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("freshness must be an object")
+    return (
+        _timestamp(value.get("as_of"), "freshness.as_of"),
+        _seconds(value.get("max_age_seconds"), "freshness.max_age_seconds"),
+    )
+
+
+def _evidence_quality(evidence: dict, freshness=None) -> tuple[list[str], str]:
+    """Only supplied metadata is checked; absent legacy metadata stays not_checked."""
+    problems = []
+    if "truncated" in evidence:
+        if type(evidence["truncated"]) is not bool:
+            raise ValueError("truncated must be a boolean")
+        if evidence["truncated"]:
+            problems.append("observation_truncated")
+    status = evidence.get("http_status")
+    if status is not None:
+        if type(status) is not int or not 100 <= status <= 599:
+            raise ValueError("http_status must be an integer from 100 to 599")
+        if status in {401, 403}:
+            problems.append("permission_denied")
+        elif not 200 <= status < 300:
+            problems.append("page_failed")
+    if evidence.get("status", "ok") != "ok":
+        problems.append("page_failed")
+    if "error" in evidence:
+        error = _text(evidence["error"], "error")
+        # Never copy a remote body or caller-authored diagnostic into a report.
+        problems.append(error if error in COLLECTION_ERRORS else "collection_error")
+    age = evidence.get("cache_age_seconds")
+    lifetime = evidence.get("cache_max_age_seconds")
+    for field in ("cache_age_seconds", "cache_max_age_seconds"):
+        if field in evidence:
+            _seconds(evidence[field], field)
+    state, elapsed = "not_checked", 0
+    if freshness is not None:
+        observed = _timestamp(evidence.get("observed_at"), "observed_at")
+        elapsed = (freshness[0] - observed).total_seconds()
+        state = "fresh"
+        if elapsed < 0:
+            problems.append("observation_from_future")
+            state = "unknown"
+        elif elapsed + (age or 0) > freshness[1]:
+            problems.append("stale_observation")
+            state = "stale"
+    if age is not None or lifetime is not None:
+        if age is not None and lifetime is not None:
+            if age + max(elapsed, 0) >= lifetime:
+                problems.append("stale_cache")
+                state = "stale"
+            elif state == "not_checked":
+                state = "fresh"
+        elif freshness is None or age is None:
+            problems.append("cache_freshness_unknown")
+            state = "unknown" if state != "stale" else state
+    if "stale_cache" in problems:
+        state = "stale"
+    if "cache_metadata_invalid" in problems:
+        state = "unknown"
+    return list(dict.fromkeys(problems)), state
+
+
 def summarize_observation(document: dict) -> dict:
     """Summarize v1 collector evidence without changing unknown counts into zero.
 
@@ -39,6 +153,10 @@ def summarize_observation(document: dict) -> dict:
     only explicit null terminates pagination. Optional expected_count is a count
     of this exact collection. Optional independent has source, observed_at, subject,
     collection, coverage='partial'|'complete', items from a separate browser view.
+    Optional freshness={as_of,max_age_seconds} checks snapshot and cache age.
+    Pages and independent evidence may declare truncated, http_status, error,
+    cache_age_seconds and cache_max_age_seconds. Without freshness/cache metadata,
+    a known count describes the supplied snapshot, not current remote state.
     """
     if not isinstance(document, dict) or document.get("schema_version") != 1:
         raise ValueError("observation schema_version must be 1")
@@ -59,6 +177,9 @@ def summarize_observation(document: dict) -> dict:
     if not isinstance(pages, list) or len(pages) > 1000:
         raise ValueError("pages must be a list with at most 1000 entries")
     issues, sources, observed = [], [], {}
+    freshness = _freshness_policy(document.get("freshness"))
+    freshness_states = []
+    evidence_usable = True
     unknown = {metric: set() for metric in metrics}
     field_issues = []
     expected_cursor, seen_cursors, raw_count = None, set(), 0
@@ -74,6 +195,16 @@ def summarize_observation(document: dict) -> dict:
                 "observed_at": _text(page.get("observed_at"), "page.observed_at"),
             }
         )
+        quality, state = _evidence_quality(page, freshness)
+        freshness_states.append(state)
+        if quality:
+            evidence_usable = False
+            issues.extend({"code": code, "page": number + 1} for code in quality)
+        if any(
+            code in quality
+            for code in ("observation_truncated", "permission_denied", "page_failed")
+        ):
+            pagination_complete = False
         cursor = page.get("cursor")
         if cursor is not None and not isinstance(cursor, str):
             raise ValueError("page cursor must be a string or null")
@@ -94,7 +225,8 @@ def summarize_observation(document: dict) -> dict:
             issues.append({"code": "pagination_unknown", "page": number + 1})
         if page.get("status") != "ok":
             pagination_complete = False
-            issues.append({"code": "page_failed", "page": number + 1})
+            if "page_failed" not in quality:
+                issues.append({"code": "page_failed", "page": number + 1})
             continue
         items = page.get("items")
         if not isinstance(items, list):
@@ -153,11 +285,16 @@ def summarize_observation(document: dict) -> dict:
     differences = []
     independent = document.get("independent")
     comparison = "not_provided"
+    independent_source = None
     if independent is not None:
         if not isinstance(independent, dict):
             raise ValueError("independent observation must be an object")
-        _text(independent.get("source"), "independent.source")
-        _text(independent.get("observed_at"), "independent.observed_at")
+        independent_source = {
+            "source": _text(independent.get("source"), "independent.source"),
+            "observed_at": _text(independent.get("observed_at"), "independent.observed_at"),
+        }
+        quality, state = _evidence_quality(independent, freshness)
+        freshness_states.append(state)
         if independent.get("coverage") not in {"partial", "complete"}:
             raise ValueError("independent.coverage must be partial or complete")
         rows = independent.get("items")
@@ -169,7 +306,14 @@ def summarize_observation(document: dict) -> dict:
         comparison = "compared" if comparable else "scope_mismatch"
         if not comparable:
             issues.append({"code": "independent_scope_mismatch"})
-        else:
+            evidence_usable = False
+        if independent["source"] in {source["source"] for source in sources}:
+            quality.append("independent_source_not_independent")
+        if quality:
+            evidence_usable = False
+            comparison = "unavailable"
+            issues.extend({"code": code, "source_role": "independent"} for code in quality)
+        if comparable and not quality:
             other = {}
             for item in rows:
                 if (
@@ -179,6 +323,8 @@ def summarize_observation(document: dict) -> dict:
                 ):
                     raise ValueError("independent items require an id")
                 identity = str(item["id"])
+                if not identity:
+                    raise ValueError("independent item id must not be empty")
                 if identity in other:
                     raise ValueError("independent items must have unique ids")
                 other[identity] = item
@@ -201,7 +347,9 @@ def summarize_observation(document: dict) -> dict:
             for identity, item in observed.items()
             if identity not in unknown[metric] and _count(item.get(metric))
         ]
-        complete = pagination_complete and not unknown[metric] and not differences
+        complete = (
+            pagination_complete and evidence_usable and not unknown[metric] and not differences
+        )
         totals[metric] = {
             "state": "known" if complete else "unknown",
             "value": sum(known) if complete else None,
@@ -215,11 +363,21 @@ def summarize_observation(document: dict) -> dict:
         "collection": collection,
         "scope": "declared_api_collection",
         "sources": sources,
+        "independent_source": independent_source,
         "coverage": {
             "pagination_complete": pagination_complete,
             "observed_items": len(observed),
             "independent_comparison": comparison,
             "independent_coverage": independent.get("coverage") if independent else None,
+            "freshness": (
+                "stale"
+                if "stale" in freshness_states
+                else "unknown"
+                if "unknown" in freshness_states
+                else "not_checked"
+                if not freshness_states or "not_checked" in freshness_states
+                else "fresh"
+            ),
         },
         "metrics": totals,
         "issues": issues,
@@ -316,11 +474,14 @@ def reconcile_publication(intent: dict, evidence: dict) -> dict:
     """Match a post-attempt intent against separately fetched external evidence.
 
     Intent: action_id, subject, target, content_sha256, status=sent|unknown|confirmed,
-    optional external_id. Evidence: source, observed_at, receipts; each receipt has
+    optional external_id and sent_at. Evidence: source, observed_at, receipts; each receipt has
     kind=read_back, external_id, subject, target, content_sha256, visible and optional
     action_id. HTTP submission responses alone cannot confirm publication. A matching
     body without an ID/action binding is only a candidate, not proof of this action.
     No outcome from this function authorizes automatically repeating a submission.
+    Optional sent_at requires readback timestamps at or after the attempt; optional
+    freshness and observation quality metadata reject stale/failed readbacks.
+    Without sent_at, the temporal relationship remains explicitly not_checked.
     """
     if not isinstance(intent, dict) or not isinstance(evidence, dict):
         raise ValueError("intent and evidence must be objects")
@@ -334,10 +495,16 @@ def reconcile_publication(intent: dict, evidence: dict) -> dict:
         _text(intent["external_id"], "intent.external_id")
     source = _text(evidence.get("source"), "evidence.source")
     observed_at = _text(evidence.get("observed_at"), "evidence.observed_at")
+    freshness = _freshness_policy(evidence.get("freshness"))
+    evidence_problems, _ = _evidence_quality(evidence, freshness)
+    sent_at = _timestamp(intent["sent_at"], "intent.sent_at") if "sent_at" in intent else None
+    if sent_at is not None and _timestamp(observed_at, "evidence.observed_at") < sent_at:
+        evidence_problems.append("evidence_before_action")
     receipts = evidence.get("receipts")
     if not isinstance(receipts, list) or len(receipts) > 1000:
         raise ValueError("receipts must be a list of at most 1000 entries")
     confirmed, candidates, conflicts = set(), set(), set()
+    issues = [{"code": code, "source_role": "evidence"} for code in evidence_problems]
     for receipt in receipts:
         if not isinstance(receipt, dict):
             raise ValueError("receipt must be an object")
@@ -348,6 +515,19 @@ def reconcile_publication(intent: dict, evidence: dict) -> dict:
         ):
             raise ValueError("receipt external_id must identify an external object")
         identity = str(receipt["external_id"])
+        quality_receipt = {"observed_at": observed_at, **receipt}
+        # Legacy receipts may include the copied intent's lifecycle status.
+        if quality_receipt.get("status") in {"sent", "unknown", "confirmed"}:
+            quality_receipt.pop("status")
+        receipt_problems, _ = _evidence_quality(quality_receipt, freshness)
+        if (
+            sent_at is not None
+            and _timestamp(receipt.get("observed_at", observed_at), "receipt.observed_at") < sent_at
+        ):
+            receipt_problems.append("evidence_before_action")
+        issues.extend({"code": code, "external_id": identity} for code in receipt_problems)
+        if evidence_problems or receipt_problems:
+            continue
         same_target = all(receipt.get(field) == intent[field] for field in ("subject", "target"))
         bound = (
             identity == intent.get("external_id") or receipt.get("action_id") == intent["action_id"]
@@ -388,6 +568,8 @@ def reconcile_publication(intent: dict, evidence: dict) -> dict:
         "candidate_ids": sorted(candidates | confirmed) if status != "confirmed" else [],
         "conflicting_ids": sorted(conflicts),
         "retry_allowed": False,
+        "temporal_check": "checked" if sent_at is not None else "not_checked",
+        "issues": issues,
         "evidence": {"source": source, "observed_at": observed_at},
     }
 

@@ -253,3 +253,201 @@ def test_real_module_cli_fails_a_leaking_draft_without_rewriting_it(tmp_path):
     assert result.returncode == 2
     assert not json.loads(result.stdout)["passed"]
     assert draft.read_text() == body
+
+
+@pytest.mark.parametrize(
+    "field,value,code",
+    [
+        ("subject", "different-account", "independent_scope_mismatch"),
+        ("source", "api/answers", "independent_source_not_independent"),
+    ],
+)
+def test_unusable_independent_view_cannot_leave_totals_known(field, value, code):
+    document = observation(
+        [{"id": "a", "voteup_count": 0, "comment_count": 0}],
+        independent=independent([]),
+    )
+    document["independent"][field] = value
+    result = summarize_observation(document)
+    assert code in {issue["code"] for issue in result["issues"]}
+    assert result["metrics"]["voteup_count"]["value"] is None
+    assert result["coverage"]["pagination_complete"]
+
+
+@pytest.mark.parametrize(
+    "metadata,code",
+    [
+        ({"truncated": True}, "observation_truncated"),
+        ({"http_status": 403}, "permission_denied"),
+        ({"cache_age_seconds": 60, "cache_max_age_seconds": 60}, "stale_cache"),
+        ({"cache_age_seconds": 12}, "cache_freshness_unknown"),
+        ({"cache_max_age_seconds": 60}, "cache_freshness_unknown"),
+        ({"error": "private remote diagnostic"}, "collection_error"),
+    ],
+)
+def test_explicit_quality_evidence_prevents_false_complete_zero(metadata, code):
+    document = observation([])
+    document["pages"][0].update(metadata)
+    result = summarize_observation(document)
+    assert code in {issue["code"] for issue in result["issues"]}
+    assert not result["complete"]
+    assert result["metrics"]["voteup_count"]["value"] is None
+    assert "private remote diagnostic" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"status": "error"},
+        {"http_status": 401},
+        {"truncated": True},
+        {"cache_age_seconds": 90, "cache_max_age_seconds": 60},
+    ],
+)
+def test_failed_independent_evidence_is_unavailable_not_an_empty_disagreement(metadata):
+    document = observation(
+        [{"id": "a", "voteup_count": 7, "comment_count": 0}],
+        independent=independent([], coverage="complete"),
+    )
+    document["independent"].update(metadata)
+    result = summarize_observation(document)
+    assert result["coverage"]["independent_comparison"] == "unavailable"
+    assert result["differences"] == []
+    assert result["metrics"]["voteup_count"]["value"] is None
+    assert result["metrics"]["voteup_count"]["observed_sum"] == 7
+    assert result["independent_source"] == {
+        "source": "rendered-profile",
+        "observed_at": "2026-09-06T10:00:01Z",
+    }
+
+
+@pytest.mark.parametrize(
+    "as_of,cache_age,state,code",
+    [
+        ("2026-09-06T10:00:30Z", 0, "fresh", None),
+        ("2026-09-06T10:01:01Z", 0, "stale", "stale_observation"),
+        ("2026-09-06T10:00:30Z", 40, "stale", "stale_observation"),
+        ("2026-09-06T09:59:59Z", 0, "unknown", "observation_from_future"),
+        ("2026-09-06T18:00:30+08:00", 0, "fresh", None),
+    ],
+)
+def test_explicit_freshness_checks_elapsed_snapshot_and_cache_age(as_of, cache_age, state, code):
+    document = observation([], freshness={"as_of": as_of, "max_age_seconds": 60})
+    document["pages"][0]["cache_age_seconds"] = cache_age
+    result = summarize_observation(document)
+    assert result["coverage"]["freshness"] == state
+    assert result["complete"] is (code is None)
+    if code:
+        assert code in {issue["code"] for issue in result["issues"]}
+        assert result["metrics"]["voteup_count"]["value"] is None
+
+
+def test_legacy_snapshot_remains_readable_without_claiming_freshness():
+    result = summarize_observation(observation([]))
+    assert result["complete"] and result["metrics"]["voteup_count"]["value"] == 0
+    assert result["coverage"]["freshness"] == "not_checked"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"truncated": "false"},
+        {"http_status": True},
+        {"cache_age_seconds": None},
+        {"cache_age_seconds": float("nan")},
+        {"cache_max_age_seconds": -1},
+    ],
+)
+def test_invalid_quality_metadata_cannot_be_silently_ignored(metadata):
+    document = observation([])
+    document["pages"][0].update(metadata)
+    with pytest.raises(ValueError):
+        summarize_observation(document)
+
+
+def test_freshness_requires_a_zoned_clock_and_bounded_numeric_age():
+    document = observation([], freshness={"as_of": "2026-09-06T10:00:30", "max_age_seconds": 60})
+    with pytest.raises(ValueError, match="timezone"):
+        summarize_observation(document)
+    document["freshness"] = {"as_of": "2026-09-06T10:00:30Z", "max_age_seconds": True}
+    with pytest.raises(ValueError, match="finite nonnegative"):
+        summarize_observation(document)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"http_status": 403},
+        {"truncated": True},
+        {"status": "error"},
+        {"cache_age_seconds": 90, "cache_max_age_seconds": 60},
+        {"observed_at": "2026-09-06T09:59:59Z"},
+    ],
+)
+def test_incomplete_or_pre_action_readback_does_not_confirm(metadata):
+    intent, evidence = publication()
+    intent["sent_at"] = "2026-09-06T10:00:00Z"
+    evidence.update(metadata)
+    result = reconcile_publication(intent, evidence)
+    assert result["status"] == "needs_reconciliation"
+    assert result["issues"] and not result["retry_allowed"]
+
+
+def test_new_envelope_time_cannot_refresh_an_old_receipt():
+    intent, evidence = publication()
+    intent["sent_at"] = "2026-09-06T10:00:00Z"
+    evidence["observed_at"] = "2026-09-06T10:00:10Z"
+    evidence["receipts"][0]["observed_at"] = "2026-09-06T09:59:59Z"
+    result = reconcile_publication(intent, evidence)
+    assert result["status"] == "needs_reconciliation"
+    assert result["issues"] == [{"code": "evidence_before_action", "external_id": "answer-1"}]
+    evidence["receipts"][0]["observed_at"] = evidence["observed_at"]
+    result = reconcile_publication(intent, evidence)
+    assert result["status"] == "confirmed" and result["temporal_check"] == "checked"
+
+
+def test_readback_without_attempt_time_does_not_claim_temporal_verification():
+    intent, evidence = publication()
+    assert reconcile_publication(intent, evidence)["temporal_check"] == "not_checked"
+
+
+def test_elapsed_snapshot_time_can_expire_a_previously_fresh_cache():
+    document = observation([], freshness={"as_of": "2026-09-06T10:00:50Z", "max_age_seconds": 3600})
+    document["pages"][0].update(cache_age_seconds=10, cache_max_age_seconds=60)
+    result = summarize_observation(document)
+    assert result["coverage"]["freshness"] == "stale"
+    assert result["metrics"]["voteup_count"]["value"] is None
+    assert "stale_cache" in {issue["code"] for issue in result["issues"]}
+
+
+def test_fresh_api_does_not_override_a_stale_independent_snapshot():
+    document = observation(
+        [],
+        independent=independent([]),
+        freshness={"as_of": "2026-09-06T10:00:30Z", "max_age_seconds": 60},
+    )
+    document["independent"]["observed_at"] = "2026-09-06T09:58:00Z"
+    result = summarize_observation(document)
+    assert result["coverage"]["independent_comparison"] == "unavailable"
+    assert result["metrics"]["voteup_count"]["value"] is None
+    assert {"code": "stale_observation", "source_role": "independent"} in result["issues"]
+
+
+def test_module_cli_rejects_stale_observation_then_accepts_a_fresh_read(tmp_path):
+    document = observation([{"id": "a", "voteup_count": 7, "comment_count": 0}])
+    document["pages"][0].update(cache_age_seconds=90, cache_max_age_seconds=60)
+    path = tmp_path / "synthetic-observation.json"
+    for age, expected_exit, expected_value in [(90, 2, None), (10, 0, 7)]:
+        document["pages"][0]["cache_age_seconds"] = age
+        path.write_text(json.dumps(document))
+        result = subprocess.run(
+            [sys.executable, "-m", "alice_codex.business", "summarize-observation", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        assert result.returncode == expected_exit
+        report = json.loads(result.stdout)
+        assert report["metrics"]["voteup_count"]["value"] == expected_value
+        assert report["metrics"]["voteup_count"]["observed_sum"] == 7

@@ -1,13 +1,17 @@
 """Real localhost HTTP fixtures, never production Zhihu or cookie stores."""
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
+from urllib.request import urlopen
 
 import pytest
 
 from alice_codex.collector import collect_collection, collect_zhihu_answers
+from alice_codex.business import reconcile_publication
 
 
 @contextmanager
@@ -288,4 +292,157 @@ def test_invalid_config_is_rejected_before_http_or_credential_lookup(monkeypatch
             collect_zhihu_answers("../me", base_url=base)
         with pytest.raises(ValueError, match="loopback"):
             collect_collection("http://example.com/answers", subject="x", collection="answers")
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    "headers,code,state",
+    [
+        ({"Age": "120", "Cache-Control": "public, max-age=60"}, "stale_cache", "stale"),
+        ({"Age": "0", "Cache-Control": "max-age=0"}, "stale_cache", "stale"),
+        ({"Warning": '110 synthetic-cache "Response is stale"'}, "stale_cache", "stale"),
+        ({"Age": "10"}, "cache_freshness_unknown", "unknown"),
+        ({"Age": "private-header-value"}, "cache_metadata_invalid", "unknown"),
+        ({"Cache-Control": "max-age=private-header-value"}, "cache_metadata_invalid", "unknown"),
+        ({"Cache-Control": 'max-age="60'}, "cache_metadata_invalid", "unknown"),
+    ],
+)
+def test_http_cache_evidence_never_turns_stale_or_unknown_into_empty_zero(headers, code, state):
+    status, value, _ = page([])
+    with endpoint({"/answers": (status, value, headers)}) as (base, requests):
+        result = collect(base)
+    assert len(requests) == 1
+    assert result["summary"]["coverage"]["freshness"] == state
+    assert code in {issue["code"] for issue in result["summary"]["issues"]}
+    assert result["summary"]["metrics"]["voteup_count"]["value"] is None
+    assert result["fetches"][0]["bytes_received"] == len(json.dumps(value).encode())
+    assert "private-header-value" not in json.dumps(result)
+
+
+def test_fresh_http_cache_preserves_counts_but_respects_explicit_stricter_age():
+    status, value, _ = page([{"id": "a", "voteup_count": 7}])
+    with endpoint(
+        {"/answers": (status, value, {"Age": "10", "Cache-Control": 'max-age="60"'})}
+    ) as (base, requests):
+        fresh = collect(base, required_metrics=("voteup_count",))
+        stale = collect(base, required_metrics=("voteup_count",), max_age_seconds=5)
+    assert len(requests) == 2
+    assert fresh["summary"]["complete"]
+    assert fresh["summary"]["coverage"]["freshness"] == "fresh"
+    assert fresh["summary"]["metrics"]["voteup_count"]["value"] == 7
+    assert stale["summary"]["coverage"]["freshness"] == "stale"
+    assert stale["summary"]["metrics"]["voteup_count"]["value"] is None
+    assert stale["summary"]["metrics"]["voteup_count"]["observed_sum"] == 7
+
+
+def test_forbidden_and_truncated_http_failures_are_retained_in_observation_contract():
+    with endpoint({"/answers": (403, b"unavailable", {})}) as (base, _):
+        forbidden = collect(base)
+    page_evidence = forbidden["observation"]["pages"][0]
+    assert page_evidence["http_status"] == 403 and page_evidence["error"] == "http_error"
+    assert "permission_denied" in {issue["code"] for issue in forbidden["summary"]["issues"]}
+    with endpoint({"/answers": (200, b'{"data":[]}', {"Content-Length": 100})}) as (base, _):
+        truncated = collect(base)
+    assert truncated["observation"]["pages"][0]["truncated"] is True
+    assert "observation_truncated" in {issue["code"] for issue in truncated["summary"]["issues"]}
+
+
+@pytest.mark.parametrize("independent_status", [200, 403])
+def test_two_real_http_sources_expose_disagreement_or_unavailable_comparison(independent_status):
+    other = page([{"id": "a", "voteup_count": 9}]) if independent_status == 200 else (403, b"", {})
+    with endpoint({"/answers": page([{"id": "a", "voteup_count": 0}]), "/rendered": other}) as (
+        base,
+        requests,
+    ):
+        separately_read = collect_collection(
+            base + "/rendered",
+            subject="test-member",
+            collection="answers",
+            required_metrics=("voteup_count",),
+        )
+        independent = {
+            **separately_read["observation"]["pages"][0],
+            "subject": "test-member",
+            "collection": "answers",
+            "coverage": "complete",
+        }
+        result = collect(base, required_metrics=("voteup_count",), independent=independent)
+    assert len(requests) == 2
+    assert result["summary"]["metrics"]["voteup_count"]["value"] is None
+    if independent_status == 200:
+        assert result["summary"]["differences"] == [
+            {"code": "metric_disagreement", "id": "a", "metric": "voteup_count"}
+        ]
+    else:
+        assert result["summary"]["coverage"]["independent_comparison"] == "unavailable"
+        assert result["summary"]["differences"] == []
+
+
+def test_business_result_is_checked_by_separate_http_readback_of_actual_visible_body():
+    intended = "Synthetic public answer with complete evidence."
+    intent = {
+        "action_id": "synthetic-action",
+        "subject": "synthetic-account",
+        "target": "question",
+        "status": "unknown",
+        "external_id": "synthetic-answer",
+        "content_sha256": hashlib.sha256(intended.encode()).hexdigest(),
+        "sent_at": "2026-09-06T00:00:00Z",
+    }
+    binding = {key: intent[key] for key in ("action_id", "subject", "target", "external_id")}
+    routes = {
+        "/submission-ack": (
+            201,
+            {
+                **binding,
+                "kind": "submission_ack",
+                "visible": True,
+                "content_sha256": intent["content_sha256"],
+            },
+            {},
+        ),
+        "/public-object": (
+            200,
+            {**binding, "body": "Synthetic incomplete answer.", "visible": True},
+            {},
+        ),
+    }
+    with endpoint(routes) as (base, requests):
+
+        def read_evidence(path, is_readback):
+            with urlopen(base + path, timeout=2) as response:
+                actual = json.load(response)
+            if is_readback:
+                actual["kind"] = "read_back"
+                actual["content_sha256"] = hashlib.sha256(actual.pop("body").encode()).hexdigest()
+            return {
+                "source": base + path,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "receipts": [actual],
+            }
+
+        assert (
+            reconcile_publication(intent, read_evidence("/submission-ack", False))["status"]
+            == "needs_reconciliation"
+        )
+        wrong = reconcile_publication(intent, read_evidence("/public-object", True))
+        assert wrong["status"] == "conflict" and not wrong["retry_allowed"]
+        routes["/public-object"][1]["body"] = intended
+        corrected = reconcile_publication(intent, read_evidence("/public-object", True))
+        assert corrected["status"] == "confirmed" and corrected["temporal_check"] == "checked"
+    assert len(requests) == 3  # All requests were loopback GET; no publication was attempted.
+
+
+def test_empty_remote_identity_is_a_missing_record_not_a_collector_exception():
+    with endpoint({"/answers": page([{"id": "", "voteup_count": 0}])}) as (base, _):
+        result = collect(base, required_metrics=("voteup_count",))
+    assert not result["summary"]["complete"]
+    assert "item_missing_id" in {issue["code"] for issue in result["summary"]["issues"]}
+
+
+@pytest.mark.parametrize("max_age", [True, float("nan"), 10**400])
+def test_invalid_freshness_limit_is_rejected_before_fetch(max_age):
+    with endpoint({"/answers": page([])}) as (base, requests):
+        with pytest.raises(ValueError, match="finite nonnegative"):
+            collect(base, max_age_seconds=max_age)
     assert requests == []
