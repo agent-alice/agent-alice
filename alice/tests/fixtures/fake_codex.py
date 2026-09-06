@@ -104,6 +104,10 @@ class FakeServer:
                 "nextCursor": None,
             }
         thread = self.state["threads"][params["threadId"]]
+        if method == "thread/inject_items":
+            thread.setdefault("injected_items", []).extend(params["items"])
+            self.save()
+            return {}
         if method == "thread/resume":
             thread["status"] = {"type": "idle"}
             self.save()

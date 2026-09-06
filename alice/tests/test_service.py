@@ -27,7 +27,13 @@ def service(tmp_path):
     item = Service(config)
     item.ready = True
     item.codex = Mock()
-    item.codex.thread_start = AsyncMock(return_value={"thread": {"id": "new-root"}})
+    item.codex.thread_start = AsyncMock(
+        return_value={"thread": {"id": "new-root", "status": {"type": "idle"}}}
+    )
+    item.codex.record_runtime_initialization = AsyncMock(return_value={})
+    item.codex.thread_resume = AsyncMock(
+        return_value={"thread": {"id": "new-root", "status": {"type": "idle"}}}
+    )
     item.codex.thread_read = AsyncMock(
         return_value={"thread": {"id": "root", "status": {"type": "idle"}}}
     )
@@ -94,7 +100,7 @@ async def test_request_id_is_global_even_across_concurrent_targets(service):
     async def create_thread(**kwargs):
         entered.set()
         await release.wait()
-        return {"thread": {"id": "new-root"}}
+        return {"thread": {"id": "new-root", "status": {"type": "idle"}}}
 
     service.codex.thread_start.side_effect = create_thread
     first = asyncio.create_task(service.submit("main", "input", intent_id="global-id"))
@@ -129,6 +135,9 @@ async def test_concurrent_automatic_inputs_reserve_capacity_until_reconciled(ser
     assert sum(isinstance(result, RejectedDispatch) for result in results) == 1
     service.codex.turn_start.assert_awaited_once()
     service._complete_turn("new-root", {"id": "turn-1", "status": "completed"})
+    service.codex.thread_start.return_value = {
+        "thread": {"id": "other-root", "status": {"type": "idle"}}
+    }
     assert (await service.submit("other", "two", intent_id="two", automatic=True))[
         "status"
     ] == "accepted"
@@ -244,9 +253,12 @@ async def test_unloaded_thread_resumes_same_id_before_considering_empty_replacem
         service.state["intents"]["unknown"] = {"thread_id": "old-root", "status": "unknown"}
     service.save()
     service.codex.thread_read.side_effect = RpcError("thread not loaded: old-root", -32600)
-    service.codex.thread_resume = AsyncMock(
-        side_effect=RpcError("no rollout found for thread id old-root", -32600)
-    )
+    async def resume(thread_id, **kwargs):
+        if thread_id == "old-root":
+            raise RpcError("no rollout found for thread id old-root", -32600)
+        return {"thread": {"id": thread_id, "status": {"type": "idle"}}}
+
+    service.codex.thread_resume = AsyncMock(side_effect=resume)
     if input_state == "empty":
         replacement = await service.ensure_thread("main")
         assert replacement["thread_id"] == "new-root" and replacement["paused"]
@@ -257,7 +269,9 @@ async def test_unloaded_thread_resumes_same_id_before_considering_empty_replacem
             await service.ensure_thread("main")
         assert service.state["tasks"]["main"] == old
         service.codex.thread_start.assert_not_called()
-    assert service.codex.thread_resume.await_args.args == ("old-root",)
+    assert service.codex.thread_resume.await_args_list[0].args == ("old-root",)
+    if input_state == "empty":
+        assert service.codex.thread_resume.await_args_list[-1].args == ("new-root",)
 
 
 async def test_unloaded_durable_history_is_resumed_without_replacement(service):
@@ -326,7 +340,7 @@ async def test_shutdown_restart_global_resume_and_due_dispatch_hydrates_original
         return {"thread": {"id": thread_id, "status": {"type": "idle"}}}
 
     async def resume(thread_id, **kwargs):
-        if not has_input:
+        if not has_input and thread_id == "old-root":
             raise RpcError("no rollout found for thread id old-root", -32600)
         loaded.add(thread_id)
         return await read(thread_id)
