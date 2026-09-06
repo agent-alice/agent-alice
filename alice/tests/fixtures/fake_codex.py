@@ -8,11 +8,13 @@ Alice process/protocol path, and is deliberately not labelled native Codex.
 
 import asyncio
 from contextlib import suppress
+import hashlib
 import json
 import os
 from pathlib import Path
 import signal
 import sys
+import tomllib
 from uuid import uuid4
 
 
@@ -80,6 +82,32 @@ class FakeServer:
     async def call(self, method, params):
         if method == "initialize":
             return {"userAgent": "alice-fixture/0", "version": "fixture"}
+        if method == "hooks/list":
+            config_path = self.path.parent / "config.toml"
+            hooks = tomllib.loads(config_path.read_text()).get("hooks", {})
+            values = []
+            for event, groups in hooks.items():
+                if event == "state":
+                    continue
+                for i, group in enumerate(groups):
+                    for j, handler in enumerate(group["hooks"]):
+                        key = f"{config_path}:{event}:{i}:{j}"
+                        current_hash = "sha256:" + hashlib.sha256(
+                            json.dumps(handler, sort_keys=True).encode()
+                        ).hexdigest()
+                        trusted = hooks.get("state", {}).get(key, {}).get("trusted_hash") == current_hash
+                        values.append({
+                            "key": key, "eventName": event[0].lower() + event[1:],
+                            "handlerType": "command", "command": handler["command"],
+                            "async": handler.get("async", False), "matcher": group.get("matcher"),
+                            "timeoutSec": handler.get("timeout"),
+                            "statusMessage": handler.get("statusMessage"),
+                            "additionalContextLimit": handler.get("additionalContextLimit"),
+                            "sourcePath": str(config_path), "source": "user", "enabled": True,
+                            "currentHash": current_hash, "trustStatus": "trusted" if trusted else "untrusted",
+                        })
+            return {"data": [{"cwd": cwd, "hooks": values, "warnings": [], "errors": []}
+                             for cwd in params["cwds"]]}
         if method == "thread/start":
             thread = {
                 "id": str(uuid4()),

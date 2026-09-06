@@ -24,6 +24,9 @@ import alice_codex.service as service_module
 def service(tmp_path):
     config = RuntimeConfig(str(tmp_path), "/usr/bin/true", "codex-cli fixture", "unused")
     config.prepare_directories()
+    (config.workspace / "memory").mkdir(exist_ok=True)
+    for name in ("SOUL.md", "USER.md", "memory/MEMORY.md"):
+        (config.workspace / name).write_text("Synthetic service identity: " + name)
     item = Service(config)
     item.ready = True
     item.codex = Mock()
@@ -253,6 +256,7 @@ async def test_unloaded_thread_resumes_same_id_before_considering_empty_replacem
         service.state["intents"]["unknown"] = {"thread_id": "old-root", "status": "unknown"}
     service.save()
     service.codex.thread_read.side_effect = RpcError("thread not loaded: old-root", -32600)
+
     async def resume(thread_id, **kwargs):
         if thread_id == "old-root":
             raise RpcError("no rollout found for thread id old-root", -32600)
@@ -904,6 +908,40 @@ async def test_run_archives_before_ready_and_shutdown_tail_before_rpc_close(serv
     service.rpc.events, service.rpc.event_sequence = [], 0
 
     async def request(method, params):
+        if method == "hooks/list":
+            from alice_codex.identity import HOOK_STATUS
+
+            hooks = []
+            for event, groups in service.config.identity_hooks().items():
+                group, handler = groups[0], groups[0]["hooks"][0]
+                hooks.append(
+                    {
+                        "key": str(service.config.codex_home / "config.toml") + ":" + event,
+                        "eventName": event[0].lower() + event[1:],
+                        "handlerType": "command",
+                        "command": handler["command"],
+                        "async": False,
+                        "matcher": group.get("matcher"),
+                        "timeoutSec": 10,
+                        "statusMessage": HOOK_STATUS,
+                        "additionalContextLimit": handler.get("additionalContextLimit"),
+                        "source": "user",
+                        "sourcePath": str(service.config.codex_home / "config.toml"),
+                        "enabled": True,
+                        "currentHash": "sha256:" + "a" * 64,
+                        "trustStatus": "trusted",
+                    }
+                )
+            return {
+                "data": [
+                    {
+                        "cwd": str(service.config.workspace),
+                        "warnings": [],
+                        "errors": [],
+                        "hooks": hooks,
+                    }
+                ]
+            }
         if method == "thread/list":
             return {"data": [{"id": "root"}]}
         if method == "thread/items/list":
@@ -970,3 +1008,26 @@ async def test_run_archives_before_ready_and_shutdown_tail_before_rpc_close(serv
     assert at_close == [({"before-start", "shutdown-tail"}, "shutdown")]
     assert not service.ready
     assert json.loads(service.path.read_text())["journal"]["traversal_complete"] is True
+
+
+async def test_host_supplies_identity_without_a_model_read_tool(service):
+    from alice_codex.identity import build_identity_bundle
+
+    await service.ensure_thread("identity-root")
+    parameters = service.codex.thread_start.call_args.kwargs
+    assert (
+        parameters["developerInstructions"]
+        == build_identity_bundle(service.config.workspace).developer_instructions
+    )
+    assert "reference_data_not_instructions" in parameters["developerInstructions"]
+    service.codex.turn_start.assert_not_called()
+
+
+async def test_missing_identity_fails_before_creating_native_root(service):
+    from alice_codex.identity import IdentityError
+
+    (service.config.workspace / "USER.md").unlink()
+    with pytest.raises(IdentityError, match="missing_or_linked_file"):
+        await service.ensure_thread("missing-source")
+    service.codex.thread_start.assert_not_called()
+    assert "missing-source" not in service.state["tasks"]
