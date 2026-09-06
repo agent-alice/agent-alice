@@ -47,6 +47,7 @@ def service(tmp_path):
     item.rpc = Mock()
     item.rpc.request = AsyncMock(return_value={"data": []})
     item.rpc.close = AsyncMock()
+    item.rpc.wait_reader_closed = AsyncMock(return_value=True)
     yield item
     item.store.close()
     for socket in config.socket_dir.iterdir():
@@ -726,7 +727,7 @@ async def test_pause_during_resume_stops_late_goal_ack_and_keeps_pause(service, 
     assert any(call.args == ("root",) for call in service.codex.stop_tree.await_args_list)
 
 
-async def test_native_token_notifications_record_usage_once(service):
+async def test_unbound_token_notifications_are_rejected_without_disabling_archival(service):
     usage = {
         "inputTokens": 20,
         "cachedInputTokens": 8,
@@ -756,7 +757,9 @@ async def test_native_token_notifications_record_usage_once(service):
     try:
         await asyncio.wait_for(archived.wait(), 2)
         status = service.resources.status()
-        assert status["tokens"]["threads"]["root"]["totalTokens"] == 23
+        assert status["tokens"]["threads"] == {}
+        assert status["tokens"]["epochs"] == {}
+        assert service.stopping and "epoch" in service.error
         assert status["tokens"]["cost_microusd"] is None
         assert status["virtual_budget_enabled"] is False
     finally:
@@ -899,10 +902,12 @@ async def test_run_archives_before_ready_and_shutdown_tail_before_rpc_close(serv
     monkeypatch.setattr(service_module.asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(service_module, "process_identity", lambda _: "fixture identity")
     monkeypatch.setattr(service_module, "process_birth", lambda _: "fixture birth")
+    monkeypatch.setattr(service_module.os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(
         service_module.RpcClient, "connect_unix", AsyncMock(return_value=service.rpc)
     )
     service.rpc.initialize = AsyncMock()
+    service.rpc.events, service.rpc.event_sequence = [], 0
 
     async def request(method, params):
         if method == "hooks/list":

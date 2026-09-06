@@ -441,7 +441,12 @@ class RuntimeConfig:
             atomic_write(path, rendered)
 
 
-def load_config(home: Path | str | None = None) -> RuntimeConfig:
+def load_config(home: Path | str | None = None, *, for_maintenance: bool = False) -> RuntimeConfig:
+    """Load executable config strictly; maintenance may inspect known fields only.
+
+    A maintenance view must not be saved over the source JSON. Repinning keeps
+    and atomically updates the original object, including unknown fields.
+    """
     home = Path(home).expanduser().resolve() if home is not None else default_home()
     path = home / "config.json"
     if not path.is_file():
@@ -450,7 +455,11 @@ def load_config(home: Path | str | None = None) -> RuntimeConfig:
     if not isinstance(value, dict):
         raise ValueError("Alice config must be an object")
     try:
-        config = RuntimeConfig(**value)
+        known = {field.name for field in fields(RuntimeConfig)}
+        selected = (
+            {key: item for key, item in value.items() if key in known} if for_maintenance else value
+        )
+        config = RuntimeConfig(**selected)
     except TypeError as error:
         raise ValueError("Unsupported or missing Alice configuration fields") from error
     config.validate()
@@ -505,10 +514,23 @@ def initialize_config(
 
 
 def repin_codex_bundle(home: Path, source_binary: Path) -> dict:
+    """Migrate a stopped runtime, retaining the standalone service-lock contract."""
+    home = home.expanduser().resolve()
+    lock = home / "state/service.lock"
+    if (home / "state").is_symlink() or (home / "config.json").is_symlink():
+        raise ValueError("Alice config and state directories must not be symbolic links")
+    if lock.is_symlink():
+        raise ValueError("Alice service lock must not be a symbolic link")
+    with SingletonLock(lock):
+        return _repin_codex_bundle_locked(home, source_binary)
+
+
+def _repin_codex_bundle_locked(home: Path, source_binary: Path) -> dict:
     """Explicit stopped-runtime migration; preserve config fields and previous binaries.
 
     The source must contain the same primary binary already recorded by Alice.
-    The caller runs this synchronous function off an asyncio event loop. No
+    The caller must already hold service.lock, normally through offline_maintenance.
+    Run this synchronous function off an asyncio event loop. No
     model, auth file, Codex TOML, conversation or schedule is read or changed.
     """
     import asyncio
@@ -531,44 +553,40 @@ def repin_codex_bundle(home: Path, source_binary: Path) -> dict:
     config.validate()
     if config.root.resolve() != home:
         raise ValueError("Alice config belongs to a different data directory")
-    lock = home / "state/service.lock"
-    if lock.is_symlink():
-        raise ValueError("Alice service lock must not be a symbolic link")
-    with SingletonLock(lock):
-        if config.control_socket.exists():
-            try:
-                asyncio.run(request(config.control_socket, "status", timeout=2))
-            except Exception as error:
-                raise RuntimeError(
-                    "Alice control state is uncertain; stop/diagnose before repinning"
-                ) from error
-            raise RuntimeError("Stop Alice before repinning its Codex bundle")
-        if config.codex_socket.exists():
-            raise RuntimeError("Alice native socket remains; stop/diagnose before repinning")
-        source = inspect_bundle(source_binary)
-        if source.binary_sha256 != config.codex_sha256:
-            raise ValueError(
-                "Source Codex does not match the recorded primary hash; original preserved"
-            )
-        result = subprocess.run(
-            [str(source.binary), "--version"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=15,
-        )
-        if result.stdout.strip() != config.codex_version:
-            raise ValueError("Source Codex version differs from the recorded version")
-        bundle = pin_bundle(home, source, config.codex_version)
-        if path.read_bytes() != original:
+    if config.control_socket.exists():
+        try:
+            asyncio.run(request(config.control_socket, "status", timeout=2))
+        except Exception as error:
             raise RuntimeError(
-                "Alice configuration changed during repinning; concurrent edit preserved"
-            )
-        updated = dict(value)
-        updated["codex_binary"] = str(bundle.binary)
-        # The complete immutable pair and manifest exist before this single
-        # configuration switch; a crash cannot pair the old executable with a
-        # new companion index. Old binaries remain available for rollback.
-        write_json(path, updated)
-        config.codex_binary = str(bundle.binary)
-        return verify_runtime_bundle(config, require=True)
+                "Alice control state is uncertain; stop/diagnose before repinning"
+            ) from error
+        raise RuntimeError("Stop Alice before repinning its Codex bundle")
+    if config.codex_socket.exists():
+        raise RuntimeError("Alice native socket remains; stop/diagnose before repinning")
+    source = inspect_bundle(source_binary)
+    if source.binary_sha256 != config.codex_sha256:
+        raise ValueError(
+            "Source Codex does not match the recorded primary hash; original preserved"
+        )
+    result = subprocess.run(
+        [str(source.binary), "--version"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    if result.stdout.strip() != config.codex_version:
+        raise ValueError("Source Codex version differs from the recorded version")
+    bundle = pin_bundle(home, source, config.codex_version)
+    if path.read_bytes() != original:
+        raise RuntimeError(
+            "Alice configuration changed during repinning; concurrent edit preserved"
+        )
+    updated = dict(value)
+    updated["codex_binary"] = str(bundle.binary)
+    # The complete immutable pair and manifest exist before this single
+    # configuration switch; a crash cannot pair the old executable with a
+    # new companion index. Old binaries remain available for rollback.
+    write_json(path, updated)
+    config.codex_binary = str(bundle.binary)
+    return verify_runtime_bundle(config, require=True)

@@ -6,6 +6,7 @@ Codex remains the executor and authoritative store for conversation state.
 
 import asyncio
 from contextlib import suppress
+from copy import copy
 from dataclasses import asdict
 import hashlib
 import json
@@ -29,6 +30,7 @@ from .control import MAX_MESSAGE
 from .files import SingletonLock, read_json, write_json
 from .memory import MemoryStore
 from .journal import NativeJournal
+from .heartbeat import CollectionSpec, HostHeartbeatAdapter, compare_receipts
 from .identity import (
     IDENTITY_HOOK_COMPAT_VERSION,
     build_identity_bundle,
@@ -39,6 +41,68 @@ from .resources import ResourceLedger
 from .rpc import RpcClient, RpcError
 from .scheduler import Scheduler, RejectedDispatch, DeferredDispatch
 from .store import DispatchReceipt, Store
+
+
+# Release guards must inspect the installed candidate, not infer compatibility
+# from runtime.version or ResourceLedger's schema alone.
+RESOURCE_EPOCH_CAPABILITY = 1
+RESOURCE_SHUTDOWN_DRAIN_TIMEOUT = 1.0
+NATIVE_SHUTDOWN_TERM_TIMEOUT = 10.0
+
+
+def validate_resource_epoch_journal(state: dict) -> None:
+    """Validate only the additive journal and its current-server reference.
+
+    No I/O or mutation; unrelated runtime fields and unknown additive keys are
+    left to their owners. A valid prepared record is accepted structurally;
+    Service startup separately refuses another spawn until it is reconciled.
+    """
+    if not isinstance(state, dict):
+        raise ValueError("Resource epoch validation requires a runtime object")
+    epochs = state.get("resource_epochs", {})
+    if not isinstance(epochs, dict):
+        raise ValueError("Invalid resource epoch journal; preserved for reconciliation")
+
+    def valid_server(server):
+        return (
+            isinstance(server, dict)
+            and type(server.get("pid")) is int
+            and server["pid"] > 0
+            and all(
+                isinstance(server.get(key), str) and server[key].strip()
+                for key in ("birth", "identity")
+            )
+        )
+
+    for epoch, record in epochs.items():
+        if (
+            not isinstance(epoch, str)
+            or not epoch.strip()
+            or len(epoch) > 2000
+            or not isinstance(record, dict)
+            or not isinstance(record.get("state"), str)
+            or record["state"] not in {"prepared", "bound", "aborted"}
+            or "server" not in record
+        ):
+            raise ValueError("Invalid resource epoch record; preserved for reconciliation")
+        if record["state"] == "bound":
+            if not valid_server(record["server"]):
+                raise ValueError("Invalid resource epoch binding; preserved for reconciliation")
+        elif record["server"] is not None:
+            raise ValueError("Unbound resource epoch has a server identity")
+    current = state.get("server")
+    if current is not None and not isinstance(current, dict):
+        raise ValueError("Invalid active server in resource epoch journal")
+    if isinstance(current, dict) and "resource_epoch_id" in current:
+        epoch_id = current["resource_epoch_id"]
+        record = epochs.get(epoch_id) if isinstance(epoch_id, str) else None
+        if (
+            not record
+            or record["state"] != "bound"
+            or not valid_server(current)
+            or any(record["server"][key] != current[key] for key in ("pid", "birth", "identity"))
+        ):
+            raise ValueError("Active resource epoch binding conflicts with server identity")
 
 
 def process_identity(pid: int) -> str | None:
@@ -174,6 +238,82 @@ async def recover_owned_server(config: RuntimeConfig, state: dict) -> None:
     raise RuntimeError("Owned orphan server did not exit")
 
 
+class _ResourceEpochListener:
+    """One connection's bounded observations, with immutable source attribution."""
+
+    MAX_PENDING = 256
+    MAX_BYTES = 1024 * 1024
+
+    def __init__(self, service, rpc, codex, epoch_id, durable_roots):
+        self.codex, self.epoch_id = codex, epoch_id
+        self._roots = set(durable_roots)
+        self._pending = []
+        self._bytes = 0
+        self._service = service
+
+        # These closures capture this process's epoch/client, never the next
+        # values of Service.rpc, Service.codex or runtime.json's active server.
+        self._record = lambda params: service.resources.record_token_usage(
+            params, epoch_id=epoch_id
+        )
+        # Read-only view: share the captured client's native ancestry, but only
+        # trust roots whose host aliases were durably saved. Call owns() only;
+        # this view creates no listener and never performs control or close().
+        ownership = copy(codex)
+        ownership.owned_root_ids = self._roots
+        self._owned = ownership.owns
+        self._current = lambda: service.rpc is rpc and service.codex is codex
+
+    @property
+    def pending_count(self):
+        return len(self._pending)
+
+    def confirm_roots(self, roots):
+        """Called only after the host has successfully saved these root aliases."""
+        self._roots.update(roots)
+        self.flush()
+
+    def flush(self):
+        remaining = []
+        for index, (params, size) in enumerate(self._pending):
+            try:
+                if self._owned(params.get("threadId")):
+                    self._record(params)
+                    self._bytes -= size
+                else:
+                    remaining.append((params, size))
+            except Exception:
+                # Retain this notification and the unprocessed suffix for a
+                # possible shutdown delivery; never discard a failed write.
+                self._pending = remaining + self._pending[index:]
+                self._service._fail("Native resource observations could not be persisted")
+                return
+        self._pending = remaining
+
+    def receive(self, event):
+        try:
+            method = event.get("method")
+            if method == "thread/tokenUsage/updated":
+                payload = json.dumps(
+                    event.get("params", {}), allow_nan=False, separators=(",", ":")
+                )
+                size = len(payload.encode())
+                if len(self._pending) >= self.MAX_PENDING or self._bytes + size > self.MAX_BYTES:
+                    raise RuntimeError("Unresolved token observation buffer is full")
+                self._pending.append((json.loads(payload), size))
+                self._bytes += size
+                self.flush()
+            elif method == "thread/started":
+                # CodexClient's listener runs first and remembers native ancestry.
+                self.flush()
+            elif self._current():
+                # Stale transport callbacks must not update a newer task lifecycle.
+                self._service._on_notification(event)
+        except Exception:
+            # RpcClient isolates listener exceptions; explicitly stop dispatch.
+            self._service._fail("Native resource observation buffer could not be preserved")
+
+
 class Service:
     def __init__(self, config: RuntimeConfig):
         self.config = config
@@ -196,15 +336,33 @@ class Service:
             or not isinstance(self.state.get("intents"), dict)
         ):
             raise ValueError("Unsupported or damaged runtime state; preserved for recovery")
+        self._validate_resource_epochs()
         self.store = Store(config.database)
         self.memory = MemoryStore(config.root)
         self.resources = ResourceLedger(config.root / "state/resources.sqlite3")
         self._resource_refresh_at = 0.0
+        self._heartbeat = HostHeartbeatAdapter()
+        self._heartbeat_intervals: dict[str, float] = {}
+        self._heartbeat_scopes: dict[str, str] = {}
+        self._heartbeat_next: dict[str, float] = {}
+        self._heartbeat_collection_rejected: dict[str, bool] = {}
+        consumed = self.state.get("heartbeat_consumed", {})
+        if not isinstance(consumed, dict):
+            raise ValueError("Damaged heartbeat consumption state; preserved for recovery")
+        for target, receipt in consumed.items():
+            compare_receipts(None, receipt)
+            if receipt["target"] != target or receipt["state"] != "known":
+                raise ValueError("Heartbeat consumption requires a matching known host receipt")
         self.stop_event = asyncio.Event()
         self.rpc: RpcClient | None = None
         self.codex: CodexClient | None = None
         self.journal: NativeJournal | None = None
         self.process: asyncio.subprocess.Process | None = None
+        self._bound_resource_epoch: str | None = None
+        self._resource_observer: _ResourceEpochListener | None = None
+        self._resource_durable_roots = {task["thread_id"] for task in self.state["tasks"].values()}
+        self._starting_resource_epoch: str | None = None
+        self._spawn_attempted = False
         self.ready = False
         self.stopping = False
         self.error: str | None = None
@@ -216,10 +374,110 @@ class Service:
         self._resuming: set[str] = set()
         self._pause_revision = 0  # In-flight resume fence; no resume survives process exit.
         self._task_pause_revisions: dict[str, int] = {}
+        self._native_turn_revisions: dict[str, int] = {}
+        self._policy_wakeup = asyncio.Event()
         self.scheduler = Scheduler(self.store, self)
 
     def save(self) -> None:
         write_json(self.path, self.state)
+
+    def _validate_resource_epochs(self):
+        validate_resource_epoch_journal(self.state)
+
+    def _prepare_resource_epoch(self):
+        epochs = self.state.get("resource_epochs", {})
+        if any(record["state"] == "prepared" for record in epochs.values()):
+            raise RuntimeError(
+                "Unbound resource epoch requires reconciliation before another spawn"
+            )
+        epoch = str(uuid.uuid4())
+        previous = {key: self.state.get(key) for key in ("server", "lifecycle", "resource_epochs")}
+        self.state["resource_epochs"] = {**epochs, epoch: {"state": "prepared", "server": None}}
+        self.state["lifecycle"], self.state["server"] = "starting", None
+        try:
+            self.save()
+        except BaseException:
+            for key, value in previous.items():
+                if key == "resource_epochs" and value is None:
+                    self.state.pop(key, None)
+                else:
+                    self.state[key] = value
+            raise
+        self._starting_resource_epoch = epoch
+        self._bound_resource_epoch = None
+        self._spawn_attempted = False
+        return epoch
+
+    def _bind_resource_epoch(self, epoch_id):
+        if self.state.get("resource_epochs", {}).get(epoch_id) != {
+            "state": "prepared",
+            "server": None,
+        }:
+            raise RuntimeError("Resource epoch was not prepared for this spawn")
+        if self.process is None or self.process.returncode is not None:
+            raise RuntimeError("Cannot bind a resource epoch without a live owned child")
+        server = {
+            "pid": self.process.pid,
+            "identity": process_identity(self.process.pid),
+            "birth": process_birth(self.process.pid),
+        }
+        if (
+            not server["identity"]
+            or not server["birth"]
+            or os.getpgid(self.process.pid) != self.process.pid
+        ):
+            raise RuntimeError("Cannot verify the resource epoch's owned process identity")
+        self.state["server"] = {**server, "resource_epoch_id": epoch_id}
+        self.state["resource_epochs"][epoch_id] = {"state": "bound", "server": server}
+        try:
+            self.save()
+        except BaseException:
+            # Keep the known child identity for cleanup, without claiming an
+            # acknowledged epoch binding on a subsequent shutdown save.
+            self.state["server"] = server
+            self.state["resource_epochs"][epoch_id] = {"state": "prepared", "server": None}
+            raise
+        self._bound_resource_epoch = epoch_id
+        self._resource_durable_roots.update(
+            task["thread_id"] for task in self.state["tasks"].values()
+        )
+
+    def _attach_resource_listener(self, rpc, codex, epoch_id):
+        active = self.state.get("server") or {}
+        record = self.state.get("resource_epochs", {}).get(epoch_id, {})
+        if (
+            not epoch_id
+            or epoch_id != self._bound_resource_epoch
+            or active.get("resource_epoch_id") != epoch_id
+            or record.get("state") != "bound"
+            or record.get("server")
+            != {key: active.get(key) for key in ("pid", "birth", "identity")}
+            or self.process is None
+            or self.process.returncode is not None
+            or self.process.pid != active.get("pid")
+        ):
+            raise RuntimeError("Resource listener requires a durably bound process epoch")
+        observer = _ResourceEpochListener(self, rpc, codex, epoch_id, self._resource_durable_roots)
+        # No await between subscribing and replaying the connection's retained
+        # prefix. A missing prefix cannot be silently treated as no observations.
+        rpc.add_listener(observer.receive)
+        self._resource_observer = observer
+        retained = list(rpc.events)
+        if rpc.event_sequence and (not retained or retained[0].sequence != 1):
+            self._fail("Native resource notifications have an unobserved connection prefix")
+            raise RuntimeError("Resource notification prefix is unavailable")
+        for event in retained:
+            codex._on_event(event.message)  # Replay native ancestry through its existing owner.
+            observer.receive(event.message)
+        return observer
+
+    def _confirm_resource_roots(self):
+        self._resource_durable_roots.update(
+            task["thread_id"] for task in self.state["tasks"].values()
+        )
+        observer = self._resource_observer
+        if observer is not None and observer.codex is self.codex:
+            observer.confirm_roots(self._resource_durable_roots)
 
     def _lock(self, key: str) -> asyncio.Lock:
         return self._task_locks.setdefault(key, asyncio.Lock())
@@ -234,19 +492,19 @@ class Service:
             if self.state["lifecycle"] in {"new", "running", "starting", "stopping"}:
                 self.store.set_autonomy_paused(True)
             await self._recover_orphan()
+            self._recover_task_policy_usage()
             identity_manifest = self.config.root / "state/identity-runtime.json"
             if identity_manifest.exists():
                 prior_identity = read_json(identity_manifest)
                 validate_identity_runtime_manifest(prior_identity)
             identity = build_identity_bundle(self.config.workspace)
             self.config.write_identity_config(identity)
-            self.state["lifecycle"] = "starting"
-            self.state["server"] = None
-            self.save()
+            epoch_id = self._prepare_resource_epoch()
             self.config.codex_socket.unlink(missing_ok=True)
             self.config.control_socket.unlink(missing_ok=True)
             log = open(self.config.root / "logs/codex-server.log", "ab", buffering=0)
             try:
+                self._spawn_attempted = True
                 self.process = await asyncio.create_subprocess_exec(
                     self.config.codex_binary,
                     "app-server",
@@ -259,12 +517,7 @@ class Service:
                     stderr=log,
                     start_new_session=True,
                 )
-                self.state["server"] = {
-                    "pid": self.process.pid,
-                    "identity": process_identity(self.process.pid),
-                    "birth": process_birth(self.process.pid),
-                }
-                self.save()
+                self._bind_resource_epoch(epoch_id)
                 deadline = time.monotonic() + 30
                 while True:
                     if self.process.returncode is not None:
@@ -282,7 +535,15 @@ class Service:
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Owned Codex App Server did not become ready")
                     await asyncio.sleep(0.1)
+                self.codex = CodexClient(
+                    self.rpc,
+                    owned_root_ids=list(self._resource_durable_roots),
+                )
+                self._attach_resource_listener(self.rpc, self.codex, epoch_id)
+                self.journal = NativeJournal(self.memory, self.rpc, self.codex.owns)
                 await self.rpc.initialize()
+                if self.stopping:
+                    raise RuntimeError(self.error or "Native resource startup failed")
                 listing = await self.rpc.request(
                     "hooks/list", {"cwds": [str(self.config.workspace)]}
                 )
@@ -312,13 +573,9 @@ class Service:
                     "hooks": "trusted_before_thread_load",
                 }
                 self.save()
-                self.codex = CodexClient(
-                    self.rpc,
-                    owned_root_ids=[task["thread_id"] for task in self.state["tasks"].values()],
-                )
-                self.journal = NativeJournal(self.memory, self.rpc, self.codex.owns)
-                self.rpc.add_listener(self._on_notification)
                 await self.archive_native_history("startup")
+                if self.stopping:
+                    raise RuntimeError(self.error or "Native resource startup failed")
                 server = await asyncio.start_unix_server(
                     self._control_client, str(self.config.control_socket), limit=MAX_MESSAGE
                 )
@@ -327,6 +584,8 @@ class Service:
                     self._background = [
                         asyncio.create_task(self._tick()),
                         asyncio.create_task(self._record_events()),
+                        asyncio.create_task(self._watch_task_policies()),
+                        asyncio.create_task(self._watch_heartbeats()),
                     ]
                     self.state["lifecycle"] = "running"
                     self.save()
@@ -342,6 +601,12 @@ class Service:
                 await self._shutdown(log)
 
     async def _shutdown(self, log) -> None:
+        # Shutdown must retain this epoch's transport and ancestry listener,
+        # even if a later connection replaces the Service's current fields.
+        rpc, codex, process = self.rpc, self.codex, self.process
+        starting_epoch = self._starting_resource_epoch
+        spawn_attempted = self._spawn_attempted
+        cancelled_while_reaping = False
         try:
             # Shutdown never means that externally published work was undone.
             try:
@@ -350,34 +615,88 @@ class Service:
                 self.save()
             except Exception as error:
                 self.error = f"Pause persistence failed: {type(error).__name__}"
-            if self.codex:
+            if codex:
                 for key in list(self.state["tasks"]):
                     try:
-                        await self._stop_task(key, timeout=8)
+                        await self._stop_task(key, codex=codex, timeout=8)
                     except Exception as error:
                         self.error = (
                             f"Shutdown required owned-server termination: {type(error).__name__}"
                         )
-                if self.journal:
+                if self.journal and self.rpc is rpc and self.codex is codex:
                     await self.archive_native_history("shutdown")
-                self.codex.close()
         finally:
             try:
-                if self.rpc:
-                    with suppress(Exception):
-                        await self.rpc.close()
-                if self.process and self.process.returncode is None:
-                    with suppress(ProcessLookupError):
-                        os.killpg(self.process.pid, signal.SIGTERM)
+                try:
+                    if process and process.returncode is None:
+
+                        async def terminate_owned_child():
+                            with suppress(ProcessLookupError):
+                                os.killpg(process.pid, signal.SIGTERM)
+                            try:
+                                await asyncio.wait_for(process.wait(), NATIVE_SHUTDOWN_TERM_TIMEOUT)
+                            except TimeoutError:
+                                with suppress(ProcessLookupError):
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                await process.wait()
+
+                        termination = asyncio.create_task(terminate_owned_child())
+                        while True:
+                            try:
+                                await asyncio.shield(termination)
+                                break
+                            except asyncio.CancelledError:
+                                if termination.cancelled():
+                                    raise
+                                # Cancellation cannot orphan the child by
+                                # cancelling its only wait. Escalate this owned
+                                # process, finish reaping, then propagate below.
+                                cancelled_while_reaping = True
+                                if process.returncode is None:
+                                    with suppress(ProcessLookupError):
+                                        os.killpg(process.pid, signal.SIGKILL)
+                    # The OS child is already reaped. Buffered frames can still
+                    # be waiting for the RPC reader; leave both listeners alive
+                    # until that reader finishes or this bounded wait expires.
+                    if rpc:
+                        try:
+                            drained = await rpc.wait_reader_closed(
+                                timeout=RESOURCE_SHUTDOWN_DRAIN_TIMEOUT
+                            )
+                            reason = None if drained else "Native notification tail drain timed out"
+                        except Exception as error:
+                            reason = (
+                                f"Native notification tail drain failed: {type(error).__name__}"
+                            )
+                        if reason:
+                            self.error = f"{self.error}; {reason}" if self.error else reason
+                            # A fixed, content-free diagnostic remains in the
+                            # private server log after this Service exits.
+                            with suppress(OSError):
+                                log.write(f"Alice resource shutdown: {reason}\n".encode())
+                finally:
                     try:
-                        await asyncio.wait_for(self.process.wait(), 10)
-                    except TimeoutError:
-                        with suppress(ProcessLookupError):
-                            os.killpg(self.process.pid, signal.SIGKILL)
-                        await self.process.wait()
+                        if codex:
+                            codex.close()
+                    finally:
+                        if rpc:
+                            with suppress(Exception):
+                                await rpc.close()
                 self.state["lifecycle"] = "stopped"
                 self.state["server"] = None
+                epoch = self.state.get("resource_epochs", {}).get(starting_epoch)
+                if (
+                    epoch
+                    and epoch["state"] == "prepared"
+                    and (
+                        not spawn_attempted
+                        or (process is not None and process.returncode is not None)
+                    )
+                ):
+                    epoch["state"] = "aborted"
                 self.save()
+                if cancelled_while_reaping:
+                    raise asyncio.CancelledError
             finally:
                 try:
                     self.config.control_socket.unlink(missing_ok=True)
@@ -395,6 +714,9 @@ class Service:
             self.store.set_autonomy_paused(True)
 
     def _on_notification(self, event: dict) -> None:
+        if event.get("method") == "thread/tokenUsage/updated":
+            self._fail("Native resource notification has no bound epoch listener")
+            return
         if event.get("method") not in {
             "turn/started",
             "turn/completed",
@@ -411,29 +733,40 @@ class Service:
             try:
                 changed = False
                 for task in self.state["tasks"].values():
-                    if task["thread_id"] == params.get("threadId") and not task.get("has_input"):
-                        task["has_input"] = True
-                        changed = True
+                    if task["thread_id"] == params.get("threadId"):
+                        if event["method"] == "turn/started":
+                            thread_id = task["thread_id"]
+                            self._native_turn_revisions[thread_id] = (
+                                self._native_turn_revisions.get(thread_id, 0) + 1
+                            )
+                        if not task.get("has_input"):
+                            task["has_input"] = True
+                            changed = True
+                        if event["method"] == "turn/started" and task.get(
+                            "policy_deadline_stopped"
+                        ):
+                            # Another native client can start after a prior stop.
+                            # Re-arm the obligation; never treat the old stop as
+                            # proof that this new execution has also ended.
+                            task.pop("policy_deadline_stopped")
+                            self._policy_wakeup.set()
+                            changed = True
                 if changed:
                     self.save()  # Direct TUI input must survive before archive-worker scheduling.
             except Exception:
                 self._fail("Native input ownership could not be persisted")
                 return
-        if event["method"] in {"thread/tokenUsage/updated", "account/rateLimits/updated"}:
+        if event["method"] == "account/rateLimits/updated":
             try:
                 # Keep receiving accounting through native interruption, even
                 # after the asynchronous transcript worker has been cancelled.
-                if event["method"] == "thread/tokenUsage/updated":
-                    if self.codex and self.codex.owns(params.get("threadId")):
-                        self.resources.record_token_usage(params)
-                else:
-                    snapshot = params.get("rateLimits")
-                    limit_id = snapshot.get("limitId") if isinstance(snapshot, dict) else None
-                    observed = {"rateLimits": snapshot}
-                    if limit_id:
-                        observed["rateLimitsByLimitId"] = {limit_id: snapshot}
-                    self.resources.record_rate_limits(observed)
-                    self._mark_resource_pauses()
+                snapshot = params.get("rateLimits")
+                limit_id = snapshot.get("limitId") if isinstance(snapshot, dict) else None
+                observed = {"rateLimits": snapshot}
+                if limit_id:
+                    observed["rateLimitsByLimitId"] = {limit_id: snapshot}
+                self.resources.record_rate_limits(observed)
+                self._mark_resource_pauses()
             except Exception:
                 self._fail("Native resource observations could not be persisted")
             return
@@ -523,6 +856,8 @@ class Service:
             }
         self.state["journal"] = {"reason": reason, "observed_at": time.time(), **report}
         self.save()
+        if self._resource_observer is not None and self._resource_observer.codex is self.codex:
+            self._resource_observer.flush()
 
     def _complete_turn(self, thread: str, turn: dict) -> None:
         for intent_id, intent in self.state["intents"].items():
@@ -535,6 +870,9 @@ class Service:
                 status = "completed" if evidence["complete"] else "unknown"
                 intent["summary_evidence"] = evidence
             intent.update(status=status, outcome=turn["status"])
+            self._finish_policy_intent(
+                intent, "unknown" if turn["status"] == "completed" else "failed"
+            )
             if intent.get("event_id"):
                 receipt = DispatchReceipt(
                     status,
@@ -562,6 +900,287 @@ class Service:
             raise
         except Exception as error:
             self._fail(f"Dispatch stopped: {type(error).__name__}: {error}")
+
+    @staticmethod
+    def _policy_target(target: str) -> None:
+        if (
+            not isinstance(target, str)
+            or not target
+            or len(target) > 150
+            or target == "new"
+            or target.startswith(("summary:", "scheduled:"))
+        ):
+            raise ValueError(
+                "Task policy requires a stable named target, not recurring summary roots"
+            )
+
+    def _default_task_policy(self, target: str, *, summary_plan: str | None = None) -> None:
+        # A configured default only applies to explicit named work. Main and
+        # recurring summaries need their own explicit operator decision.
+        policy = self.config.task_policy
+        if (
+            policy is None
+            or target in {"main", "new"}
+            or target.startswith(("summary:", "scheduled:"))
+            or summary_plan is not None
+            or self.store.get_task_policy(target) is not None
+        ):
+            return
+        fingerprint = hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.store.set_task_policy(
+            target, policy, f"config-policy:{target}:{fingerprint}", now=time.time()
+        )
+
+    def _policy_intent_busy(self, target: str) -> bool:
+        root = self.state["tasks"].get(target, {}).get("thread_id")
+        return any(
+            (item.get("target") == target or (root and item.get("thread_id") == root))
+            and item["status"] in {"sending", "accepted", "queued", "unknown"}
+            for item in self.state["intents"].values()
+        )
+
+    async def set_task_policy(self, target: str, policy: dict, request_id: str) -> dict:
+        self._policy_target(target)
+        async with self._lock("admission"):
+            if request_id in self.state["intents"]:
+                raise ValueError("Request ID already identifies task input")
+            # Do not pretend to know when pre-existing unbudgeted work began.
+            if self.store.get_task_policy(target) is None:
+                if self._policy_intent_busy(target):
+                    raise RejectedDispatch(
+                        "Reconcile existing work before assigning its first policy"
+                    )
+                task = self.state["tasks"].get(target)
+                if task:
+                    native = (await self.codex.thread_read(task["thread_id"]))["thread"]
+                    if native.get("status", {}).get("type") == "active":
+                        raise RejectedDispatch(
+                            "Stop existing native work before assigning its first policy"
+                        )
+            receipt = self.store.set_task_policy(target, policy, request_id, now=time.time())
+            self._policy_wakeup.set()
+            return receipt
+
+    async def task_policy_status(self, target: str) -> dict:
+        self._policy_target(target)
+        busy = self._policy_intent_busy(target)
+        task = self.state["tasks"].get(target)
+        if task and not busy:
+            try:
+                native = (await self.codex.thread_read(task["thread_id"]))["thread"]
+                busy = native.get("status", {}).get("type") == "active"
+            except RpcError as error:
+                if error.code != -32600 or str(error) != f"thread not loaded: {task['thread_id']}":
+                    raise
+        report = self.store.task_policy_status(target, now=time.time(), busy=busy)
+        return {
+            **(report or {"target": target, "policy": None, "usage": None, "decision": None}),
+            "enforcement_scope": "alice_admission",
+        }
+
+    def _finish_policy_intent(self, intent: dict, outcome: str) -> None:
+        if not intent.get("policy_charged"):
+            return
+        record = self.store.get_task_policy(intent["target"])
+        if record is None or intent["id"] not in record["attempts"]:
+            raise RuntimeError("Task policy receipt missing; consumption cannot be reconstructed")
+        attempt = record["attempts"][intent["id"]]
+        if attempt["outcome"] not in {"running", "unknown"}:
+            return  # Late native notifications cannot overwrite independently confirmed facts.
+        if record["current_attempt_id"] != intent["id"]:
+            raise RuntimeError("Unresolved old policy attempt requires reconciliation")
+        self.store.finish_task_attempt(intent["target"], intent["id"], outcome, now=time.time())
+        self._policy_wakeup.set()
+
+    def _restore_policy_intents(self) -> None:
+        """Reconcile the SQLite-before-runtime crash boundary without resending input."""
+        changed = False
+        for record in self.store.list_task_policies():
+            intent_id = record["current_attempt_id"]
+            if not intent_id:
+                continue
+            attempt = record["attempts"][intent_id]
+            if attempt["outcome"] not in {"running", "unknown"}:
+                continue
+            task = self.state["tasks"].get(record["target"])
+            if (
+                not task
+                or not attempt.get("thread_id")
+                or task["thread_id"] != attempt["thread_id"]
+            ):
+                raise RuntimeError(
+                    "Charged policy attempt has no matching owned root; reconcile manually"
+                )
+            intent = self.state["intents"].get(intent_id)
+            if intent is not None:
+                if (
+                    intent.get("thread_id") != attempt["thread_id"]
+                    or intent.get("target") != record["target"]
+                    or intent.get("input_sha256") != attempt["input_sha256"]
+                    or intent.get("policy_charged") is not True
+                ):
+                    raise RuntimeError("Runtime intent conflicts with its charged policy receipt")
+                continue
+            self.store.finish_task_attempt(record["target"], intent_id, "unknown", now=time.time())
+            self.state["intents"][intent_id] = {
+                "id": intent_id,
+                "target": record["target"],
+                "thread_id": attempt["thread_id"],
+                "input_sha256": attempt["input_sha256"],
+                "created_at": attempt["admitted_at"],
+                "status": "unknown",
+                "event_id": None,
+                "policy_charged": True,
+                "recovered_policy_receipt": True,
+            }
+            changed = True
+        if changed:
+            self.save()
+
+    def _recover_task_policy_usage(self) -> None:
+        # This runs once after old-server cleanup, never on the running watcher.
+        # A persisted acceptance alone cannot prove what survived process death.
+        self._restore_policy_intents()
+        for record in self.store.list_task_policies():
+            intent_id = record["current_attempt_id"]
+            if not intent_id or record["usage"]["last_outcome"] not in {"running", "unknown"}:
+                continue
+            self.store.finish_task_attempt(record["target"], intent_id, "unknown", now=time.time())
+            intent = self.state["intents"].get(intent_id)
+            if intent is not None:
+                intent["status"] = "unknown"
+        self.save()
+
+    def register_heartbeat_source(
+        self, target: str, spec: CollectionSpec, *, wait_seconds: float
+    ) -> None:
+        """Internal host registration; no control/MCP operation accepts sources.
+
+        The interval is explicit and independent of a task's lifetime budget.
+        Production hosts must register again on restart; persisted receipts do
+        not grant permission to contact their old source.
+        """
+        import math
+
+        self._policy_target(target)
+        if (
+            type(wait_seconds) not in (int, float)
+            or not math.isfinite(wait_seconds)
+            or wait_seconds <= 0
+        ):
+            raise ValueError("Heartbeat wait must be finite and positive")
+        self._heartbeat.register(target, spec)
+        self._heartbeat_intervals[target] = wait_seconds
+        self._heartbeat_scopes[target] = spec.scope_sha256
+        self._heartbeat_next.pop(target, None)
+
+    async def observe_heartbeat(self, target: str) -> dict:
+        """Collect only from host-registered sources and durably compare them."""
+        async with self._lock("heartbeat:" + target):
+            now = time.time()
+            interval = self._heartbeat_intervals.get(target, self.config.poll_seconds)
+            previous = self.store.get_heartbeat_state(target)
+            # On restart an old wait cannot masquerade as a configured source.
+            configured = target in self._heartbeat_intervals
+            if (
+                previous is not None
+                and self._heartbeat_next.get(target, 0) > time.monotonic()
+                and (configured or previous["latest"]["state"] == "unconfigured")
+            ):
+                return {
+                    **previous,
+                    "configured": configured,
+                    "collection_rejected": self._heartbeat_collection_rejected.get(target, False),
+                }
+            receipt = await asyncio.to_thread(self._heartbeat.observe, target, now=now)
+            state = self.store.record_heartbeat(target, receipt, wait_seconds=interval)
+            scope_changed = receipt["scope_sha256"] != self._heartbeat_scopes.get(target)
+            rejected = state["latest"]["id"] != receipt["id"] or scope_changed
+            self._heartbeat_collection_rejected[target] = rejected
+            self._heartbeat_next[target] = time.monotonic() + (
+                0 if scope_changed else self._heartbeat_intervals.get(target, interval)
+            )
+            return {**state, "configured": configured, "collection_rejected": rejected}
+
+    async def _watch_heartbeats(self) -> None:
+        try:
+            while True:
+                # Recheck evidence even while policy/native ambiguity blocks
+                # dispatch. New evidence never clears those independent blocks.
+                for target in list(self._heartbeat_intervals):
+                    await self.observe_heartbeat(target)
+                await asyncio.sleep(self.config.poll_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._fail(f"Heartbeat evidence stopped: {type(error).__name__}: {error}")
+
+    def _heartbeat_candidate(self, target: str, receipt: dict) -> bool:
+        consumed = self.state.get("heartbeat_consumed", {}).get(target)
+        return consumed is None or any(
+            consumed[key] != receipt[key]
+            for key in ("source_id", "scope_sha256", "validator_version", "content_sha256")
+        )
+
+    async def _enforce_task_deadlines(self) -> float:
+        """Check the same persisted policy independently of scheduler/RPC latency."""
+        self._restore_policy_intents()
+        delay = self.config.poll_seconds
+        async with self._lock("policy-stops"):
+            for record in self.store.list_task_policies():
+                usage = record["usage"]
+                task = self.state["tasks"].get(record["target"])
+                if usage is None or task is None:
+                    continue
+                # Running/unknown work may still own native execution after a
+                # lost acknowledgement; treat it as reserved until reconciled.
+                busy = usage["last_outcome"] in {"running", "unknown"} or self._policy_intent_busy(
+                    record["target"]
+                )
+                report = self.store.task_policy_status(record["target"], now=time.time(), busy=busy)
+                decision = report["decision"]
+                if decision["state"] != "complete":
+                    seconds = decision["remaining"]["seconds"]
+                    if seconds > 0:
+                        delay = min(delay, seconds)
+                if "task_time_exhausted" in decision["reasons"] and not task.get(
+                    "policy_deadline_stopped"
+                ):
+                    task.update(paused=True, policy_pause_pending=True)
+                    self._task_pause_revisions[record["target"]] = (
+                        self._task_pause_revisions.get(record["target"], 0) + 1
+                    )
+                    self.save()  # Preserve the stop obligation before waiting on native state.
+                if task.get("policy_pause_pending"):
+                    thread_id = task["thread_id"]
+                    stopped_revision = self._native_turn_revisions.get(thread_id, 0)
+                    await asyncio.wait_for(self.pause(record["target"]), timeout=5)
+                    if self._native_turn_revisions.get(thread_id, 0) != stopped_revision:
+                        # A received start raced with the final native stop
+                        # proof. Keep the durable obligation for that execution.
+                        delay = 0.01
+                        self._policy_wakeup.set()
+                        continue
+                    task.pop("policy_pause_pending", None)
+                    task["policy_deadline_stopped"] = True
+                    self.save()
+        return max(0.01, delay)
+
+    async def _watch_task_policies(self) -> None:
+        try:
+            while True:
+                self._policy_wakeup.clear()
+                delay = await self._enforce_task_deadlines()
+                try:
+                    await asyncio.wait_for(self._policy_wakeup.wait(), delay)
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._fail(f"Task policy enforcement stopped: {type(error).__name__}: {error}")
 
     async def refresh_resources(self) -> dict:
         self._resource_refresh_at = time.monotonic() + 60
@@ -762,7 +1381,12 @@ class Service:
                 },
             }
             self.state["tasks"][key] = task
-            self.save()  # Preserve the alias before the first native history write.
+            try:
+                self.save()  # Preserve the alias before admitting its early token observations.
+            except Exception:
+                self._fail("Native resource root ownership could not be persisted")
+                raise
+            self._confirm_resource_roots()
             await self._bootstrap_thread(task, result["thread"], fresh=True)
             return task
 
@@ -774,12 +1398,23 @@ class Service:
         task = self.state["tasks"].get(target)
         if task and task.get("paused"):
             return True
+        policy = self.store.task_policy_status(
+            target, now=time.time(), busy=self._policy_intent_busy(target)
+        )
+        if policy and not policy["decision"]["allowed"]:
+            return True
         # An acknowledgement can precede native status visibility; ambiguous
         # inputs also reserve their root until reconciliation, never a new ID.
+        stopped_roots = {
+            item["thread_id"]
+            for item in self.state["tasks"].values()
+            if item.get("paused") and item.get("policy_deadline_stopped") is True
+        }
         active = {
             intent["thread_id"]
             for intent in self.state["intents"].values()
             if intent["status"] in {"sending", "unknown", "accepted", "queued"}
+            and intent["thread_id"] not in stopped_roots
         }
         if task and task["thread_id"] in active:
             return True
@@ -832,6 +1467,7 @@ class Service:
         event_id: str | None = None,
         automatic: bool = False,
         summary_plan: str | None = None,
+        heartbeat_receipt: dict | None = None,
     ) -> dict:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Task input cannot be empty")
@@ -873,6 +1509,36 @@ class Service:
                 # No input was sent, so retain the occurrence without inventing
                 # a failed durable intent that would poison its stable retry ID.
                 raise DeferredDispatch("Dispatch paused or busy before input was sent")
+            self._default_task_policy(target, summary_plan=summary_plan)
+            if heartbeat_receipt is not None:
+                latest = self.store.get_heartbeat_state(target)
+                if (
+                    target not in self._heartbeat_intervals
+                    or self._heartbeat_collection_rejected.get(target, False)
+                    or latest is None
+                    or latest["latest"]["state"] != "known"
+                    or latest["latest"] != heartbeat_receipt
+                    or heartbeat_receipt["scope_sha256"] != self._heartbeat_scopes.get(target)
+                    or not self._heartbeat_candidate(target, heartbeat_receipt)
+                ):
+                    raise DeferredDispatch("Heartbeat evidence was consumed or superseded")
+            charge = self.store.admit_task_attempt(
+                target,
+                intent_id,
+                fingerprint,
+                now=time.time(),
+                busy=native.get("status", {}).get("type") == "active"
+                or self._policy_intent_busy(target),
+                thread_id=task["thread_id"],
+            )
+            if charge and charge["replayed"]:
+                raise RejectedDispatch(
+                    "Task attempt was already charged; reconcile its receipt without replay"
+                )
+            if charge and not charge["admitted"]:
+                raise DeferredDispatch(
+                    "Task policy blocked dispatch: " + ", ".join(charge["decision"]["reasons"])
+                )
             intent = {
                 "id": intent_id,
                 "target": target,
@@ -882,13 +1548,18 @@ class Service:
                 "created_at": time.time(),
                 "input_sha256": fingerprint,
                 "automatic": automatic,
+                "policy_charged": charge is not None,
             }
             if summary_plan:
                 intent["summary_plan"] = summary_plan
             self.state["intents"][intent_id] = intent
+            if heartbeat_receipt is not None:
+                intent["heartbeat_receipt_id"] = heartbeat_receipt["id"]
+                self.state.setdefault("heartbeat_consumed", {})[target] = heartbeat_receipt
             # A manual follow-up can share a native root with an autonomous
             # Goal/queue. It cannot revoke ownership of that still-running tree.
             task["automatic"] = automatic or task.get("automatic") is True
+            self._policy_wakeup.set()
             self.save()  # Save intent before any RPC can start side effects.
             try:
                 if native.get("status", {}).get("type") == "active":
@@ -907,6 +1578,7 @@ class Service:
             except BaseException:
                 if intent["status"] != "failed":
                     intent["status"] = "unknown"
+                self._finish_policy_intent(intent, "unknown")
                 self.save()
                 raise
             self.save()
@@ -918,6 +1590,7 @@ class Service:
             f"through_at={event.through_at}; catch_up={event.catch_up}.\n" + event.prompt
         )
         summary_plan = None
+        heartbeat_receipt = None
         if summary_level(event.job):
             try:
                 dependencies = summary_dependencies(event, self.store.list_events())
@@ -932,6 +1605,28 @@ class Service:
                 )
             prompt, summary_plan = plan["prompt"], plan["plan_path"]
         if event.job.kind == "heartbeat":
+            evidence = await self.observe_heartbeat(event.target)
+            heartbeat_receipt = evidence["latest"]
+            if not evidence["configured"]:
+                # General periodic self-review remains usable without an
+                # external business source. It gets ordinary admission, never
+                # an invented unchanged verdict or evidence-based sleep.
+                heartbeat_receipt = None
+                prompt += "\nExternal heartbeat evidence is unconfigured; no external unchanged verdict is available."
+            elif evidence["collection_rejected"]:
+                raise DeferredDispatch(
+                    "Heartbeat observation did not advance its evidence watermark"
+                )
+            elif heartbeat_receipt["state"] != "known":
+                raise DeferredDispatch("Heartbeat evidence is " + heartbeat_receipt["state"])
+            # Compare to the evidence actually admitted, not just the preceding
+            # poll: an actionable change survives pauses and unchanged rechecks.
+            if heartbeat_receipt is not None and not self._heartbeat_candidate(
+                event.target, heartbeat_receipt
+            ):
+                raise DeferredDispatch(
+                    "Heartbeat source is unchanged; waiting for the next host check"
+                )
             heartbeat = self.config.workspace / "HEARTBEAT.md"
             prompt += (
                 "\nRead HEARTBEAT.md and .alice/prompts/autonomy-review.md. If nothing warrants "
@@ -947,6 +1642,7 @@ class Service:
             event_id=event.id,
             automatic=True,
             summary_plan=summary_plan,
+            heartbeat_receipt=heartbeat_receipt,
         )
         return DispatchReceipt(
             "accepted" if result["status"] in {"queued", "accepted"} else result["status"],
@@ -977,6 +1673,7 @@ class Service:
                 for task in self.state["tasks"].values():
                     if task["thread_id"] == intent["thread_id"]:
                         task.update(paused=True, reconcile_error="native_history_missing")
+                self._finish_policy_intent(intent, "unknown")
                 self.save()
 
     async def _reconcile_intent(self, intent: dict) -> None:
@@ -1061,6 +1758,8 @@ class Service:
 
     async def resume(self, target: str | None = None) -> dict:
         await self._stop_resource_paused_tasks()
+        await self._enforce_task_deadlines()
+        blocked_tasks = {}
         async with self._lock("admission"):
             revision = self._pause_revision
             keys = (
@@ -1070,6 +1769,10 @@ class Service:
             )
             task_revisions = {key: self._task_pause_revisions.get(key, 0) for key in keys}
             for key in keys:
+                blocked = self._policy_resume_block(key)
+                if target is None and blocked:
+                    blocked_tasks[key] = blocked
+                    continue
                 async with self._lock("input:" + key):
                     self._resuming.add(key)
                     try:
@@ -1087,22 +1790,38 @@ class Service:
                                 and not self.resources.can_dispatch(automatic=True)["allowed"]
                             ):
                                 raise RejectedDispatch("Automatic task resource limit is active")
+                            blocked = self._policy_resume_block(key)
+                            if blocked:
+                                raise RejectedDispatch(
+                                    "Task policy blocks resume: " + ", ".join(blocked)
+                                )
 
                         check()
                         task = await self.ensure_thread(key)
                         check()
                         queue = await self.codex.queue_list(task["thread_id"], limit=1)
                         check()
-                        if queue.get("data"):
-                            await self.codex.queue_start(task["thread_id"])
-                            check()
                         goal = (
                             await self.rpc.request(
                                 "thread/goal/get", {"threadId": task["thread_id"]}
                             )
                         ).get("goal")
                         check()
+                        if queue.get("data") or (goal and goal.get("status") == "paused"):
+                            try:
+                                self._check_policy_native_resume(key)
+                            except RejectedDispatch:
+                                if target is not None:
+                                    raise
+                                blocked_tasks[key] = [
+                                    "native_work_has_no_confirmed_charged_attempt"
+                                ]
+                                continue
+                        if queue.get("data"):
+                            await self.codex.queue_start(task["thread_id"])
+                            check()
                         if goal and goal.get("status") == "paused":
+                            self._check_policy_native_resume(key)
                             await self.rpc.request(
                                 "thread/goal/set",
                                 {"threadId": task["thread_id"], "status": "active"},
@@ -1110,12 +1829,51 @@ class Service:
                             check()
                         task["paused"] = False
                         task.pop("reconcile_error", None)
+                        task.pop("policy_deadline_stopped", None)
                         self.save()
                     finally:
                         self._resuming.discard(key)
             if target is None:
+                if self.stopping or self._pause_revision != revision:
+                    raise RejectedDispatch("Resume superseded by a pause")
                 self.store.set_autonomy_paused(False)
-        return {"resumed": target or "autonomy"}
+        return {
+            "resumed": target or "autonomy",
+            **({"blocked_tasks": blocked_tasks} if blocked_tasks else {}),
+        }
+
+    def _policy_resume_block(self, target: str) -> list[str]:
+        policy = self.store.task_policy_status(
+            target, now=time.time(), busy=self._policy_intent_busy(target)
+        )
+        if policy is None or policy["decision"]["allowed"]:
+            return []
+        # An already admitted final attempt can continue; no new input is bought.
+        if (
+            policy["usage"] is not None
+            and policy["usage"]["last_outcome"] == "running"
+            and policy["decision"]["reasons"] == ["task_busy"]
+        ):
+            return []
+        return policy["decision"]["reasons"] or ["task_" + policy["decision"]["state"]]
+
+    def _check_policy_native_resume(self, target: str) -> None:
+        record = self.store.get_task_policy(target)
+        if record is None:
+            return
+        usage = record["usage"]
+        current = self.state["intents"].get(record["current_attempt_id"])
+        if (
+            usage is None
+            or usage["last_outcome"] != "running"
+            or current is None
+            or not current.get("policy_charged")
+            or current.get("status") not in {"accepted", "queued"}
+            or current.get("thread_id") != self.state["tasks"][target]["thread_id"]
+        ):
+            raise RejectedDispatch(
+                "Native queue/Goal has no confirmed charged attempt; submit new work through task admission"
+            )
 
     async def handle(self, action: str, params: dict) -> dict:
         if action == "status":
@@ -1147,9 +1905,25 @@ class Service:
                 intent_id=params.get("request_id"),
                 automatic=params.get("automatic", False),
             )
+        if action == "task_policy_set":
+            return await self.set_task_policy(**params)
+        if action == "task_policy_status":
+            return await self.task_policy_status(params.get("target", "main"))
         if action == "task_status":
-            task = self.state["tasks"][params.get("target", "main")]
-            return await self.codex.thread_read(task["thread_id"], include_turns=True)
+            target = params.get("target", "main")
+            task = self.state["tasks"][target]
+            native = await self.codex.thread_read(task["thread_id"], include_turns=True)
+            policy = self.store.task_policy_status(
+                target,
+                now=time.time(),
+                busy=self._policy_intent_busy(target)
+                or native["thread"].get("status", {}).get("type") == "active",
+            )
+            return {
+                **native,
+                **(policy or {"target": target, "policy": None, "usage": None, "decision": None}),
+                "enforcement_scope": "alice_admission",
+            }
         if action == "intents":
             return {"intents": list(self.state["intents"].values())}
         if action == "cron_list":

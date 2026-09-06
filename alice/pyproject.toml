@@ -29,6 +29,7 @@ asyncio_mode = "auto"
 addopts = "-ra"
 markers = [
   "native: real Codex binary, no model inference unless also marked live",
+  "native_resource_epoch: installed Service resource epoch gate with fixed Codex/host pair",
   "live: real model inference, explicitly selected and budgeted",
   "artifact: installed wheel lifecycle and MCP acceptance gate",
 ]
