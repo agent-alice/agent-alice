@@ -371,12 +371,26 @@ class ReleaseManager:
             digest.update(b"\0")
         return digest.hexdigest()
 
+    def _runtime_codex_binary(self, manifest: dict) -> Path:
+        config_path = self.home / "config.json"
+        if not config_path.exists():
+            return Path(manifest["codex_binary"])
+        from .config import load_config
+
+        try:
+            config = load_config(self.home)
+        except (OSError, ValueError) as error:
+            raise ReleaseError(f"runtime config is invalid: {error}") from error
+        if config.codex_sha256 != manifest["codex_sha256"]:
+            raise ReleaseError("runtime config expects a different Codex binary")
+        return Path(config.codex_binary)
+
     def _assert_unchanged(self, candidate: Path, manifest: dict) -> None:
         if Path(manifest["wheel"]).name != manifest["wheel"]:
             raise ReleaseError("invalid wheel path in manifest")
         if sha256_file(candidate / manifest["wheel"]) != manifest["wheel_sha256"]:
             raise ReleaseError("candidate wheel changed after staging")
-        if sha256_file(Path(manifest["codex_binary"])) != manifest["codex_sha256"]:
+        if sha256_file(self._runtime_codex_binary(manifest)) != manifest["codex_sha256"]:
             raise ReleaseError("pinned Codex binary changed")
         if self._environment_fingerprint(candidate) != manifest["environment_fingerprint"]:
             raise ReleaseError("installed candidate or dependency environment changed")
@@ -410,7 +424,7 @@ class ReleaseManager:
             # subprocesses use the candidate interpreter with -I instead.
             env["PYTHONPATH"] = str(source / "src")
             env["ALICE_ARTIFACT_PYTHON"] = str(self._python(candidate))
-            env["ALICE_TEST_CODEX_BINARY"] = manifest["codex_binary"]
+            env["ALICE_TEST_CODEX_BINARY"] = str(self._runtime_codex_binary(manifest))
             python = manifest["verification_python"]
             static_paths = [name for name in ("src", "tests", "tools") if (source / name).exists()]
             commands: list[tuple[str, list[str], Path | None]] = [
@@ -559,9 +573,8 @@ class ReleaseManager:
                 )
         config_path = self.home / "config.json"
         if config_path.exists():
-            config = read_json(config_path)
-            if config.get("codex_sha256") != manifest["codex_sha256"]:
-                raise ReleaseError("candidate was verified against a different Codex binary")
+            if sha256_file(self._runtime_codex_binary(manifest)) != manifest["codex_sha256"]:
+                raise ReleaseError("runtime pinned Codex binary changed")
 
     def current(self) -> dict[str, Any] | None:
         path = self.root / "current.json"
@@ -570,6 +583,10 @@ class ReleaseManager:
         value = read_json(path)
         if not isinstance(value, dict) or "current" not in value:
             raise ReleaseError("invalid active release pointer")
+        if not isinstance(value["current"], str) or not re.fullmatch(
+            r"[0-9a-f]{16}-[0-9a-f]{12}", value["current"]
+        ):
+            raise ReleaseError("invalid active candidate id")
         epoch = value.get("activation_epoch")
         if epoch is not None and (
             not isinstance(epoch, str)

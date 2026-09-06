@@ -14,7 +14,10 @@ from .config import load_config
 from .control import ControlError, request
 from .files import SingletonLock, read_json, write_json
 from .releases import ReleaseError, ReleaseManager
-from .service import Service, process_birth, process_identity
+from .service import process_birth, process_identity, recover_owned_server
+from .store import Store
+from .memory import MemoryStore
+from .resources import ResourceLedger
 
 BOOTSTRAP_PROTOCOL = 1
 
@@ -29,10 +32,19 @@ class Supervisor:
         healthy_seconds: float = 60,
         stop_timeout: float = 40,
         retry_delay: float = 1,
+        bootstrap_manifest: dict | None = None,
     ):
         if min(startup_timeout, max_failures, healthy_seconds, stop_timeout) <= 0:
             raise ValueError("supervisor bounds must be positive")
         self.config = config
+        self.bootstrap_manifest = bootstrap_manifest or {
+            "installed": {
+                "schedule_schema": Store.SCHEMA_VERSION,
+                "memory_schema": MemoryStore.SCHEMA_VERSION,
+                "resource_schema": ResourceLedger.SCHEMA_VERSION,
+            },
+            "codex_sha256": config.codex_sha256,
+        }
         self.manager = ReleaseManager(config.root)
         self.path = config.root / "state/bootstrap-state.json"
         self.startup_timeout, self.max_failures = startup_timeout, max_failures
@@ -77,37 +89,48 @@ class Supervisor:
     def _same_child(self, child: dict) -> bool:
         return process_birth(child["pid"]) == child["birth"]
 
+    def _signalable_child(self, child: dict) -> bool:
+        if not self._same_child(child):
+            return False
+        identity = process_identity(child["pid"])
+        if not identity:
+            return False
+        try:
+            group = os.getpgid(child["pid"])
+        except ProcessLookupError:
+            return False
+        if (
+            group != child["pid"]
+            or str(self.config.root) not in identity
+            or "alice_codex" not in identity
+        ):
+            raise RuntimeError("Recorded daemon identity changed; refusing to signal")
+        return self._same_child(child)
+
     async def terminate_child(self) -> None:
         """Only the exact child identity recorded by this supervisor is signalable."""
         child = self.state.get("child")
-        if not child or not self._same_child(child):
+        if not child or not self._signalable_child(child):
             if self.process is not None:
                 await self.process.wait()
             self.state["child"] = None
             return
         pid = child["pid"]
-        identity = process_identity(pid) or ""
-        if (
-            os.getpgid(pid) != pid
-            or str(self.config.root) not in identity
-            or "alice_codex" not in identity
-        ):
-            raise RuntimeError("Recorded daemon identity changed; refusing to signal")
         # First allow normal journal draining and native shutdown. A status probe
         # must name the same daemon; never send shutdown to an unrelated service.
         state = await self.status()
         if state and state.get("pid") == pid:
             with suppress(OSError, TimeoutError, ControlError):
                 await request(self.config.control_socket, "shutdown", timeout=2)
-        if self._same_child(child):
-            os.kill(pid, signal.SIGTERM)
+        if self._signalable_child(child):
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
         deadline = time.monotonic() + self.stop_timeout
         while self._same_child(child) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
-        if self._same_child(child):
-            if os.getpgid(pid) != pid:
-                raise RuntimeError("Recorded daemon process group changed")
-            os.kill(pid, signal.SIGKILL)
+        if self._signalable_child(child):
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
         deadline = time.monotonic() + 5
         while self._same_child(child) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
@@ -118,17 +141,36 @@ class Supervisor:
         self.state["child"] = None
 
     async def clean_orphan(self) -> None:
-        """Reuse the Service's birth/socket/group checks, while no daemon owns its lock."""
+        """Stop the native owner before touching potentially damaged business data."""
         with SingletonLock(self.config.root / "state/service.lock"):
-            service = Service(self.config)
-            try:
-                service.store.set_autonomy_paused(True)
-                await service._recover_orphan()
-                service.state["server"] = None
-                service.state["lifecycle"] = "stopped"
-                service.save()
-            finally:
-                service.store.close()
+            path = self.config.root / "state/runtime.json"
+            state = (
+                read_json(path)
+                if path.exists()
+                else {
+                    "version": 1,
+                    "tasks": {},
+                    "intents": {},
+                    "server": None,
+                    "lifecycle": "new",
+                }
+            )
+            if not isinstance(state, dict):
+                raise ValueError("Invalid runtime state; preserved for recovery")
+            # This function only reads the native identity and owned root IDs; it
+            # does not construct Service or open memory/schedule/resource stores.
+            await recover_owned_server(self.config, state)
+            ReleaseManager(self.config.root)._check_data_schema(self.bootstrap_manifest, None)
+            if (
+                state.get("version") != 1
+                or not isinstance(state.get("tasks"), dict)
+                or not isinstance(state.get("intents"), dict)
+            ):
+                raise ValueError("Unsupported runtime state; preserved after owned cleanup")
+            with Store(self.config.database) as store:
+                store.set_autonomy_paused(True)
+            state.update(server=None, lifecycle="stopped")
+            write_json(path, state)
 
     def launch_command(self, pointer: dict) -> list[str]:
         return [pointer["python"], "-I", "-m", "alice_codex", "--home", self.config.home, "serve"]
@@ -136,7 +178,7 @@ class Supervisor:
     async def attempt(self, pointer: dict) -> str:
         candidate = pointer["current"]
         self.config.write_codex_config(python=pointer["python"])
-        self.save("starting", candidate=candidate)
+        self.save("starting", candidate=candidate, error=None)
         self.process = await asyncio.create_subprocess_exec(
             *self.launch_command(pointer),
             cwd=self.config.workspace,
@@ -156,7 +198,9 @@ class Supervisor:
         ready_at, reset = None, False
         while not self.stop_event.is_set():
             if self.process.returncode is not None:
-                return "stopped" if self.process.returncode == 0 else "failed"
+                if self.process.returncode == 0 and ready_at is not None:
+                    return "stopped"
+                return "failed"
             now = time.monotonic()
             if ready_at is None:
                 observed = await self.status()
@@ -164,14 +208,14 @@ class Supervisor:
                     if observed.get("pid") != self.process.pid:
                         raise RuntimeError("Health socket belongs to another service")
                     ready_at = now
-                    self.save("running", ready_at=time.time())
+                    self.save("running", ready_at=time.time(), error=None)
                 elif now >= deadline:
                     self.save("startup_timeout", error="candidate readiness deadline exceeded")
                     return "failed"
             elif not reset and now - ready_at >= self.healthy_seconds:
                 # A later, isolated crash does not inherit ancient startup failures.
                 self.state["attempts"][candidate] = 0
-                self.save("healthy")
+                self.save("healthy", error=None)
                 reset = True
             await self.delay(0.1)
         return "stopped"
@@ -250,9 +294,7 @@ async def _main(home: Path) -> int:
     if Path(sys.executable).absolute() != Path(runtime["python"]).absolute():
         raise ReleaseError("supervisor must run from its independent bootstrap environment")
     config = load_config(home)
-    manager = ReleaseManager(home)
-    manager._check_data_schema(runtime["manifest"], None)
-    supervisor = Supervisor(config)
+    supervisor = Supervisor(config, bootstrap_manifest=runtime["manifest"])
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, supervisor.stop_event.set)
@@ -275,7 +317,7 @@ def main(argv=None) -> int:
                     "error": f"{type(error).__name__}: {error}",
                 },
             )
-        print(f"alice supervisor stopped safely: {type(error).__name__}: {error}", file=sys.stderr)
+        print(f"alice supervisor stopped: {type(error).__name__}: {error}", file=sys.stderr)
         return 0
 
 

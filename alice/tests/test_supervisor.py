@@ -36,9 +36,9 @@ async def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig,stop.set)
     record('started')
-    if a.mode=='bad':
+    if a.mode in {'bad','empty'}:
         record('exited')
-        return 71
+        return 71 if a.mode=='bad' else 0
     if a.mode=='slow':
         await stop.wait()
         record('exited')
@@ -143,6 +143,9 @@ async def stop_ready(value):
     state = await value.status()
     assert state and state["ready"]
     await request(value.config.control_socket, "shutdown")
+    # Installed CLI stop also signals the supervisor; a daemon can complete its
+    # shutdown before the supervisor first observes its ready socket.
+    value.stop_event.set()
 
 
 @pytest.mark.asyncio
@@ -299,6 +302,94 @@ async def test_second_supervisor_cannot_interrupt_first_owned_daemon(runtime):
         assert process_birth(child["pid"]) == child["birth"]
         await stop_ready(value)
         assert await asyncio.wait_for(task, 5) == 0
+    finally:
+        value.stop_event.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["corrupt", "future"])
+async def test_owned_native_is_stopped_before_rejecting_damaged_business_store(runtime, failure):
+    import sqlite3
+    from alice_codex.files import write_json
+    from alice_codex.service import process_identity
+
+    native = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        str(runtime.codex_socket),
+        start_new_session=True,
+    )
+    state = {
+        "version": 1,
+        "tasks": {},
+        "intents": {},
+        "lifecycle": "running",
+        "server": {
+            "pid": native.pid,
+            "birth": process_birth(native.pid),
+            "identity": process_identity(native.pid),
+        },
+    }
+    write_json(runtime.root / "state/runtime.json", state)
+    database = runtime.root / "memory-state/sources.sqlite3"
+    database.parent.mkdir()
+    if failure == "corrupt":
+        database.write_bytes(b"synthetic corrupt database; preserve these bytes")
+    else:
+        with sqlite3.connect(database) as db:
+            db.execute("PRAGMA user_version=2")
+            db.execute("CREATE TABLE evidence(value TEXT)")
+            db.execute("INSERT INTO evidence VALUES ('newer data')")
+    before = database.read_bytes()
+    value = supervisor(runtime, {"A": "good", "B": "good"})
+    try:
+        with pytest.raises(ReleaseError, match="memory"):
+            await value.run()
+        assert await asyncio.wait_for(native.wait(), 5) != 0
+        assert database.read_bytes() == before
+        assert value.manager.fallbacks == []
+        assert records(runtime) == []
+        assert json.loads((runtime.root / "state/runtime.json").read_text()) == state
+    finally:
+        if native.returncode is None:
+            native.kill()
+            await native.wait()
+
+
+@pytest.mark.asyncio
+async def test_exit_zero_before_readiness_is_a_startup_failure_not_an_explicit_stop(runtime):
+    value = supervisor(runtime, {"A": "good", "B": "empty"})
+    task = asyncio.create_task(value.run())
+    try:
+        await eventually(lambda: value.status())
+        assert value.manager.fallbacks == [("B", "A")]
+        await stop_ready(value)
+        assert await asyncio.wait_for(task, 5) == 0
+    finally:
+        value.stop_event.set()
+        await asyncio.gather(task, return_exceptions=True)
+    assert [row["mode"] for row in records(runtime) if row["kind"] == "started"] == [
+        "empty",
+        "empty",
+        "good",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clean_exit_after_observed_readiness_stays_stopped(runtime):
+    value = supervisor(runtime, {"A": "good", "B": "good"})
+    task = asyncio.create_task(value.run())
+    try:
+
+        async def observed_ready():
+            return value.state.get("lifecycle") in {"running", "healthy"}
+
+        await eventually(observed_ready)
+        await request(runtime.control_socket, "shutdown")
+        assert await asyncio.wait_for(task, 5) == 0
+        assert value.manager.fallbacks == []
     finally:
         value.stop_event.set()
         await asyncio.gather(task, return_exceptions=True)

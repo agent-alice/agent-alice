@@ -448,3 +448,46 @@ def test_bootstrap_rejects_environment_links_to_unrelated_external_files(tmp_pat
     with pytest.raises(ReleaseError, match="unsupported external"):
         _check_links(environment)
     assert external.read_text() == "unrelated synthetic evidence"
+
+
+@pytest.mark.parametrize("original_change", ["modified", "deleted"])
+def test_runtime_verifies_private_pin_after_original_application_changes(
+    tmp_path, project, original_change
+):
+    from dataclasses import asdict
+    from alice_codex.config import RuntimeConfig
+    from alice_codex.files import write_json
+
+    manager, candidate = stage(tmp_path, project)
+    report = manager.verify(candidate)
+    assert report["passed"]
+    private = manager.home / "bin/codex"
+    private.parent.mkdir()
+    private.write_bytes(project[1].read_bytes())
+    private.chmod(0o700)
+    config = RuntimeConfig(
+        str(manager.home), str(private), "codex-cli test-fixture", report["codex_sha256"]
+    )
+    write_json(manager.home / "config.json", asdict(config))
+    pointer = manager.activate(candidate)
+    if original_change == "modified":
+        project[1].write_text("updated original application")
+    else:
+        project[1].unlink()
+    assert manager.checked_current() == pointer
+    # Original path and original verified SHA remain unchanged historical evidence.
+    _, manifest = manager._manifest(candidate)
+    assert manifest["codex_binary"] == str(project[1])
+    assert manifest["codex_sha256"] == report["codex_sha256"]
+    private.write_text("changed private runtime")
+    with pytest.raises(ReleaseError, match="Codex binary changed"):
+        manager.checked_current()
+    write_json(
+        manager.home / "config.json",
+        {
+            **asdict(config),
+            "codex_sha256": hashlib.sha256(private.read_bytes()).hexdigest(),
+        },
+    )
+    with pytest.raises(ReleaseError, match="different Codex binary"):
+        manager.checked_current()
