@@ -16,7 +16,7 @@ See [installation and commands](alice/README.md), [development and verification 
 4. Integration verifies the installed artifact, including startup, MCP calls, interruption, restart and recovery.
 5. Only a verified candidate can replace the running release. Rollback must retain new runtime data.
 
-CI builds and verifies an installed candidate on macOS and Linux with Python 3.11 and 3.14. Check the actual workflow results for evidence; required-check enforcement remains pending. The default CI does not call a real model. An agent reporting success is not a substitute for integration evidence.
+CI builds and verifies an installed candidate on macOS and Linux with Python 3.11 and 3.14. Every pull request runs the required `all checks passed` gate, including documentation changes. The main branch requires that GitHub Actions check and an up-to-date PR; administrators are also subject to the rule. The default CI does not call a real model. An agent reporting success is not a substitute for integration evidence.
 
 ## Data boundary
 

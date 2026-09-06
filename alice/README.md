@@ -90,12 +90,18 @@ SOUL、USER、MEMORY、手记及经历档案保存在运行工作区，来源索
 ```sh
 alice stop
 alice memory snapshot /path/to/legacy-workspace \
+  --snapshot-id migration-example \
   --external runtime-logs=/path/to/runtime-logs
 alice memory search "需要查询的经历"
 alice memory read SOURCE_ID --offset 0 --max-chars 4096
 alice memory prepare L1 2026-01-01T00:00
 alice memory commit BATCH_ID /path/to/candidate.json
 ```
+
+快照命令开始时会把 ID 写到 stderr。索引失败或命令中断后，用同一
+`--snapshot-id`、来源和选项恢复，避免重新复制已经发布的原文。
+复用 ID 会继续原快照；要采集后来发生的变动，应使用新 ID 和 `--previous`。
+`--final` 只检查采集窗口内的来源变化，执行前仍需独立确认旧写入进程已停止。
 
 快照支持 `--previous SNAPSHOT_ID` 和 `--final`。最终快照需要控制流程先确认旧 writer 停写；参数本身不会停止旧系统。切换和回退须保留新产生的记录，不能将旧快照覆盖回新工作区。
 
