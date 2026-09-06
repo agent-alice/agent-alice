@@ -156,8 +156,42 @@ async def running(config) -> dict | None:
 
 async def start(config) -> dict:
     status = await running(config)
-    if status:
+    if status and status.get("ready"):
         return status
+    if (config.root / "state/supervisor.json").exists():
+        from .launchd import start as start_supervisor
+        from .launchd import status as supervisor_status
+
+        # The stable supervisor must be allowed to recover a damaged current
+        # candidate before resolving the runtime interpreter or writing MCP config.
+        await asyncio.to_thread(start_supervisor, config)
+        deadline = time.monotonic() + 180
+        next_supervisor_check = 0
+        while time.monotonic() < deadline:
+            status = await running(config)
+            if status and status.get("ready"):
+                return status
+            if time.monotonic() >= next_supervisor_check:
+                supervised = await asyncio.to_thread(supervisor_status, config)
+                state = supervised.get("supervisor") or {}
+                if state.get("lifecycle") == "blocked":
+                    raise RuntimeError(
+                        "Supervisor could not start a compatible verified release; "
+                        "inspect service status and private launchd.log"
+                    )
+                next_supervisor_check = time.monotonic() + 1
+            await asyncio.sleep(0.2)
+        raise TimeoutError("User service startup unconfirmed; inspect private launchd.log")
+    if status:
+        # Another caller already started the daemon. A responsive control socket
+        # is not readiness, and launching a second daemon cannot fix initialization.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            status = await running(config)
+            if status and status.get("ready"):
+                return status
+            await asyncio.sleep(0.1)
+        raise TimeoutError("Existing service has not become ready; inspect private log")
     log_path = config.root / "logs/alice-service.log"
     from .releases import ReleaseManager
 
@@ -165,16 +199,6 @@ async def start(config) -> dict:
     python = release["python"] if release else sys.executable
     # MCP must use exactly the runtime being started, not a development venv.
     config.write_codex_config(python=python)
-    if (config.root / "state/supervisor.json").exists():
-        from .launchd import start as start_supervisor
-
-        start_supervisor(config)
-        for _ in range(300):
-            status = await running(config)
-            if status and status.get("ready"):
-                return status
-            await asyncio.sleep(0.1)
-        raise TimeoutError("User service startup unconfirmed; inspect private launchd.log")
     with log_path.open("ab", buffering=0) as log:
         child = subprocess.Popen(
             [python, "-m", "alice_codex", "--home", config.home, "serve"],
@@ -333,6 +357,22 @@ async def execute(args) -> dict | None:
                 "last_state": read_json(state) if state.exists() else None,
             }
     if args.command == "stop":
+        if (config.root / "state/supervisor.json").exists():
+            from .control import ControlError
+            from .launchd import stop as stop_supervisor
+
+            # A failed or starting candidate may not expose a usable control
+            # socket. The supervisor still owns and must confirm process cleanup.
+            try:
+                status = await running(config)
+                if status:
+                    await request(config.control_socket, "shutdown", timeout=5)
+            except (OSError, TimeoutError, ControlError):
+                pass
+            result = await asyncio.to_thread(stop_supervisor, config)
+            if not isinstance(result, dict) or result.get("stopped") is not True:
+                raise RuntimeError("Supervisor has not confirmed owned process shutdown")
+            return result
         status = await running(config)
         if not status:
             # Do not claim a crashed daemon's orphaned server was stopped.
