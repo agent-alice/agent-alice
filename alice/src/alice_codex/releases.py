@@ -658,6 +658,10 @@ class ReleaseManager:
                 raise ReleaseError("source/checks changed since this candidate was built")
             if not (source / "tests" / "test_artifact_smoke.py").is_file():
                 raise ReleaseError("required installed-artifact smoke test is missing")
+            runs = candidate / "verification-runs"
+            if runs.is_symlink():
+                raise ReleaseError("verification evidence directory must not be a symbolic link")
+            verification_run = private_dir(private_dir(runs) / uuid4().hex)
             env = self._environment(candidate / "verification-home")
             # The verification interpreter may have another editable checkout
             # installed. Test this explicit source tree; installed-artifact
@@ -815,7 +819,13 @@ class ReleaseManager:
             for name, command, junit in commands:
                 if junit is not None:
                     junit.unlink(missing_ok=True)
-                    command = [*command, f"--junitxml={junit}"]
+                    # Pytest's global numbered-directory retention otherwise
+                    # deletes a failed earlier group's fixtures during this
+                    # same verification. A later verify gets a new run too.
+                    command = [
+                        *command, f"--junitxml={junit}",
+                        f"--basetemp={verification_run / name}",
+                    ]
                 result = run_check(
                     name, command, cwd=source, env=env, timeout=timeout, junit=junit,
                     # Structured evidence must be parsed before any display

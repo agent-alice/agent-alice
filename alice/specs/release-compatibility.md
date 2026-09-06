@@ -116,3 +116,11 @@ declaration probing, report binding and rejected switches. They do not claim
 that the synthetic native fixtures prove Service behavior. The separate actual
 native tests exercise owned processes against recorded localhost Responses;
 only a full candidate run establishes evidence for the combined source snapshot.
+
+Each verification uses a new private `verification-runs/<uuid>` directory inside
+its candidate. Each pytest group receives its own explicit `--basetemp` below
+that run, recorded in the check command. A later group or verification therefore
+does not apply pytest's global numbered-directory retention to earlier failure
+fixtures. This preserves pytest-owned `tmp_path` / `tmp_path_factory` evidence;
+fixtures that deliberately close their own `TemporaryDirectory` still control
+that cleanup. It does not turn discarded earlier-run fixtures into saved proof.
