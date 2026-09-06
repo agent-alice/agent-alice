@@ -65,6 +65,22 @@ def tagged_result(value):
     return None
 
 
+def output_kind(value):
+    """Describe the actual native envelope without accepting a failed or partial page."""
+    output = value.get("output", []) if isinstance(value, dict) else value
+    if isinstance(output, str):
+        output = [output]
+    for item in output if isinstance(output, list) else []:
+        text = item.get("text", "") if isinstance(item, dict) else item
+        if not isinstance(text, str):
+            continue
+        if text.startswith("Script failed\n"):
+            return "script_failed"
+        if text.startswith("Script running with cell ID "):
+            return "script_running"
+    return "missing_or_invalid_tagged_result"
+
+
 class PartitionRuntime(NativePolicyRuntime):
     def __init__(self, root):
         super().__init__(root)
@@ -75,6 +91,12 @@ class PartitionRuntime(NativePolicyRuntime):
         self.native_reads = {}
         self.sequence = 0
         self.raw_source = b""
+        if os.environ.get("ALICE_SUMMARY_DIAGNOSTICS") == "1":
+            self.host_command = [
+                self.runtime_python, "-I",
+                str(Path(__file__).parent / "fixtures/native_summary_diagnostic_service.py"),
+                str(self.home), str(self.root / "service-failures.jsonl"),
+            ]
 
     def call(self, body, name, arguments=None, code=None):
         matches = [item for item in advertised(body) if item.get("name") == name]
@@ -230,8 +252,12 @@ const manifest = JSON.parse(file.output);
             state.update(sources=manifest["sources"], readings=[], source_index=0, offset=0, chunks=[])
             return self.read_call(body, state)
         if state["stage"] == "page":
-            value = tagged_result(self.latest_output(body, state["call_id"]))
-            assert value is not None, "A bounded native MCP page must be fully visible"
+            output = self.latest_output(body, state["call_id"])
+            value = tagged_result(output)
+            assert value is not None, (
+                "A bounded native MCP page must be fully visible; "
+                f"native_output={output_kind(output)}, call_id={state['call_id']}"
+            )
             assert value["source_id"] == state["sources"][state["source_index"]]["source_id"]
             assert value["offset_chars"] == state["offset"]
             assert len(value["content"]) == min(PAGE_CHARS, value["total_chars"] - state["offset"])
@@ -316,6 +342,9 @@ const manifest = JSON.parse(file.output);
             if not self.errors:
                 (self.root / "fixture-error.json").write_text(json.dumps({
                     "error": repr(error), "input": body["input"],
+                    "service_pid": self.service.pid if self.service else None,
+                    "service_returncode": self.service.returncode if self.service else None,
+                    "control_socket_exists": self.config.control_socket.exists() if self.config else None,
                 }, ensure_ascii=False))
                 self.errors.append(repr(error))
         finally:
