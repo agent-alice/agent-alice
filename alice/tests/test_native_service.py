@@ -18,7 +18,7 @@ import tomlkit
 
 from alice_codex.config import load_config
 from alice_codex.control import request
-from alice_codex.rpc import RpcClient
+from alice_codex.rpc import RpcClient, RpcError
 
 pytestmark = pytest.mark.native
 
@@ -407,6 +407,11 @@ stream_max_retries = 0
         assert not any(
             job["name"] == "late forbidden schedule" for job in (await cli("cron", "list"))["jobs"]
         )
+        # An explicit empty task has an Alice identity but no native rollout.
+        # Even this task's manual pause must survive replacing an unused ID.
+        empty_task = await request(config.control_socket, "thread", {"target": "rehearsal-main"})
+        await request(config.control_socket, "pause", {"target": "rehearsal-main"})
+        remember_mcp()
         await rpc.close()
         rpc = None
         assert (await cli("stop", timeout=25))["stopped"]
@@ -418,14 +423,28 @@ stream_max_retries = 0
         restarted = await launch()
         assert restarted["autonomy_paused"]
         assert restarted["tasks"]["main"]["thread_id"] == thread_id
+        rpc = await RpcClient.connect_unix(config.codex_socket)
+        await rpc.initialize()
+        with pytest.raises(RpcError) as unreadable:
+            await rpc.request("thread/read", {"threadId": empty_task["thread_id"]})
+        assert unreadable.value.code == -32600
+        assert str(unreadable.value) == f"thread not loaded: {empty_task['thread_id']}"
+        with pytest.raises(RpcError) as unresumable:
+            await rpc.request("thread/resume", {"threadId": empty_task["thread_id"]})
+        assert unresumable.value.code == -32600
+        assert str(unresumable.value) == f"no rollout found for thread id {empty_task['thread_id']}"
+        replacement = await request(
+            config.control_socket, "thread", {"target": "rehearsal-main"}
+        )
+        assert replacement["thread_id"] != empty_task["thread_id"]
+        assert replacement["paused"] and not replacement["has_input"]
+        assert len(model_requests) == 4, "replacing an untouched thread must not submit input"
         # Read/resume the existing thread without starting another model request.
         resumed = await request(config.control_socket, "thread", {"target": "main"})
         assert resumed["thread_id"] == thread_id
         history = await cli("task-status", "--target", "main")
         assert "Recorded native execution completed." in json.dumps(history)
         assert len(model_requests) == 4 and not errors
-        rpc = await RpcClient.connect_unix(config.codex_socket)
-        await rpc.initialize()
         assert (await until(tools_ready, timeout=20)).get("toolsError") is None
         remember_mcp()
         await rpc.close()

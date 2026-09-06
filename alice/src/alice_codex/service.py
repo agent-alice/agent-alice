@@ -92,6 +92,7 @@ class Service:
         self._native_interrupts: dict[str, str] = {}
         self._resuming: set[str] = set()
         self._pause_revision = 0  # In-flight resume fence; no resume survives process exit.
+        self._task_pause_revisions: dict[str, int] = {}
         self.scheduler = Scheduler(self.store, self)
 
     def save(self) -> None:
@@ -133,8 +134,8 @@ class Service:
                 owned_root_ids=[task["thread_id"] for task in self.state["tasks"].values()],
             )
             try:
-                for task in list(self.state["tasks"].values()):
-                    await recovered.stop_tree(task["thread_id"], timeout=5)
+                for key in list(self.state["tasks"]):
+                    await self._stop_task(key, codex=recovered, timeout=5)
             finally:
                 recovered.close()
         except Exception:
@@ -249,9 +250,9 @@ class Service:
             except Exception as error:
                 self.error = f"Pause persistence failed: {type(error).__name__}"
             if self.codex:
-                for task in list(self.state["tasks"].values()):
+                for key in list(self.state["tasks"]):
                     try:
-                        await self.codex.stop_tree(task["thread_id"], timeout=8)
+                        await self._stop_task(key, timeout=8)
                     except Exception as error:
                         self.error = (
                             f"Shutdown required owned-server termination: {type(error).__name__}"
@@ -302,6 +303,21 @@ class Service:
         }:
             return
         params = event.get("params", {})
+        if event["method"] == "turn/started" or (
+            event["method"] == "item/completed"
+            and params.get("item", {}).get("type") == "userMessage"
+        ):
+            try:
+                changed = False
+                for task in self.state["tasks"].values():
+                    if task["thread_id"] == params.get("threadId") and not task.get("has_input"):
+                        task["has_input"] = True
+                        changed = True
+                if changed:
+                    self.save()  # Direct TUI input must survive before archive-worker scheduling.
+            except Exception:
+                self._fail("Native input ownership could not be persisted")
+                return
         if event["method"] in {"thread/tokenUsage/updated", "account/rateLimits/updated"}:
             try:
                 # Keep receiving accounting through native interruption, even
@@ -340,11 +356,13 @@ class Service:
         # The TUI can interrupt a turn that never passed through Alice.submit.
         # Persist before the next await so a due heartbeat cannot revive it.
         for key, task in list(self.state["tasks"].items()):
-            if task["thread_id"] == thread and not task.get("paused"):
-                self._pause_revision += 1
+            if task["thread_id"] == thread and (not task.get("paused") or key in self._resuming):
                 task["paused"] = True
                 if key == "main":
+                    self._pause_revision += 1
                     self.store.set_autonomy_paused(True)
+                else:
+                    self._task_pause_revisions[key] = self._task_pause_revisions.get(key, 0) + 1
                 self.save()
                 return key
         return None
@@ -470,9 +488,9 @@ class Service:
                 and not task.get("resource_pause_pending")
             ):
                 task.update(paused=True, resource_pause_pending=True)
+                self._task_pause_revisions[key] = self._task_pause_revisions.get(key, 0) + 1
                 changed = True
         if changed:
-            self._pause_revision += 1
             self.save()  # Persist admission and unfinished stop before the next await.
 
     async def _stop_resource_paused_tasks(self) -> None:
@@ -490,7 +508,23 @@ class Service:
             task = self.state["tasks"].get(key)
             if task:
                 try:
-                    result = await self.codex.thread_read(task["thread_id"])
+                    try:
+                        result = await self.codex.thread_read(task["thread_id"])
+                    except RpcError as error:
+                        if (
+                            error.code != -32600
+                            or str(error) != f"thread not loaded: {task['thread_id']}"
+                        ):
+                            raise
+                        # This is not proof of absent history. Resume the exact
+                        # ID first; only an explicit no-rollout error below can
+                        # authorize replacement of an untouched empty thread.
+                        result = await self.codex.thread_resume(
+                            task["thread_id"],
+                            cwd=str(self.config.workspace),
+                            model=self.config.model,
+                            **self.config.native_permission_params(),
+                        )
                     status = result["thread"].get("status", {}).get("type")
                     if status == "notLoaded":
                         await self.codex.thread_resume(
@@ -509,9 +543,8 @@ class Service:
                         raise
                     # Codex intentionally doesn't persist an unused empty thread.
                     # Never use this fallback after any acknowledged/unknown input.
-                    self.state.setdefault("replaced_empty_threads", []).append(task["thread_id"])
-                    del self.state["tasks"][key]
-                    self.save()
+                    # Retain the old alias and its pause flags until replacement
+                    # succeeds, including if this process dies during thread/start.
             if self.stopping:
                 raise DeferredDispatch("Service is stopping")
             result = await self.codex.thread_start(
@@ -527,9 +560,14 @@ class Service:
                     "Only explicit user goals authorize creating a persistent Goal."
                 ),
             )
+            if task:
+                if task.get("has_input"):
+                    raise RpcError("Input was observed while replacing an empty thread")
+                self.state.setdefault("replaced_empty_threads", []).append(task["thread_id"])
             task = {
+                **(task or {}),
                 "thread_id": result["thread"]["id"],
-                "paused": False,
+                "paused": bool(task and task.get("paused")),
                 "created_at": time.time(),
                 "has_input": False,
             }
@@ -770,13 +808,14 @@ class Service:
             seen.add(cursor)
 
     async def pause(self, target: str | None = None) -> dict:
-        self._pause_revision += 1
         if target is None:
+            self._pause_revision += 1
             self.store.set_autonomy_paused(True)
             keys = list(self.state["tasks"])
         else:
             if target not in self.state["tasks"]:
                 raise ValueError("Unknown task")
+            self._task_pause_revisions[target] = self._task_pause_revisions.get(target, 0) + 1
             keys = [target]
         for key in keys:
             self.state["tasks"][key]["paused"] = True
@@ -785,13 +824,48 @@ class Service:
         for key in keys:
             async with self._lock("input:" + key):
                 try:
-                    results[key] = await self.codex.stop_tree(self.state["tasks"][key]["thread_id"])
+                    results[key] = await self._stop_task(key)
                 except Exception:
                     self._fail("Task tree pause could not be proven")
                     raise RuntimeError(
                         "Could not prove task tree paused; stopping the owned Codex server"
                     )
         return {"paused": True, "tasks": results}
+
+    async def _stop_task(self, key: str, *, codex=None, timeout: float | None = None) -> dict:
+        client = codex or self.codex
+        task = self.state["tasks"][key]
+        thread_id = task["thread_id"]
+        options = {} if timeout is None else {"timeout": timeout}
+        try:
+            try:
+                return await client.stop_tree(thread_id, **options)
+            except RpcError as error:
+                if error.code != -32600 or str(error) not in {
+                    f"thread not loaded: {thread_id}",
+                    f"thread not found: {thread_id}",
+                }:
+                    raise
+                await client.thread_resume(
+                    thread_id,
+                    cwd=str(self.config.workspace),
+                    model=self.config.model,
+                    **self.config.native_permission_params(),
+                )
+                return await client.stop_tree(thread_id, **options)
+        except RpcError as error:
+            untouched = not task.get("has_input") and not any(
+                intent["thread_id"] == thread_id for intent in self.state["intents"].values()
+            )
+            if (
+                not untouched
+                or error.code != -32600
+                or str(error) != f"no rollout found for thread id {thread_id}"
+            ):
+                raise
+            # Native explicitly confirms an unused alias has no execution to
+            # stop. Keep that paused alias; stopping must not create a new root.
+            return {"stopped": [], "absent_empty_thread": thread_id}
 
     async def resume(self, target: str | None = None) -> dict:
         await self._stop_resource_paused_tasks()
@@ -802,6 +876,7 @@ class Service:
                 if target
                 else [name for name, task in self.state["tasks"].items() if task.get("paused")]
             )
+            task_revisions = {key: self._task_pause_revisions.get(key, 0) for key in keys}
             for key in keys:
                 async with self._lock("input:" + key):
                     self._resuming.add(key)
@@ -809,7 +884,11 @@ class Service:
 
                         def check():
                             self._mark_resource_pauses()
-                            if self.stopping or self._pause_revision != revision:
+                            if (
+                                self.stopping
+                                or self._pause_revision != revision
+                                or self._task_pause_revisions.get(key, 0) != task_revisions[key]
+                            ):
                                 raise RejectedDispatch("Resume superseded by a pause")
                             if (
                                 self.state["tasks"].get(key, {}).get("automatic") is True
