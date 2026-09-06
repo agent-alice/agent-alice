@@ -17,8 +17,12 @@ import pytest
 
 from alice_codex.config import RuntimeConfig
 from alice_codex.control import request
+from alice_codex.identity import IDENTITY_HOOK_COMPAT_VERSION
+from alice_codex.memory import MemoryStore
 from alice_codex.releases import ReleaseError
-from alice_codex.service import process_birth
+from alice_codex.resources import ResourceLedger
+from alice_codex.service import RESOURCE_EPOCH_CAPABILITY, process_birth
+from alice_codex.store import Store
 from alice_codex.supervisor import Supervisor
 
 DAEMON = """
@@ -116,6 +120,16 @@ def runtime(tmp_path):
 def supervisor(config, modes, **manager_options):
     value = ProcessSupervisor(
         config,
+        bootstrap_manifest={
+            "installed": {
+                "schedule_schema": Store.SCHEMA_VERSION,
+                "memory_schema": MemoryStore.SCHEMA_VERSION,
+                "resource_schema": ResourceLedger.SCHEMA_VERSION,
+                "resource_epoch_capability": RESOURCE_EPOCH_CAPABILITY,
+                "identity_hook_compat_version": IDENTITY_HOOK_COMPAT_VERSION,
+            },
+            "codex_sha256": config.codex_sha256,
+        },
         startup_timeout=0.35,
         healthy_seconds=0.4,
         stop_timeout=0.5,
