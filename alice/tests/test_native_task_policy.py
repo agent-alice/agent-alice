@@ -44,6 +44,24 @@ async def until(operation, *, timeout=15):
             await asyncio.sleep(0.03)
 
 
+def settled_unchanged_heartbeat(snapshot, *, observed_checks, minimum_checks):
+    """Accept the unchanged heartbeat only once its dispatch is pending again."""
+    if not snapshot or observed_checks < minimum_checks:
+        return None
+    evidence = snapshot["heartbeat"]
+    if not evidence or evidence["comparison"]["state"] != "unchanged":
+        return None
+    assert evidence["latest"]["state"] == "known"
+    assert evidence["waiting_until"] > evidence["latest"]["observed_at"]
+    # A host observation can advance while Scheduler.poll is between claim,
+    # send and DeferredDispatch. Preserve the pending assertion by waiting for
+    # that transition to finish, rather than accepting its in-flight snapshot.
+    states = {item["status"] for item in snapshot["events"]}
+    if "pending" not in states or states & {"claimed", "sending"}:
+        return None
+    return snapshot
+
+
 class NativePolicyRuntime:
     def __init__(self, root):
         self.root = root.resolve()
@@ -663,15 +681,9 @@ async def test_native_registered_heartbeat_waits_for_change_and_preserves_pause(
         return None
 
     async def unchanged_after(minimum_checks):
-        snapshot = await report()
-        if not snapshot or len(observations) < minimum_checks:
-            return None
-        evidence = snapshot["heartbeat"]
-        if not evidence or evidence["comparison"]["state"] != "unchanged":
-            return None
-        assert evidence["latest"]["state"] == "known"
-        assert evidence["waiting_until"] > evidence["latest"]["observed_at"]
-        return snapshot
+        return settled_unchanged_heartbeat(
+            await report(), observed_checks=len(observations), minimum_checks=minimum_checks
+        )
 
     try:
         await runtime.configure()
