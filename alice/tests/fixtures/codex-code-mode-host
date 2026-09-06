@@ -1,0 +1,6 @@
+#!/bin/sh
+# Synthetic package-layout companion for installation/protocol fixtures only.
+# This is deliberately NOT a Code Mode implementation. Required native tests
+# must use a real distribution and observe real execution through its host.
+printf '%s\n' 'Synthetic fixture: Code Mode execution is not implemented.' >&2
+exit 78

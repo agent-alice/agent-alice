@@ -22,6 +22,11 @@ def binary(tmp_path):
     path = tmp_path / "codex"
     path.write_text('#!/bin/sh\nprintf "codex-cli 0.test\\n"\n')
     path.chmod(0o700)
+    # Synthetic distribution files exercise pinning only; native tool
+    # execution is verified with a real pair in test_native_code_mode.py.
+    host = tmp_path / "codex-code-mode-host"
+    host.write_text("#!/bin/sh\nexit 0\n")
+    host.chmod(0o700)
     return path
 
 
