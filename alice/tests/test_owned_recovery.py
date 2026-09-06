@@ -168,14 +168,19 @@ def install_rpc(monkeypatch, rpc):
     return connect
 
 
-async def test_corrupt_business_databases_do_not_prevent_real_owned_process_cleanup(
+async def test_long_argv_owned_process_cleanup_preserves_corrupt_business_databases(
     config, monkeypatch
 ):
+    # A narrow caller environment must not hide the socket at the command tail.
+    # Recovery must still inspect the full command before signalling this group.
+    monkeypatch.setenv("COLUMNS", "80")
+    long_argument = "synthetic-padding-" + "x" * 8192
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-I",
         "-c",
         "import time; time.sleep(60)",
+        long_argument,
         str(config.codex_socket),
         start_new_session=True,
         stdin=subprocess.DEVNULL,
@@ -185,11 +190,14 @@ async def test_corrupt_business_databases_do_not_prevent_real_owned_process_clea
     )
     try:
         assert os.getpgid(process.pid) == process.pid
+        identity = service_module.process_identity(process.pid)
+        assert identity is not None
+        assert identity.endswith(str(config.codex_socket))
         state = recorded_state(
             config,
             process.pid,
             service_module.process_birth(process.pid),
-            service_module.process_identity(process.pid),
+            identity,
         )
         original_state = copy.deepcopy(state)
         original_files = preserve_fixture_data(config, state)

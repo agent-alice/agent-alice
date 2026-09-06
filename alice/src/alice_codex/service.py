@@ -36,7 +36,7 @@ from .store import DispatchReceipt, Store
 
 def process_identity(pid: int) -> str | None:
     result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="],
+        ["ps", "-ww", "-p", str(pid), "-o", "lstart=", "-o", "command="],
         capture_output=True,
         text=True,
         timeout=5,
