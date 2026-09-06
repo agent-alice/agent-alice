@@ -49,6 +49,7 @@ def parser() -> argparse.ArgumentParser:
     collect.add_argument("--max-items", type=int, default=2000)
     collect.add_argument("--expected-count", type=int)
     collect.add_argument("--independent", type=Path)
+    collect.add_argument("--max-age-seconds", type=float)
     for command in ("serve", "start", "status", "stop", "mcp", "intents", "doctor"):
         commands.add_parser(command)
     resources = commands.add_parser("resources").add_subparsers(dest="operation", required=True)
@@ -66,6 +67,19 @@ def parser() -> argparse.ArgumentParser:
     for command in ("pause", "resume", "chat", "task-status"):
         cmd = commands.add_parser(command)
         cmd.add_argument("--target", default="main" if command in {"chat", "task-status"} else None)
+    task_policy = commands.add_parser(
+        "task-policy", help="Inspect or explicitly extend persistent task limits"
+    ).add_subparsers(dest="operation", required=True)
+    policy_status = task_policy.add_parser("status")
+    policy_status.add_argument("--target", default="main")
+    policy_set = task_policy.add_parser("set")
+    policy_set.add_argument("--target", required=True)
+    policy_set.add_argument("--request-id", required=True)
+    policy_set.add_argument("--max-elapsed-seconds", type=float, required=True)
+    policy_set.add_argument("--max-attempts", type=int, required=True)
+    policy_set.add_argument("--max-retries", type=int, required=True)
+    policy_set.add_argument("--retry-wait-seconds", type=float, required=True)
+    policy_set.add_argument("--unchanged-wait-seconds", type=float, required=True)
     ask = commands.add_parser("ask")
     ask.add_argument("text")
     ask.add_argument("--target", default="main")
@@ -213,6 +227,7 @@ async def execute(args) -> dict | None:
             max_items=args.max_items,
             expected_count=args.expected_count,
             independent=read_json(args.independent) if args.independent else None,
+            max_age_seconds=args.max_age_seconds,
         )
         write_json(args.output, result)
         return {
@@ -264,6 +279,24 @@ async def execute(args) -> dict | None:
             npm_cli=args.npm_cli,
             browser_executable=args.browser_executable,
         )
+    if args.command == "task-policy":
+        params = {"target": args.target}
+        if args.operation == "set":
+            from dataclasses import asdict
+
+            from .resources import TaskPolicy
+
+            params["request_id"] = args.request_id
+            params["policy"] = asdict(
+                TaskPolicy(
+                    max_elapsed_seconds=args.max_elapsed_seconds,
+                    max_attempts=args.max_attempts,
+                    max_retries=args.max_retries,
+                    retry_wait_seconds=args.retry_wait_seconds,
+                    unchanged_wait_seconds=args.unchanged_wait_seconds,
+                )
+            )
+        return await request(config.control_socket, "task_policy_" + args.operation, params)
     if args.command == "resources":
         action, params = "resources_" + args.operation, {}
         if args.operation == "observation":
