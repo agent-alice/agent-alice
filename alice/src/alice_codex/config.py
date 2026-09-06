@@ -1,0 +1,390 @@
+"""Alice's explicit runtime configuration, pinned Codex and private state layout."""
+
+from collections.abc import MutableMapping
+from dataclasses import asdict, dataclass
+import hashlib
+import math
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tomllib
+
+import tomlkit
+from tomlkit.exceptions import ParseError
+from tomlkit.items import InlineTable
+
+from .files import atomic_write, private_dir, read_json, sha256_file, write_json
+
+
+CONFIG_VERSION = 1
+
+# Only these reviewed, Alice-owned local operations can run unattended. New MCP
+# tools keep Codex's approval default; explicit user resume remains a CLI action.
+UNATTENDED_TOOLS = (
+    "status",
+    "cron_create",
+    "cron_list",
+    "cron_update",
+    "cron_delete",
+    "task_start",
+    "task_status",
+    "autonomy_pause",
+    "memory_search",
+    "memory_read",
+    "memory_prepare_summary",
+    "memory_commit_summary",
+    "resources_status",
+    "resources_record_observation",
+)
+
+
+def _table(document: MutableMapping, *keys: str) -> MutableMapping:
+    """Update a managed table without replacing its unknown fields or trivia."""
+    current = document
+    for key in keys:
+        if key not in current:
+            current[key] = (
+                tomlkit.inline_table() if isinstance(current, InlineTable) else tomlkit.table()
+            )
+        current = current[key]
+        if not isinstance(current, MutableMapping):
+            raise ValueError(
+                "Codex managed configuration requires a table; original file preserved"
+            )
+    return current
+
+
+def default_home() -> Path:
+    return Path(os.environ.get("ALICE_HOME", "~/.local/share/alice")).expanduser().resolve()
+
+
+@dataclass
+class RuntimeConfig:
+    home: str
+    codex_binary: str
+    codex_version: str
+    codex_sha256: str
+    source_root: str | None = None
+    model: str = "gpt-6-astra"
+    reasoning_effort: str = "high"
+    timezone: str = "Asia/Shanghai"
+    poll_seconds: float = 5.0
+    max_active_tasks: int = 2
+    sandbox: str = "workspace-write"
+    network_access: bool = True
+    version: int = CONFIG_VERSION
+
+    @property
+    def root(self) -> Path:
+        return Path(self.home)
+
+    @property
+    def codex_home(self) -> Path:
+        return self.root / "codex"
+
+    @property
+    def workspace(self) -> Path:
+        return self.root / "workspace"
+
+    @property
+    def socket_dir(self) -> Path:
+        # macOS sockaddr_un is too short for many worktree/temp directory paths.
+        digest = hashlib.sha256(self.home.encode()).hexdigest()[:16]
+        return Path("/tmp") / f"alice-{os.getuid()}-{digest}"
+
+    @property
+    def control_socket(self) -> Path:
+        return self.socket_dir / "alice.sock"
+
+    @property
+    def codex_socket(self) -> Path:
+        return self.socket_dir / "codex.sock"
+
+    @property
+    def database(self) -> Path:
+        return self.root / "state" / "schedules.sqlite3"
+
+    def prepare_directories(self) -> None:
+        for path in (
+            self.root,
+            self.codex_home,
+            self.workspace,
+            self.root / "logs",
+            self.root / "state",
+            self.root / "releases",
+        ):
+            if path.is_symlink():
+                raise ValueError("Alice runtime directories must not be symbolic links")
+            private_dir(path)
+        for path in (self.workspace / ".agents", self.workspace / ".agents" / "skills"):
+            if path.is_symlink():
+                raise ValueError("Alice skill directories must not be symbolic links")
+            private_dir(path)
+        if self.socket_dir.is_symlink():
+            raise ValueError("Runtime socket directory must not be a symbolic link")
+        if self.socket_dir.exists() and self.socket_dir.stat().st_uid != os.getuid():
+            raise ValueError("Runtime socket directory belongs to another user")
+        private_dir(self.socket_dir)
+
+    def save(self) -> None:
+        self.validate()
+        write_json(self.root / "config.json", asdict(self))
+
+    def validate(self) -> None:
+        from zoneinfo import ZoneInfo
+
+        if self.version != CONFIG_VERSION:
+            raise ValueError(f"Unsupported Alice config version {self.version}")
+        if not Path(self.home).is_absolute() or not Path(self.codex_binary).is_absolute():
+            raise ValueError("Alice home and Codex binary must be absolute paths")
+        if (
+            type(self.poll_seconds) not in (float, int)
+            or not math.isfinite(self.poll_seconds)
+            or self.poll_seconds <= 0
+            or type(self.max_active_tasks) is not int
+            or self.max_active_tasks < 1
+        ):
+            raise ValueError("Polling interval and task limit must be positive")
+        if self.sandbox not in {"read-only", "workspace-write"}:
+            raise ValueError("Use a bounded read-only or workspace-write Alice runtime")
+        if type(self.network_access) is not bool:
+            raise ValueError("network_access must be an explicit boolean")
+        ZoneInfo(self.timezone)
+
+    def verify_binary(self) -> None:
+        binary = Path(self.codex_binary)
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise ValueError("Pinned Codex executable is missing or not executable")
+        if sha256_file(binary) != self.codex_sha256:
+            raise ValueError("Codex executable changed; validate a new version before using it")
+
+    def environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(self.codex_home)
+        env["ALICE_HOME"] = self.home
+        return env
+
+    def native_permission_params(self, *, workspace: Path | None = None) -> dict:
+        """Native thread/start/resume arguments, without a legacy sandbox override.
+
+        An optional workspace is for a separately host-owned task/test directory.
+        The caller must not supply model-selected or unowned paths here. The
+        profile retains normal filesystem read access and grants writes only to
+        the declared workspace and its skills; other metadata stays protected.
+        """
+        self.validate()
+        workspace = Path(workspace) if workspace is not None else self.workspace
+        if not workspace.is_absolute():
+            raise ValueError("Native permissions require an absolute workspace")
+        if any(
+            path.is_symlink()
+            for path in (workspace, workspace / ".agents", workspace / ".agents/skills")
+        ):
+            raise ValueError("Alice permission roots must not be symbolic links")
+        workspace = workspace.resolve()
+        filesystem = {"/": "read"}
+        if self.sandbox == "workspace-write":
+            filesystem[str(workspace)] = "write"
+            filesystem[str(workspace / ".agents/skills")] = "write"
+        profile = {
+            "extends": ":read-only",
+            "filesystem": filesystem,
+            "network": {"enabled": self.network_access},
+        }
+        return {"permissions": "alice", "config": {"permissions.alice": profile}}
+
+    def write_codex_config(self, *, python: str | None = None) -> None:
+        """Merge owned settings, preserving CLI-installed plugins/MCP and comments.
+
+        Invalid or concurrently edited input is never reset to defaults. Only
+        Alice's own MCP namespace has its unattended approval policy reconciled.
+        """
+        self.validate()
+        python = python or sys.executable
+        path = self.codex_home / "config.toml"
+        if self.codex_home.is_symlink() or path.is_symlink():
+            raise ValueError("Managed Codex configuration cannot be a symlink; original preserved")
+        original = path.read_bytes() if path.exists() else None
+        try:
+            document = (
+                tomlkit.parse(original.decode("utf-8"))
+                if original is not None
+                else tomlkit.document()
+            )
+        except (UnicodeError, ParseError) as exc:
+            raise ValueError("Invalid Codex TOML; original file preserved") from exc
+        if original is None:
+            document.add(
+                tomlkit.comment(
+                    "Alice-owned settings; local extensions and comments are preserved."
+                )
+            )
+        for key, value in {
+            "model": self.model,
+            "model_reasoning_effort": self.reasoning_effort,
+            "approval_policy": "on-request",
+            "default_permissions": "alice",
+            "cli_auth_credentials_store": "file",
+            "web_search": "live",
+        }.items():
+            document[key] = value
+        # Migrate only settings managed by the former Alice generator. Keep
+        # additional legacy fields and other named profiles for explicit use;
+        # native default_permissions selects the Alice profile for this runtime.
+        document.pop("sandbox_mode", None)
+        if "sandbox_workspace_write" in document:
+            legacy = _table(document, "sandbox_workspace_write")
+            legacy.pop("network_access", None)
+            if not legacy:
+                document.pop("sandbox_workspace_write")
+        profile = self.native_permission_params()["config"]["permissions.alice"]
+        managed = _table(document, "permissions", "alice")
+        if "extends" in managed and managed["extends"] != ":read-only":
+            raise ValueError(
+                "Conflicting permissions.alice inheritance; move custom rules to another profile; original file preserved"
+            )
+        managed["extends"] = profile["extends"]
+        filesystem = _table(managed, "filesystem")
+        managed_paths = {
+            "/",
+            str(self.workspace.resolve()),
+            str(self.workspace.resolve() / ".agents/skills"),
+        }
+        if set(filesystem) - managed_paths or "workspace_roots" in managed:
+            raise ValueError(
+                "Conflicting permissions.alice filesystem roots; move custom rules to another profile; original file preserved"
+            )
+        for key in list(filesystem):
+            if key not in profile["filesystem"]:
+                filesystem.pop(key)
+        for key, value in profile["filesystem"].items():
+            filesystem[key] = value
+        network = _table(managed, "network")
+        if set(network) - {"enabled"}:
+            raise ValueError(
+                "Conflicting permissions.alice network rules; move custom rules to another profile; original file preserved"
+            )
+        network["enabled"] = self.network_access
+        features = _table(document, "features")
+        for key, value in {
+            "goals": True,
+            "multi_agent_v2": True,
+            "memories": False,
+            "respect_system_proxy": True,
+        }.items():
+            features[key] = value
+        server = _table(document, "mcp_servers", "alice")
+        if "url" in server:
+            raise ValueError(
+                "Alice MCP must use its managed stdio transport; original file preserved"
+            )
+        for key, value in {
+            "command": python,
+            "args": ["-m", "alice_codex.mcp", "--home", self.home],
+            "enabled": True,
+            "required": True,
+            "startup_timeout_sec": 15,
+            "tool_timeout_sec": 120,
+            "default_tools_approval_mode": "prompt",
+        }.items():
+            server[key] = value
+        tools = _table(server, "tools")
+        for name in UNATTENDED_TOOLS:
+            _table(tools, name)["approval_mode"] = "approve"
+        for name in list(tools):
+            if name not in UNATTENDED_TOOLS:
+                # In particular, an earlier broad rule must not let a model
+                # call autonomy_resume without explicit human approval.
+                _table(tools, name)["approval_mode"] = "prompt"
+        _table(document, "projects", str(self.workspace))["trust_level"] = "trusted"
+        rendered = tomlkit.dumps(document).encode("utf-8")
+        try:
+            tomllib.loads(rendered.decode("utf-8"))
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError("Merged Codex TOML is invalid; original file preserved") from exc
+        if self.codex_home.is_symlink() or path.is_symlink():
+            raise ValueError("Codex configuration changed during update; original preserved")
+        current = path.read_bytes() if path.exists() else None
+        if current != original:
+            raise ValueError("Codex configuration changed during update; concurrent edit preserved")
+        if rendered != original:
+            atomic_write(path, rendered)
+
+
+def load_config(home: Path | str | None = None) -> RuntimeConfig:
+    home = Path(home).expanduser().resolve() if home is not None else default_home()
+    path = home / "config.json"
+    if not path.is_file():
+        raise ValueError(f"Alice is not initialized at {home}; run alice init first")
+    value = read_json(path)
+    if not isinstance(value, dict):
+        raise ValueError("Alice config must be an object")
+    try:
+        config = RuntimeConfig(**value)
+    except TypeError as error:
+        raise ValueError("Unsupported or missing Alice configuration fields") from error
+    config.validate()
+    if config.root.resolve() != home:
+        raise ValueError("Alice config belongs to a different data directory")
+    return config
+
+
+def initialize_config(
+    home: Path,
+    binary: Path,
+    *,
+    source_root: Path | None = None,
+    model: str = "gpt-6-astra",
+    pin_binary: bool = True,
+    login_home: Path | None = None,
+) -> RuntimeConfig:
+    """Initialize once; reuse login by a private link without inspecting its contents."""
+    home, binary = home.expanduser().resolve(), binary.expanduser().resolve()
+    if (home / "config.json").exists():
+        raise ValueError("Alice is already initialized; existing state was preserved")
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise ValueError("Provide an existing Codex executable")
+    result = subprocess.run(
+        [str(binary), "--version"], capture_output=True, text=True, check=True, timeout=15
+    )
+    version = result.stdout.strip()
+    if not version.startswith("codex-cli "):
+        raise ValueError("Executable did not identify itself as Codex CLI")
+    digest = sha256_file(binary)
+    private_dir(home)
+    if pin_binary:
+        destination = home / "bin" / f"codex-{digest[:16]}"
+        private_dir(destination.parent)
+        if not destination.exists():
+            temporary = destination.with_suffix(".candidate")
+            try:
+                shutil.copyfile(binary, temporary)
+                temporary.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+                if sha256_file(temporary) != digest:
+                    raise ValueError("Codex executable changed while being copied")
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+        binary = destination
+    config = RuntimeConfig(
+        home=str(home),
+        codex_binary=str(binary),
+        codex_version=version,
+        codex_sha256=digest,
+        source_root=str(source_root.resolve()) if source_root else None,
+        model=model,
+    )
+    config.prepare_directories()
+    if login_home is not None:
+        auth_source = login_home.expanduser().resolve() / "auth.json"
+        if not auth_source.is_file():
+            raise ValueError("No file-based Codex login exists at the selected login home")
+        auth_target = config.codex_home / "auth.json"
+        if not auth_target.exists():
+            auth_target.symlink_to(auth_source)
+    config.write_codex_config()
+    config.save()
+    return config

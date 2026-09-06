@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alice-codex"
+version = "0.1.0"
+description = "Alice continuity, scheduling and lifecycle integration for Codex CLI"
+requires-python = ">=3.11"
+dependencies = ["croniter==6.2.2", "websockets==16.0", "mcp==1.27.1", "tomlkit==0.13.3"]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1", "pytest-asyncio==1.4.0", "ruff==0.16.6", "build==1.6.0"]
+
+[project.scripts]
+alice = "alice_codex.cli:main"
+alice-codex = "alice_codex.cli:main"
+alice-mcp = "alice_codex.mcp:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+alice_codex = ["templates/**/*", "templates/.agents/skills/*/SKILL.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra"
+markers = [
+  "native: real Codex binary, no model inference unless also marked live",
+  "live: real model inference, explicitly selected and budgeted",
+  "artifact: installed wheel lifecycle and MCP acceptance gate",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
