@@ -21,6 +21,7 @@ _STRING_SPECIAL = re.compile(r'["\\\x00-\x1f]')
 _ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 _WHITESPACE = frozenset(" \t\r\n")
 _HEX = frozenset("0123456789abcdefABCDEF")
+_LINE_END = re.compile(b"[\r\n]")
 
 
 @dataclass(frozen=True)
@@ -345,8 +346,9 @@ def scan_records(path: str | Path) -> Iterator[RecordSpan]:
     """Yield original byte spans, checking complete JSONL records and short times.
 
     Markdown is one record numbered 0, even when empty. Other formats use physical
-    LF-delimited lines numbered from 1; only .jsonl is parsed as JSON. CRLF stays
-    byte-exact. Invalid records are drained to their line end and carry no trusted
+    universal-newline records numbered from 1, matching the existing source ID
+    reader; only .jsonl is parsed as JSON. LF, CRLF and bare CR stay byte-exact.
+    Invalid records are drained to their line end and carry no trusted
     metadata. An unterminated final line is included. JSON duplicate time keys,
     non-string time values, deep nesting and invalid UTF-8 are explicit errors.
     """
@@ -355,6 +357,7 @@ def scan_records(path: str | Path) -> Iterator[RecordSpan]:
     jsonl = path.suffix.lower() == ".jsonl"
     scanner = _RecordScanner(jsonl)
     line, start, offset = (0 if document else 1), 0, 0
+    pending_cr = False
     with path.open("rb") as stream:
         while block := stream.read(READ_BYTES):
             if document:
@@ -363,14 +366,29 @@ def scan_records(path: str | Path) -> Iterator[RecordSpan]:
                 continue
             position = 0
             while position < len(block):
-                newline = block.find(b"\n", position)
-                stop = len(block) if newline < 0 else newline + 1
+                if pending_cr:
+                    # Defer a CR until one following byte is available, even
+                    # across reads. CRLF belongs to one original record; a
+                    # non-LF byte belongs to the next record and is not consumed.
+                    if block[position] == 10:
+                        scanner.feed(block[position:position + 1])
+                        offset += 1
+                        position += 1
+                    yield scanner.finish(line, start, offset)
+                    line, start, scanner = line + 1, offset, _RecordScanner(jsonl)
+                    pending_cr = False
+                    continue
+                newline = _LINE_END.search(block, position)
+                stop = len(block) if newline is None else newline.end()
                 scanner.feed(block[position:stop])
                 offset += stop - position
                 position = stop
-                if newline >= 0:
-                    yield scanner.finish(line, start, offset)
-                    line, start, scanner = line + 1, offset, _RecordScanner(jsonl)
+                if newline is not None:
+                    if block[stop - 1] == 13:
+                        pending_cr = True
+                    else:
+                        yield scanner.finish(line, start, offset)
+                        line, start, scanner = line + 1, offset, _RecordScanner(jsonl)
         if document or offset > start:
             yield scanner.finish(line, start, offset)
 

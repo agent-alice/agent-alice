@@ -10,6 +10,7 @@ import tracemalloc
 import pytest
 
 from alice_codex import summary_stream as stream
+from alice_codex.memory import _record_slices, _source_id
 
 
 def source(tmp_path, raw, name="source.jsonl"):
@@ -42,6 +43,62 @@ def test_top_level_times_survive_utf8_escapes_and_crlf_across_blocks(tmp_path, m
         }),
         stream.RecordSpan(2, len(first), len(first + second)),
     ]
+
+
+@pytest.mark.parametrize("read_bytes", [1, 2, 7, 65536])
+@pytest.mark.parametrize("endings", [(b"\r",), (b"\r\n",), (b"\n", b"\r\n", b"\r")])
+def test_universal_newlines_keep_legacy_records_and_parent_source_ids(
+    tmp_path, monkeypatch, read_bytes, endings
+):
+    monkeypatch.setattr(stream, "READ_BYTES", read_bytes)
+    rows = [json.dumps({
+        "content": f"Record {index}: 中文🙂 with escaped \r and \n",
+        "timestamp": f"2026-09-01T00:{index % 60:02d}:00+08:00",
+    }, ensure_ascii=False).encode() + endings[index % len(endings)] for index in range(65)]
+    raw = b"".join(rows)
+    path = source(tmp_path, raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    legacy = list(_record_slices(path, len(raw)))
+    records = list(stream.scan_records(path))
+
+    assert len(legacy) == len(records) == len(rows)
+    expected_start = 0
+    for row, record, (number, text, total) in zip(rows, records, legacy):
+        assert record.byte_start == expected_start
+        assert record.byte_end == expected_start + len(row)
+        assert raw[record.byte_start:record.byte_end] == row
+        assert row.decode().replace("\r\n", "\n").replace("\r", "\n") == text
+        assert total == len(text) and record.line == number
+        assert record.metadata == {"timestamp": json.loads(text)["timestamp"]}
+        assert record.parse_error is None
+        assert _source_id("workspace", path.name, digest, record.line) == _source_id(
+            "workspace", path.name, digest, number
+        )
+        expected_start = record.byte_end
+    assert expected_start == len(raw)
+
+
+@pytest.mark.parametrize("read_bytes", [1, 2, 9, 65536])
+@pytest.mark.parametrize("raw", [
+    b"\r\r\n\n{}\r", b"{}\r{}", b'{"broken":"\r{}\r\n{}', b"\xff\r{}\r\n",
+])
+def test_universal_newlines_preserve_blank_bad_and_unterminated_records(
+    tmp_path, monkeypatch, read_bytes, raw
+):
+    monkeypatch.setattr(stream, "READ_BYTES", read_bytes)
+    path = source(tmp_path, raw)
+    legacy = list(_record_slices(path, len(raw)))
+    records = list(stream.scan_records(path))
+    assert len(records) == len(legacy)
+    position = 0
+    for record, (number, text, _) in zip(records, legacy):
+        assert record.byte_start == position and record.line == number
+        body = raw[record.byte_start:record.byte_end]
+        assert body.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n") == text
+        metadata, error = reference_metadata(body)
+        assert record.metadata == metadata and record.parse_error == error
+        position = record.byte_end
+    assert position == len(raw)
 
 
 @pytest.mark.parametrize("read_bytes", [1, 11, 65536])
