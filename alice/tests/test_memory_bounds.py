@@ -8,7 +8,7 @@ import tracemalloc
 
 import pytest
 
-from alice_codex.memory import MemoryStore, SummaryValidationError
+from alice_codex.memory import MemoryStore
 
 
 def sha256(path):
@@ -94,17 +94,20 @@ def test_unicode_invalid_bytes_and_newlines_keep_character_paging(tmp_path, suff
     assert store.read_source(hit["source_id"], offset_chars=len(expected) + 2)["content"] == ""
 
 
-def test_summary_rejects_oversized_record_without_truncating_archive(tmp_path):
+def test_summary_partitions_oversized_record_without_truncating_archive(tmp_path):
     store = MemoryStore(tmp_path / "data")
     path = store.workspace / "memory/chronicle/traces/2026-09-01.jsonl"
     path.parent.mkdir(parents=True)
     raw = json.dumps({"timestamp": "2026-09-01T00:30:00+08:00", "content": "x" * (2 * 1024 * 1024)})
     path.write_text(raw)
     before = sha256(path)
-    with pytest.raises(SummaryValidationError, match="partitioning"):
-        store.prepare_summary(
-            "L1", "2026-09-01T00:00", now=dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
-        )
+    batch = store.prepare_summary(
+        "L1", "2026-09-01T00:00", now=dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+    )
+    assert batch["strategy"] == "partitioned-v1"
+    frozen = Path(batch["manifest_path"]).parent / "files" / path.relative_to(store.workspace)
+    assert sha256(frozen) == before
+    assert store.summary_partition_next(batch["batch_id"])["total_nodes"] > 1
     assert sha256(path) == before
     assert not list(store.batches.iterdir())
 

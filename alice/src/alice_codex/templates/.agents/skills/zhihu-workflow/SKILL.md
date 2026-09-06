@@ -2,10 +2,12 @@
 name: zhihu-workflow
 description: Observe an explicitly scoped Zhihu collection, evaluate a question, prepare and verify an outgoing draft, and reconcile publication evidence without confusing partial API data or acknowledgements with success.
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 Use this for Zhihu observation, question research, drafting, and publication verification. The migrated collector performs GET requests only. It does not publish, solve authentication, or prove that the undocumented production API still works. Use the current user authorization for any external publication.
+
+Call Alice's `runtime_info` MCP tool for executable command arrays and the current package paths. Append the task's arguments to the relevant array and execute it directly, or quote every argument for a shell. Re-query after a runtime restart or reconnect; bare `python` may refer to a different environment. The tool describes its serving process, not a release approval.
 
 ## Establish what is observable
 
@@ -23,13 +25,13 @@ Inspect the question description and a bounded sample of existing answers before
 
 Avoid a legacy command collision: `scripts/zhihu.py answer <question_id> <content>` is a **write/publish** operation, despite an old topic-evaluation skill listing it as if it read answers. Do not invoke it for research.
 
-Create separate files for private notes and the public body. Run `python -m alice_codex.business check-draft draft.md`, then preview the final rendered payload and check its sources and assets. Run `check-draft` again against the exact outgoing text/HTML after conversion. Resolve every failure, including HTML/Markdown comments, encoded comments, placeholders, internal notes, frontmatter, and unresolved local assets. The check supplies a content hash and static lint results; it does not prove factual accuracy or correct rendering. Do not silently strip metadata and send the result unchecked.
+Create separate files for private notes and the public body. Append the draft's absolute path to `runtime_info.commands["check-draft"]`, run it, then preview the final rendered payload and check its sources and assets. Run the same check again against the exact outgoing text/HTML after conversion. Resolve every failure, including HTML/Markdown comments, encoded comments, placeholders, internal notes, frontmatter, and unresolved local assets. The check supplies a content hash and static lint results; it does not prove factual accuracy or correct rendering. Do not silently strip metadata and send the result unchecked.
 
 ## Reconcile an authorized publication
 
 Before a submission, preserve an intent containing `action_id`, exact `subject`, exact `target`, outgoing `content_sha256`, and any known external object ID. If an adapter does not exist or authorization is absent, deliver the checked draft and evidence. This skill and collector do not add a publisher.
 
-After an authorized submission, an HTTP 200/201 or returned ID is only an acknowledgement. Read the object back independently, verify the intended account/target, visible content and any assets, and retain external ID, source, and time. Use `python -m alice_codex.business reconcile-publication --intent intent.json --evidence evidence.json`. Read-back receipts require `kind=read_back`, `external_id`, `subject`, `target`, `content_sha256`, `visible`, and an action or known-object binding. Hash the same explicit public-body representation on both sides; if HTML normalization prevents a trustworthy match, keep the result unresolved and inspect it rather than inventing equivalence.
+After an authorized submission, an HTTP 200/201 or returned ID is only an acknowledgement. Read the object back independently, verify the intended account/target, visible content and any assets, and retain external ID, source, and time. Append `--intent <absolute intent path> --evidence <absolute evidence path>` to the returned `reconcile-publication` command array. Read-back receipts require `kind=read_back`, `external_id`, `subject`, `target`, `content_sha256`, `visible`, and an action or known-object binding. Hash the same explicit public-body representation on both sides; if HTML normalization prevents a trustworthy match, keep the result unresolved and inspect it rather than inventing equivalence.
 
 A timeout, ambiguous response, or missing read-back leaves the action unknown. Query the existing external ID or bounded recent objects and reconcile first. Do not repeat the publication just because no receipt was found. A same-text object without action/object binding is only a candidate. For edits, retain the original object identity; do not delete and recreate content as a recovery shortcut.
 

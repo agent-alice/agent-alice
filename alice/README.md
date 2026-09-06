@@ -190,14 +190,14 @@ alice release rollback
 alice start
 ```
 
-只激活同一受检产物。policy 5 报告绑定源码、依赖、主程序、Code Mode 宿主及产物 hash。候选保留自己的完整配对，原发行路径仅作来源记录；应用自动更新或原发行目录删除不会改变已固定候选。部署配置选中的实际两份文件必须与候选的两个 hash 一致，宿主漂移不能复用旧工具证据。源码变化需重新构建验证。回退只切换兼容代码版本，保留新增运行数据。
+只激活同一受检产物。policy 6 报告绑定源码、依赖、主程序、Code Mode 宿主及产物 hash。候选保留自己的完整配对，原发行路径仅作来源记录；应用自动更新或原发行目录删除不会改变已固定候选。部署配置选中的实际两份文件必须与候选的两个 hash 一致，宿主漂移不能复用旧工具证据。源码变化需重新构建验证。回退只切换兼容代码版本，保留新增运行数据。 新门禁还核对实际安装包的资源 epoch／身份重绑能力，并收集全部 artifact 测试；旧 policy 4／5 报告保留但不能授权新切换。详见 [发布兼容契约](specs/release-compatibility.md)。
 
 从旧 main-only 候选迁移时，使用包含上述命令的新 CLI，按以下顺序操作：
 
-1. `alice stop`；如已安装 supervisor，执行 `alice service uninstall` 并确认本实例卸载。旧 supervisor 尚安装时不能激活 policy 5，避免它使用旧门禁回退。
+1. `alice stop`；如已安装 supervisor，执行 `alice service uninstall` 并确认本实例卸载。旧 supervisor 尚安装时不能激活 policy 6，避免它使用旧门禁回退。
 2. `alice runtime repin --codex /path/to/complete-distribution/codex`，再运行 `alice runtime status` 和 `alice doctor`。配对失败会保留原配置，不继续切换。
 3. 构建并以 `--native` 验证新的候选，再激活。旧候选和原报告仍可读取，但须重新构建验收才能作为配对版本激活或回退；不会把旧报告标成新门槛通过。
-4. 再验证、激活第二个兼容的 policy 5 候选，建立可用的 previous，然后 `alice service install` 创建独立的新 supervisor。它同时绑定门禁版本和宿主 hash。
+4. 再验证、激活第二个兼容的 policy 6 候选，建立可用的 previous，然后 `alice service install` 创建独立的新 supervisor。它同时绑定门禁版本和宿主 hash。
 5. 验证启动与所需工具，再按业务意图显式 `alice resume`。缺少兼容 previous 或启动持续失败时安全停止，不恢复旧数据，也不退回未验收的 main-only 候选。
 
 如果第 2 至 4 步失败，保留候选、报告及业务数据，维持停止状态；不要安装旧 supervisor 绕过新门禁。旧报告是历史证据，不能替代此次配对验收。

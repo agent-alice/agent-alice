@@ -6,16 +6,18 @@ Codex remains the executor and authoritative store for conversation state.
 
 import asyncio
 from contextlib import suppress
+from copy import copy
 from dataclasses import asdict
 import hashlib
 import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import uuid
 
-from .codex import CodexClient
+from .codex import CodexClient, OwnershipError
 from .calendar import (
     prepare_dispatch,
     dispatch_completion,
@@ -28,11 +30,84 @@ from .control import MAX_MESSAGE
 from .files import SingletonLock, read_json, write_json
 from .memory import MemoryStore
 from .journal import NativeJournal
-from .heartbeat import CollectionSpec, HostHeartbeatAdapter, compare_receipts
+from .heartbeat import (
+    CollectionSpec,
+    HostHeartbeatAdapter,
+    compare_receipts,
+    parse_heartbeat_sources,
+)
+from .identity import (
+    IDENTITY_HOOK_COMPAT_VERSION,
+    build_identity_bundle,
+    validate_identity_hooks,
+    validate_identity_runtime_manifest,
+)
 from .resources import ResourceLedger
 from .rpc import RpcClient, RpcError
 from .scheduler import Scheduler, RejectedDispatch, DeferredDispatch
 from .store import DispatchReceipt, Store
+
+
+# Release guards must inspect the installed candidate, not infer compatibility
+# from runtime.version or ResourceLedger's schema alone.
+RESOURCE_EPOCH_CAPABILITY = 1
+RESOURCE_SHUTDOWN_DRAIN_TIMEOUT = 1.0
+NATIVE_SHUTDOWN_TERM_TIMEOUT = 10.0
+
+
+def validate_resource_epoch_journal(state: dict) -> None:
+    """Validate only the additive journal and its current-server reference.
+
+    No I/O or mutation; unrelated runtime fields and unknown additive keys are
+    left to their owners. A valid prepared record is accepted structurally;
+    Service startup separately refuses another spawn until it is reconciled.
+    """
+    if not isinstance(state, dict):
+        raise ValueError("Resource epoch validation requires a runtime object")
+    epochs = state.get("resource_epochs", {})
+    if not isinstance(epochs, dict):
+        raise ValueError("Invalid resource epoch journal; preserved for reconciliation")
+
+    def valid_server(server):
+        return (
+            isinstance(server, dict)
+            and type(server.get("pid")) is int
+            and server["pid"] > 0
+            and all(
+                isinstance(server.get(key), str) and server[key].strip()
+                for key in ("birth", "identity")
+            )
+        )
+
+    for epoch, record in epochs.items():
+        if (
+            not isinstance(epoch, str)
+            or not epoch.strip()
+            or len(epoch) > 2000
+            or not isinstance(record, dict)
+            or not isinstance(record.get("state"), str)
+            or record["state"] not in {"prepared", "bound", "aborted"}
+            or "server" not in record
+        ):
+            raise ValueError("Invalid resource epoch record; preserved for reconciliation")
+        if record["state"] == "bound":
+            if not valid_server(record["server"]):
+                raise ValueError("Invalid resource epoch binding; preserved for reconciliation")
+        elif record["server"] is not None:
+            raise ValueError("Unbound resource epoch has a server identity")
+    current = state.get("server")
+    if current is not None and not isinstance(current, dict):
+        raise ValueError("Invalid active server in resource epoch journal")
+    if isinstance(current, dict) and "resource_epoch_id" in current:
+        epoch_id = current["resource_epoch_id"]
+        record = epochs.get(epoch_id) if isinstance(epoch_id, str) else None
+        if (
+            not record
+            or record["state"] != "bound"
+            or not valid_server(current)
+            or any(record["server"][key] != current[key] for key in ("pid", "birth", "identity"))
+        ):
+            raise ValueError("Active resource epoch binding conflicts with server identity")
 
 
 def process_identity(pid: int) -> str | None:
@@ -168,8 +243,180 @@ async def recover_owned_server(config: RuntimeConfig, state: dict) -> None:
     raise RuntimeError("Owned orphan server did not exit")
 
 
+class _ResourceEpochListener:
+    """One connection's bounded observations, with immutable source attribution."""
+
+    MAX_PENDING = 256
+    MAX_BYTES = 1024 * 1024
+    RECONCILE_TIMEOUT = 5
+    RECONCILE_CLOSE_TIMEOUT = 1
+
+    def __init__(self, service, rpc, codex, epoch_id, durable_roots):
+        self.codex, self.epoch_id = codex, epoch_id
+        self._roots = set(durable_roots)
+        self._pending = []
+        self._bytes = 0
+        self._service = service
+        self._reconcile_ready = False
+        self._resolver = None
+        self._attempted = set()
+        self._closing = self._closed = False
+        self.error = None
+
+        # These closures capture this process's epoch/client, never the next
+        # values of Service.rpc, Service.codex or runtime.json's active server.
+        ledger = service.resources
+        self._record = lambda params: ledger.record_token_usage(params, epoch_id=epoch_id)
+        # Read-only view: share the captured client's native ancestry, but only
+        # trust roots whose host aliases were durably saved. Call owns() only;
+        # this view creates no listener and never performs control or close().
+        ownership = copy(codex)
+        ownership.owned_root_ids = self._roots
+        self._owned = ownership.owns
+        self._current = lambda: service.rpc is rpc and service.codex is codex
+
+    @property
+    def pending_count(self):
+        return len(self._pending)
+
+    def _fail(self, message):
+        self.error = self.error or message
+        # A stale failure is evidence about this observer; it cannot pause the
+        # replacement client's dispatch or write its lifecycle state.
+        if self._current():
+            prior = self._service.error
+            reason = f"{prior}; {self.error}" if prior and self.error not in prior else prior or self.error
+            self._service._fail(reason)
+
+    def confirm_roots(self, roots):
+        """Called only after the host has successfully saved these root aliases."""
+        self._roots.update(roots)
+        self.flush()
+
+    def start_reconciliation(self):
+        """Enable public reads only after this connection's initialize completes."""
+        self._reconcile_ready = True
+        self._schedule_reconciliation()
+
+    def _schedule_reconciliation(self):
+        if not self._reconcile_ready or self._closing or self._closed:
+            return
+        if self._resolver is not None and not self._resolver.done():
+            return
+        if any(params.get("threadId") not in self._attempted for params, _ in self._pending):
+            self._resolver = asyncio.create_task(self._reconcile(), name="alice-resource-ancestry")
+
+    async def _reconcile(self):
+        # One coalesced worker per captured client/epoch, never an RPC request
+        # inside the reader callback or a task per token. A still-unresolved ID
+        # gets one bounded attempt while pending; fresh native evidence can
+        # always resolve it synchronously. The original buffer bounds remain.
+        while not self._closing:
+            thread_id = next((params.get("threadId") for params, _ in self._pending
+                              if params.get("threadId") not in self._attempted), None)
+            if thread_id is None:
+                return
+            self._attempted.add(thread_id)
+            try:
+                await asyncio.wait_for(
+                    self.codex.reconcile_ownership(thread_id), timeout=self.RECONCILE_TIMEOUT
+                )
+            except (RpcError, OwnershipError, TimeoutError):
+                # Absence, contradictory metadata and unavailable reads are
+                # not ownership evidence. Retain observations for native events
+                # or explicit history discovery, and fail on the existing cap.
+                pass
+            except Exception:
+                self._fail("Native resource ancestry reconciliation failed")
+                return
+            self.flush()
+
+    async def close(self):
+        """After reader-tail drain, settle or cancel/await every captured read."""
+        self._closing = True
+        task = self._resolver
+        cancelled_during_cleanup = False
+        try:
+            if task is not None:
+                await asyncio.wait({task}, timeout=self.RECONCILE_CLOSE_TIMEOUT)
+        finally:
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                cleanup = asyncio.gather(task, return_exceptions=True)
+                while True:
+                    try:
+                        await asyncio.shield(cleanup)
+                        break
+                    except asyncio.CancelledError:
+                        # Cancellation of close must not interrupt the request's
+                        # own cleanup or leave a callback able to write later.
+                        cancelled_during_cleanup = True
+            self.flush()
+            if self._pending:
+                self._fail("Native resource observations remain unresolved at close")
+            self._closed = True
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError
+
+    def flush(self):
+        if self._closed:
+            return
+        remaining = []
+        for index, (params, size) in enumerate(self._pending):
+            try:
+                if self._owned(params.get("threadId")):
+                    self._record(params)
+                    self._bytes -= size
+                else:
+                    remaining.append((params, size))
+            except Exception:
+                # Retain this notification and the unprocessed suffix for a
+                # possible shutdown delivery; never discard a failed write.
+                self._pending = remaining + self._pending[index:]
+                self._fail("Native resource observations could not be persisted")
+                return
+        self._pending = remaining
+        self._attempted.intersection_update(params.get("threadId") for params, _ in remaining)
+        self._schedule_reconciliation()
+
+    def receive(self, event):
+        if self._closed:
+            return
+        try:
+            method = event.get("method")
+            if method == "thread/tokenUsage/updated":
+                payload = json.dumps(
+                    event.get("params", {}), allow_nan=False, separators=(",", ":")
+                )
+                size = len(payload.encode())
+                if len(self._pending) >= self.MAX_PENDING or self._bytes + size > self.MAX_BYTES:
+                    raise RuntimeError("Unresolved token observation buffer is full")
+                self._pending.append((json.loads(payload), size))
+                self._bytes += size
+                self.flush()
+            elif method == "thread/started":
+                # CodexClient's listener runs first and remembers native ancestry.
+                self.flush()
+            elif method == "item/completed":
+                item = event.get("params", {}).get("item", {})
+                if item.get("type") == "subAgentActivity" and item.get("kind") == "started":
+                    self.flush()
+                if self._current():
+                    self._service._on_notification(event)
+            elif self._current():
+                # Stale transport callbacks must not update a newer task lifecycle.
+                self._service._on_notification(event)
+        except Exception:
+            # RpcClient isolates listener exceptions; explicitly stop dispatch.
+            self._fail("Native resource observation buffer could not be preserved")
+
+
 class Service:
     def __init__(self, config: RuntimeConfig):
+        # Validate the complete source configuration before opening business
+        # stores or starting native work, including direct embedded callers.
+        heartbeat_sources = parse_heartbeat_sources(config.heartbeat_sources)
         self.config = config
         self.path = config.root / "state/runtime.json"
         self.state = (
@@ -190,6 +437,7 @@ class Service:
             or not isinstance(self.state.get("intents"), dict)
         ):
             raise ValueError("Unsupported or damaged runtime state; preserved for recovery")
+        self._validate_resource_epochs()
         self.store = Store(config.database)
         self.memory = MemoryStore(config.root)
         self.resources = ResourceLedger(config.root / "state/resources.sqlite3")
@@ -199,6 +447,10 @@ class Service:
         self._heartbeat_scopes: dict[str, str] = {}
         self._heartbeat_next: dict[str, float] = {}
         self._heartbeat_collection_rejected: dict[str, bool] = {}
+        for source in heartbeat_sources:
+            self.register_heartbeat_source(
+                source.target, source.spec, wait_seconds=source.wait_seconds
+            )
         consumed = self.state.get("heartbeat_consumed", {})
         if not isinstance(consumed, dict):
             raise ValueError("Damaged heartbeat consumption state; preserved for recovery")
@@ -211,6 +463,11 @@ class Service:
         self.codex: CodexClient | None = None
         self.journal: NativeJournal | None = None
         self.process: asyncio.subprocess.Process | None = None
+        self._bound_resource_epoch: str | None = None
+        self._resource_observer: _ResourceEpochListener | None = None
+        self._resource_durable_roots = {task["thread_id"] for task in self.state["tasks"].values()}
+        self._starting_resource_epoch: str | None = None
+        self._spawn_attempted = False
         self.ready = False
         self.stopping = False
         self.error: str | None = None
@@ -229,6 +486,104 @@ class Service:
     def save(self) -> None:
         write_json(self.path, self.state)
 
+    def _validate_resource_epochs(self):
+        validate_resource_epoch_journal(self.state)
+
+    def _prepare_resource_epoch(self):
+        epochs = self.state.get("resource_epochs", {})
+        if any(record["state"] == "prepared" for record in epochs.values()):
+            raise RuntimeError(
+                "Unbound resource epoch requires reconciliation before another spawn"
+            )
+        epoch = str(uuid.uuid4())
+        previous = {key: self.state.get(key) for key in ("server", "lifecycle", "resource_epochs")}
+        self.state["resource_epochs"] = {**epochs, epoch: {"state": "prepared", "server": None}}
+        self.state["lifecycle"], self.state["server"] = "starting", None
+        try:
+            self.save()
+        except BaseException:
+            for key, value in previous.items():
+                if key == "resource_epochs" and value is None:
+                    self.state.pop(key, None)
+                else:
+                    self.state[key] = value
+            raise
+        self._starting_resource_epoch = epoch
+        self._bound_resource_epoch = None
+        self._spawn_attempted = False
+        return epoch
+
+    def _bind_resource_epoch(self, epoch_id):
+        if self.state.get("resource_epochs", {}).get(epoch_id) != {
+            "state": "prepared",
+            "server": None,
+        }:
+            raise RuntimeError("Resource epoch was not prepared for this spawn")
+        if self.process is None or self.process.returncode is not None:
+            raise RuntimeError("Cannot bind a resource epoch without a live owned child")
+        server = {
+            "pid": self.process.pid,
+            "identity": process_identity(self.process.pid),
+            "birth": process_birth(self.process.pid),
+        }
+        if (
+            not server["identity"]
+            or not server["birth"]
+            or os.getpgid(self.process.pid) != self.process.pid
+        ):
+            raise RuntimeError("Cannot verify the resource epoch's owned process identity")
+        self.state["server"] = {**server, "resource_epoch_id": epoch_id}
+        self.state["resource_epochs"][epoch_id] = {"state": "bound", "server": server}
+        try:
+            self.save()
+        except BaseException:
+            # Keep the known child identity for cleanup, without claiming an
+            # acknowledged epoch binding on a subsequent shutdown save.
+            self.state["server"] = server
+            self.state["resource_epochs"][epoch_id] = {"state": "prepared", "server": None}
+            raise
+        self._bound_resource_epoch = epoch_id
+        self._resource_durable_roots.update(
+            task["thread_id"] for task in self.state["tasks"].values()
+        )
+
+    def _attach_resource_listener(self, rpc, codex, epoch_id):
+        active = self.state.get("server") or {}
+        record = self.state.get("resource_epochs", {}).get(epoch_id, {})
+        if (
+            not epoch_id
+            or epoch_id != self._bound_resource_epoch
+            or active.get("resource_epoch_id") != epoch_id
+            or record.get("state") != "bound"
+            or record.get("server")
+            != {key: active.get(key) for key in ("pid", "birth", "identity")}
+            or self.process is None
+            or self.process.returncode is not None
+            or self.process.pid != active.get("pid")
+        ):
+            raise RuntimeError("Resource listener requires a durably bound process epoch")
+        observer = _ResourceEpochListener(self, rpc, codex, epoch_id, self._resource_durable_roots)
+        # No await between subscribing and replaying the connection's retained
+        # prefix. A missing prefix cannot be silently treated as no observations.
+        rpc.add_listener(observer.receive)
+        self._resource_observer = observer
+        retained = list(rpc.events)
+        if rpc.event_sequence and (not retained or retained[0].sequence != 1):
+            self._fail("Native resource notifications have an unobserved connection prefix")
+            raise RuntimeError("Resource notification prefix is unavailable")
+        for event in retained:
+            codex._on_event(event.message)  # Replay native ancestry through its existing owner.
+            observer.receive(event.message)
+        return observer
+
+    def _confirm_resource_roots(self):
+        self._resource_durable_roots.update(
+            task["thread_id"] for task in self.state["tasks"].values()
+        )
+        observer = self._resource_observer
+        if observer is not None and observer.codex is self.codex:
+            observer.confirm_roots(self._resource_durable_roots)
+
     def _lock(self, key: str) -> asyncio.Lock:
         return self._task_locks.setdefault(key, asyncio.Lock())
 
@@ -243,13 +598,18 @@ class Service:
                 self.store.set_autonomy_paused(True)
             await self._recover_orphan()
             self._recover_task_policy_usage()
-            self.state["lifecycle"] = "starting"
-            self.state["server"] = None
-            self.save()
+            identity_manifest = self.config.root / "state/identity-runtime.json"
+            if identity_manifest.exists():
+                prior_identity = read_json(identity_manifest)
+                validate_identity_runtime_manifest(prior_identity)
+            identity = build_identity_bundle(self.config.workspace)
+            self.config.write_identity_config(identity)
+            epoch_id = self._prepare_resource_epoch()
             self.config.codex_socket.unlink(missing_ok=True)
             self.config.control_socket.unlink(missing_ok=True)
             log = open(self.config.root / "logs/codex-server.log", "ab", buffering=0)
             try:
+                self._spawn_attempted = True
                 self.process = await asyncio.create_subprocess_exec(
                     self.config.codex_binary,
                     "app-server",
@@ -262,12 +622,7 @@ class Service:
                     stderr=log,
                     start_new_session=True,
                 )
-                self.state["server"] = {
-                    "pid": self.process.pid,
-                    "identity": process_identity(self.process.pid),
-                    "birth": process_birth(self.process.pid),
-                }
-                self.save()
+                self._bind_resource_epoch(epoch_id)
                 deadline = time.monotonic() + 30
                 while True:
                     if self.process.returncode is not None:
@@ -285,14 +640,48 @@ class Service:
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Owned Codex App Server did not become ready")
                     await asyncio.sleep(0.1)
-                await self.rpc.initialize()
                 self.codex = CodexClient(
                     self.rpc,
-                    owned_root_ids=[task["thread_id"] for task in self.state["tasks"].values()],
+                    owned_root_ids=list(self._resource_durable_roots),
                 )
+                self._attach_resource_listener(self.rpc, self.codex, epoch_id)
                 self.journal = NativeJournal(self.memory, self.rpc, self.codex.owns)
-                self.rpc.add_listener(self._on_notification)
+                await self.rpc.initialize()
+                self._resource_observer.start_reconciliation()
+                if self.stopping:
+                    raise RuntimeError(self.error or "Native resource startup failed")
+                listing = await self.rpc.request(
+                    "hooks/list", {"cwds": [str(self.config.workspace)]}
+                )
+                self.config.trust_identity_hooks(listing)
+                trusted_hashes = validate_identity_hooks(
+                    await self.rpc.request("hooks/list", {"cwds": [str(self.config.workspace)]}),
+                    self.config.codex_home / "config.toml",
+                    self.config.workspace,
+                    self.config.identity_hooks(),
+                    require_trusted=True,
+                )
+                write_json(
+                    identity_manifest,
+                    {
+                        "version": 1,
+                        "hook_compat_version": IDENTITY_HOOK_COMPAT_VERSION,
+                        "python": sys.executable,
+                        "workspace": str(self.config.workspace),
+                        "config_path": str(self.config.codex_home / "config.toml"),
+                        "bundle": identity.metadata(),
+                        "hook_state": trusted_hashes,
+                    },
+                )
+                self.state["identity"] = {
+                    **identity.metadata(),
+                    "canonical": "configured",
+                    "hooks": "trusted_before_thread_load",
+                }
+                self.save()
                 await self.archive_native_history("startup")
+                if self.stopping:
+                    raise RuntimeError(self.error or "Native resource startup failed")
                 server = await asyncio.start_unix_server(
                     self._control_client, str(self.config.control_socket), limit=MAX_MESSAGE
                 )
@@ -318,6 +707,15 @@ class Service:
                 await self._shutdown(log)
 
     async def _shutdown(self, log) -> None:
+        # Shutdown must retain this epoch's transport and ancestry listener,
+        # even if a later connection replaces the Service's current fields.
+        rpc, codex, process = self.rpc, self.codex, self.process
+        observer = self._resource_observer
+        if observer is not None and observer.codex is not codex:
+            observer = None
+        starting_epoch = self._starting_resource_epoch
+        spawn_attempted = self._spawn_attempted
+        cancelled_while_reaping = False
         try:
             # Shutdown never means that externally published work was undone.
             try:
@@ -326,34 +724,99 @@ class Service:
                 self.save()
             except Exception as error:
                 self.error = f"Pause persistence failed: {type(error).__name__}"
-            if self.codex:
+            if codex:
                 for key in list(self.state["tasks"]):
                     try:
-                        await self._stop_task(key, timeout=8)
+                        await self._stop_task(key, codex=codex, timeout=8)
                     except Exception as error:
                         self.error = (
                             f"Shutdown required owned-server termination: {type(error).__name__}"
                         )
-                if self.journal:
+                if self.journal and self.rpc is rpc and self.codex is codex:
                     await self.archive_native_history("shutdown")
-                self.codex.close()
         finally:
             try:
-                if self.rpc:
-                    with suppress(Exception):
-                        await self.rpc.close()
-                if self.process and self.process.returncode is None:
-                    with suppress(ProcessLookupError):
-                        os.killpg(self.process.pid, signal.SIGTERM)
+                try:
+                    if process and process.returncode is None:
+
+                        async def terminate_owned_child():
+                            with suppress(ProcessLookupError):
+                                os.killpg(process.pid, signal.SIGTERM)
+                            try:
+                                await asyncio.wait_for(process.wait(), NATIVE_SHUTDOWN_TERM_TIMEOUT)
+                            except TimeoutError:
+                                with suppress(ProcessLookupError):
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                await process.wait()
+
+                        termination = asyncio.create_task(terminate_owned_child())
+                        while True:
+                            try:
+                                await asyncio.shield(termination)
+                                break
+                            except asyncio.CancelledError:
+                                if termination.cancelled():
+                                    raise
+                                # Cancellation cannot orphan the child by
+                                # cancelling its only wait. Escalate this owned
+                                # process, finish reaping, then propagate below.
+                                cancelled_while_reaping = True
+                                if process.returncode is None:
+                                    with suppress(ProcessLookupError):
+                                        os.killpg(process.pid, signal.SIGKILL)
+                    # The OS child is already reaped. Buffered frames can still
+                    # be waiting for the RPC reader; leave both listeners alive
+                    # until that reader finishes or this bounded wait expires.
+                    if rpc:
+                        try:
+                            drained = await rpc.wait_reader_closed(
+                                timeout=RESOURCE_SHUTDOWN_DRAIN_TIMEOUT
+                            )
+                            reason = None if drained else "Native notification tail drain timed out"
+                        except Exception as error:
+                            reason = (
+                                f"Native notification tail drain failed: {type(error).__name__}"
+                            )
+                        if reason:
+                            self.error = f"{self.error}; {reason}" if self.error else reason
+                            # A fixed, content-free diagnostic remains in the
+                            # private server log after this Service exits.
+                            with suppress(OSError):
+                                log.write(f"Alice resource shutdown: {reason}\n".encode())
+                finally:
                     try:
-                        await asyncio.wait_for(self.process.wait(), 10)
-                    except TimeoutError:
-                        with suppress(ProcessLookupError):
-                            os.killpg(self.process.pid, signal.SIGKILL)
-                        await self.process.wait()
+                        try:
+                            if observer:
+                                try:
+                                    await observer.close()
+                                finally:
+                                    if observer.error:
+                                        with suppress(OSError):
+                                            log.write(
+                                                f"Alice resource shutdown: {observer.error}\n".encode()
+                                            )
+                        finally:
+                            if codex:
+                                codex.close()
+                    finally:
+                        if rpc:
+                            with suppress(Exception):
+                                await rpc.close()
                 self.state["lifecycle"] = "stopped"
                 self.state["server"] = None
+                epoch = self.state.get("resource_epochs", {}).get(starting_epoch)
+                if (
+                    epoch
+                    and epoch["state"] == "prepared"
+                    and (
+                        not spawn_attempted
+                        or (process is not None and process.returncode is not None)
+                    )
+                ):
+                    epoch["state"] = "aborted"
                 self.save()
+                if cancelled_while_reaping:
+                    raise asyncio.CancelledError
             finally:
                 try:
                     self.config.control_socket.unlink(missing_ok=True)
@@ -371,6 +834,9 @@ class Service:
             self.store.set_autonomy_paused(True)
 
     def _on_notification(self, event: dict) -> None:
+        if event.get("method") == "thread/tokenUsage/updated":
+            self._fail("Native resource notification has no bound epoch listener")
+            return
         if event.get("method") not in {
             "turn/started",
             "turn/completed",
@@ -410,21 +876,17 @@ class Service:
             except Exception:
                 self._fail("Native input ownership could not be persisted")
                 return
-        if event["method"] in {"thread/tokenUsage/updated", "account/rateLimits/updated"}:
+        if event["method"] == "account/rateLimits/updated":
             try:
                 # Keep receiving accounting through native interruption, even
                 # after the asynchronous transcript worker has been cancelled.
-                if event["method"] == "thread/tokenUsage/updated":
-                    if self.codex and self.codex.owns(params.get("threadId")):
-                        self.resources.record_token_usage(params)
-                else:
-                    snapshot = params.get("rateLimits")
-                    limit_id = snapshot.get("limitId") if isinstance(snapshot, dict) else None
-                    observed = {"rateLimits": snapshot}
-                    if limit_id:
-                        observed["rateLimitsByLimitId"] = {limit_id: snapshot}
-                    self.resources.record_rate_limits(observed)
-                    self._mark_resource_pauses()
+                snapshot = params.get("rateLimits")
+                limit_id = snapshot.get("limitId") if isinstance(snapshot, dict) else None
+                observed = {"rateLimits": snapshot}
+                if limit_id:
+                    observed["rateLimitsByLimitId"] = {limit_id: snapshot}
+                self.resources.record_rate_limits(observed)
+                self._mark_resource_pauses()
             except Exception:
                 self._fail("Native resource observations could not be persisted")
             return
@@ -514,6 +976,8 @@ class Service:
             }
         self.state["journal"] = {"reason": reason, "observed_at": time.time(), **report}
         self.save()
+        if self._resource_observer is not None and self._resource_observer.codex is self.codex:
+            self._resource_observer.flush()
 
     def _complete_turn(self, thread: str, turn: dict) -> None:
         for intent_id, intent in self.state["intents"].items():
@@ -715,8 +1179,8 @@ class Service:
         """Internal host registration; no control/MCP operation accepts sources.
 
         The interval is explicit and independent of a task's lifetime budget.
-        Production hosts must register again on restart; persisted receipts do
-        not grant permission to contact their old source.
+        Construction restores explicit local configuration once per process;
+        persisted receipts alone never authorize contacting an old source.
         """
         import math
 
@@ -955,6 +1419,7 @@ class Service:
         if not isinstance(key, str) or not key or len(key) > 150:
             raise ValueError("Task name must contain 1–150 characters")
         async with self._lock("thread:" + key):
+            identity = build_identity_bundle(self.config.workspace)
             task = self.state["tasks"].get(key)
             if task:
                 try:
@@ -973,6 +1438,7 @@ class Service:
                             task["thread_id"],
                             cwd=str(self.config.workspace),
                             model=self.config.model,
+                            developerInstructions=identity.developer_instructions,
                             **self.config.native_permission_params(),
                         )
                     status = result["thread"].get("status", {}).get("type")
@@ -981,6 +1447,7 @@ class Service:
                             task["thread_id"],
                             cwd=str(self.config.workspace),
                             model=self.config.model,
+                            developerInstructions=identity.developer_instructions,
                             **self.config.native_permission_params(),
                         )
                 except RpcError as error:
@@ -1014,13 +1481,7 @@ class Service:
                 model=self.config.model,
                 approvalPolicy="never",
                 **self.config.native_permission_params(),
-                developerInstructions=(
-                    "You are Alice. Read AGENTS.md, SOUL.md, USER.md and "
-                    "memory/MEMORY.md before substantive work. Retrieve older experience on demand "
-                    "using alice memory tools; do not fill context with the archive. "
-                    "Use native Codex execution, compaction and collaboration. "
-                    "Only explicit user goals authorize creating a persistent Goal."
-                ),
+                developerInstructions=identity.developer_instructions,
             )
             if task:
                 if self._thread_has_input(task):
@@ -1031,6 +1492,7 @@ class Service:
                 "thread_id": result["thread"]["id"],
                 "paused": bool(task and task.get("paused")),
                 "created_at": time.time(),
+                "identity": {**identity.metadata(), "canonical": "new_thread_requested"},
                 "has_input": False,
                 "bootstrap": {
                     "version": 1,
@@ -1039,7 +1501,12 @@ class Service:
                 },
             }
             self.state["tasks"][key] = task
-            self.save()  # Preserve the alias before the first native history write.
+            try:
+                self.save()  # Preserve the alias before admitting its early token observations.
+            except Exception:
+                self._fail("Native resource root ownership could not be persisted")
+                raise
+            self._confirm_resource_roots()
             await self._bootstrap_thread(task, result["thread"], fresh=True)
             return task
 
@@ -1598,6 +2065,10 @@ class Service:
             return self.memory.prepare_summary(**params)
         if action == "memory_commit":
             return self.memory.commit_summary(**params)
+        if action == "summary_partition_next":
+            return self.memory.summary_partition_next(**params)
+        if action == "commit_summary_partition":
+            return self.memory.commit_summary_partition(**params)
         if action == "resources_status":
             return self.resources.status()
         if action == "resources_refresh":

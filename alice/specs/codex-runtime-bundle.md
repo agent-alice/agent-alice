@@ -33,7 +33,7 @@ original distribution directory.
 - `invalid`: a recorded pair is missing, changed or inconsistent.
 
 These states do not claim successful tool execution. `native_verified` remains
-false in this file-integrity interface. Release policy 5 requires a recorded
+false in this file-integrity interface. Release policy 6 requires a recorded
 pair and separates native protocol checks from the mandatory `native_pair`
 check in `tests/test_native_code_mode.py`. Without explicit `--native`, ordinary
 checks may pass but the candidate remains `promotable=false`. The native pair
@@ -94,15 +94,15 @@ implementation, avoiding a second acquisition of the same service lock.
 
 If the original primary has changed, select an archived complete distribution
 with the recorded hash. This migration does not authorize a different Codex
-version. Build and validate a new release for an upgrade. Policy 5 candidates
+version. Build and validate a new release for an upgrade. Policy 6 candidates
 freeze their own complete pair and bind both hashes in the manifest and verified
 report. Their original distribution paths are provenance only. If runtime
 configuration exists, its actual recorded pair must match both candidate hashes;
 a missing, damaged or different valid host cannot reuse previous tool evidence.
 
 Old candidates and reports remain readable, but cannot be promoted or used for
-automatic rollback under policy 5. Stop and uninstall an older supervisor before
-activating a new candidate. Verify and activate two compatible policy 5 candidates
+automatic rollback under policy 6. Stop and uninstall an older supervisor before
+activating a new candidate. Verify and activate two compatible policy 6 candidates
 to establish a usable previous, then install a new independent supervisor; its
 metadata binds the release policy and host hash. If any step fails, retain the
 old files and reports, keep the runtime stopped and diagnose the failure. Do not
@@ -114,3 +114,8 @@ Code Mode availability; copying a missing file beside a running process does
 not establish that its existing sessions have recovered. Optional browser MCP,
 Node, third-party tools and Desktop capabilities retain their own dependency
 and lifecycle requirements.
+
+Policy 6 additionally binds installed resource-epoch and identity-rebinding
+capabilities, and collects every required artifact test. See
+[release compatibility](release-compatibility.md) for the independent supervisor
+and data-footprint checks. Earlier policy 5 reports remain historical evidence.

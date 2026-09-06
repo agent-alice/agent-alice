@@ -1,7 +1,9 @@
 """Stdio MCP tools delegate to Alice's single private control service."""
 
 import argparse
+from importlib import resources
 from pathlib import Path
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
@@ -22,6 +24,37 @@ def create_server(home: Path) -> FastMCP:
     async def status() -> dict:
         """Inspect runtime, task roots, persisted pause and pinned Codex version."""
         return await call("status")
+
+    @server.tool()
+    async def runtime_info() -> dict:
+        """Get argument arrays for the Alice package serving this MCP connection.
+
+        Execute arrays directly, or quote each argument for a shell; never use
+        bare python or resolve away the virtualenv interpreter symlink. Refresh
+        after reconnect/restart. This is process metadata, not release approval.
+        Learning inputs are public synthetic regression cases, not a transfer test.
+        """
+        python = str(Path(sys.executable).absolute())
+        prefix = [python, "-I", "-m"]
+        cases = resources.files("alice_codex").joinpath("learning_cases")
+        return {
+            "schema_version": 1,
+            "environment_source": "running_mcp_process",
+            "python": python,
+            "package_path": str(Path(__file__).absolute().parent),
+            "workspace": str(config.workspace),
+            "commands": {
+                name: [*prefix, "alice_codex.business", name]
+                for name in ("check-draft", "summarize-observation", "reconcile-publication")
+            } | {
+                "collect": [*prefix, "alice_codex", "--home", config.home, "collect"],
+                "evaluate": [*prefix, "alice_codex.evaluation"],
+            },
+            "learning_inputs": {
+                name: str(cases.joinpath(name + ".json"))
+                for name in ("tasks", "oracle", "correction")
+            },
+        }
 
     @server.tool()
     async def cron_create(
@@ -118,6 +151,8 @@ def create_server(home: Path) -> FastMCP:
 
         L1 YYYY-MM-DDTHH:00 even hour; L2 YYYY-MM-DD; L3 YYYY-Www; L4 YYYY-MM.
         Read sources and write candidate; never fabricate missing coverage.
+        For strategy=partitioned-v1, follow the returned coordinator prompt and
+        use memory_summary_partition_next plus memory_commit_summary_partition.
         """
         return await call("memory_prepare", level=level, period=period, timezone=timezone)
 
@@ -129,6 +164,28 @@ def create_server(home: Path) -> FastMCP:
         checks structure/provenance, not the truth of a model's interpretation.
         """
         return await call("memory_commit", batch_id=batch_id, candidate=candidate)
+
+    @server.tool()
+    async def memory_summary_partition_next(batch_id: str, limit: int = 4) -> dict:
+        """Read ready bounded summary nodes and the host's whole-batch completion state.
+
+        This is not a claim or a new model task. Dispatch each node_id at most once
+        concurrently through native Codex children; committed nodes are omitted.
+        An empty ready list alone does not establish completion or permit replay.
+        """
+        return await call("summary_partition_next", batch_id=batch_id, limit=limit)
+
+    @server.tool()
+    async def memory_commit_summary_partition(batch_id: str, node_id: str, candidate: dict) -> dict:
+        """Validate and commit one immutable summary node, idempotently.
+
+        Use the four candidate fields from its prompt, with content at most 16 KiB.
+        Only host complete=true establishes final whole-window commit. A child
+        success claim or an intermediate node receipt is not whole-batch completion.
+        """
+        return await call(
+            "commit_summary_partition", batch_id=batch_id, node_id=node_id, candidate=candidate
+        )
 
     @server.tool()
     async def resources_status() -> dict:

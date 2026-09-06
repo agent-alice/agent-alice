@@ -1,8 +1,8 @@
 """Exercise the independent oracle with deliberately wrong synthetic candidates."""
 
 import copy
+from importlib import resources
 import json
-from pathlib import Path
 import subprocess
 import sys
 
@@ -11,7 +11,7 @@ import pytest
 from alice_codex import business, evaluation
 
 
-FIXTURES = Path(__file__).parent / "fixtures" / "observation_learning"
+FIXTURES = resources.files("alice_codex").joinpath("learning_cases")
 
 
 @pytest.fixture

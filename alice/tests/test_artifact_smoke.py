@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import time
+import tomllib
 
 import pytest
 
@@ -147,15 +148,16 @@ print(json.dumps({name: root.joinpath(name, 'SKILL.md').read_text() for name in 
 
 
 async def mcp_roundtrip(runtime):
+    configured = tomllib.loads(
+        (runtime["home"] / "codex/config.toml").read_text()
+    )["mcp_servers"]["alice"]
+    shadow = runtime["cwd"] / "shadow" / "alice_codex"
+    shadow.mkdir(parents=True)
+    (shadow / "__init__.py").write_text("raise RuntimeError('untrusted cwd package imported')\n")
     process = await asyncio.create_subprocess_exec(
-        runtime["python"],
-        "-I",
-        "-m",
-        "alice_codex.mcp",
-        "--home",
-        str(runtime["home"]),
-        cwd=runtime["cwd"],
-        env=runtime["env"],
+        configured["command"], *configured["args"],
+        cwd=shadow.parent,
+        env={**runtime["env"], "PYTHONPATH": str(shadow.parent)},
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -217,6 +219,8 @@ async def mcp_roundtrip(runtime):
         )
         jobs = structured(await call(4, "tools/call", {"name": "cron_list", "arguments": {}}))
         assert any(job["id"] == created["id"] and not job["enabled"] for job in jobs["jobs"])
+        info = structured(await call(5, "tools/call", {"name": "runtime_info", "arguments": {}}))
+        verify_runtime_commands(runtime, info)
         return created["id"]
     finally:
         process.stdin.close()
@@ -226,6 +230,48 @@ async def mcp_roundtrip(runtime):
             process.kill()
             await process.wait()
         assert process.returncode == 0, (await process.stderr.read()).decode()
+
+
+def verify_runtime_commands(runtime, info):
+    """Run MCP-discovered installed commands with no source checkout on sys.path."""
+    assert info["environment_source"] == "running_mcp_process"
+    assert info["python"] == runtime["python"]
+    package = Path(info["package_path"])
+    assert package.is_relative_to(Path(runtime["python"]).parent.parent)
+    assert Path(info["workspace"]) == runtime["home"] / "workspace"
+    shadow = runtime["cwd"] / "shadow" / "alice_codex"
+    shadow.mkdir(parents=True, exist_ok=True)
+    (shadow / "__init__.py").write_text("raise RuntimeError('untrusted cwd package imported')\n")
+    env = {**runtime["env"], "PYTHONPATH": str(shadow.parent)}
+
+    def run(name, *args):
+        command = info["commands"][name]
+        assert command[:3] == [runtime["python"], "-I", "-m"]
+        result = subprocess.run(
+            [*command, *map(str, args)], cwd=shadow.parent, env=env,
+            capture_output=True, text=True, timeout=20,
+        )
+        assert result.returncode in (0, 2), result.stderr
+        return result.returncode, json.loads(result.stdout)
+
+    draft = runtime["cwd"] / "draft with spaces.md"
+    draft.write_text("Public text. <!-- private drafting note -->\n")
+    code, dirty = run("check-draft", draft)
+    assert code == 2 and dirty["passed"] is False
+    draft.write_text("A public sentence.\n")
+    code, clean = run("check-draft", draft)
+    assert code == 0 and clean["passed"] is True
+    inputs = info["learning_inputs"]
+    assert set(inputs) == {"tasks", "oracle", "correction"}
+    assert all(Path(path).is_file() and Path(path).is_relative_to(package) for path in inputs.values())
+    report = runtime["cwd"] / "installed learning report.json"
+    code, result = run(
+        "evaluate", "--tasks", inputs["tasks"], "--oracle", inputs["oracle"], "--report", report
+    )
+    assert code == 0, result
+    actual = json.loads(report.read_text())
+    assert actual["counts"] == {"passed": 20, "failed": 0, "error": 0, "not_run": 0}
+    assert actual["consumption"]["model_calls"] == 0
 
 
 def test_installed_cli_mcp_execution_pause_and_process_restart(runtime):

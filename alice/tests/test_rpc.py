@@ -154,6 +154,123 @@ class RpcTests(unittest.IsolatedAsyncioTestCase):
         second = await self.connect()
         self.assertEqual(await second.initialize(), {"version": "test"})
 
+    async def test_wait_reader_closed_drains_listener_tail_before_eof(self):
+        rpc = await self.connect()
+        reader = rpc._reader
+        observed = []
+        rpc.add_listener(observed.append)
+        waiting = asyncio.create_task(rpc.wait_reader_closed(timeout=1))
+        await asyncio.sleep(0)
+        tail = [
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {"threadId": "fixture-root", "tokenUsage": {"total": {"totalTokens": 7}}},
+            },
+            {"method": "turn/completed", "params": {"threadId": "fixture-root"}},
+        ]
+        for event in tail:
+            await self.send(event)
+        await self.peer.close()
+        self.assertTrue(await waiting)
+        self.assertEqual(observed, tail)
+        self.assertIs(rpc._reader, reader)
+        self.assertTrue(reader.done())
+        self.assertFalse(reader.cancelled())
+
+    async def test_wait_reader_closed_reports_preexisting_eof_immediately(self):
+        rpc = await self.connect()
+        await self.peer.close()
+        # Confirm the actual reader already reached EOF without using the new API.
+        await asyncio.wait_for(asyncio.shield(rpc._reader), 1)
+        self.assertTrue(await rpc.wait_reader_closed(timeout=0))
+        self.assertTrue(await rpc.wait_reader_closed(timeout=0.0))
+        self.assertFalse(rpc.connected)
+
+    async def test_wait_reader_closed_reports_abrupt_transport_end(self):
+        rpc = await self.connect()
+        reader = rpc._reader
+        pending = asyncio.create_task(rpc.request("unfinished-request"))
+        await self.received.get()
+        self.peer.transport.abort()
+        self.assertTrue(await rpc.wait_reader_closed(timeout=1))
+        with self.assertRaises(RpcDisconnected):
+            await pending
+        self.assertIs(rpc._reader, reader)
+        self.assertTrue(reader.done())
+        self.assertFalse(reader.cancelled())
+        # True reports termination, including this failed transport, not that
+        # unfinished responses or any unreceived peer notifications are complete.
+        self.assertFalse(rpc.connected)
+
+    async def test_wait_reader_closed_timeout_keeps_reader_receiving(self):
+        rpc = await self.connect()
+        reader = rpc._reader
+        observed = []
+        rpc.add_listener(observed.append)
+        self.assertFalse(await rpc.wait_reader_closed(timeout=0))
+        self.assertFalse(await rpc.wait_reader_closed(timeout=0.01))
+        self.assertIs(rpc._reader, reader)
+        self.assertFalse(reader.done())
+        event = {
+            "method": "thread/tokenUsage/updated",
+            "params": {"threadId": "fixture-root", "tokenUsage": {"total": {"totalTokens": 11}}},
+        }
+        await self.send(event)
+        self.assertEqual(await rpc.wait_event(lambda value: value == event, timeout=1), event)
+        self.assertEqual(observed, [event])
+        self.assertTrue(rpc.connected)
+        self.assertFalse(reader.done())
+        await self.peer.close()
+        self.assertTrue(await rpc.wait_reader_closed(timeout=1))
+        self.assertTrue(await rpc.wait_reader_closed(timeout=0))
+        self.assertFalse(reader.cancelled())
+
+    async def test_wait_reader_closed_cancellation_preserves_reader_and_other_waiter(self):
+        rpc = await self.connect()
+        reader = rpc._reader
+        observed = []
+        rpc.add_listener(observed.append)
+        waiting = asyncio.create_task(rpc.wait_reader_closed(timeout=1))
+        survivor = asyncio.create_task(rpc.wait_reader_closed(timeout=1))
+        try:
+            await asyncio.sleep(0)
+            self.assertFalse(waiting.done())
+            waiting.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiting
+            self.assertIs(rpc._reader, reader)
+            self.assertFalse(reader.done())
+            self.assertFalse(survivor.done())
+            event = {"method": "progress", "params": {"after_cancel": True}}
+            await self.send(event)
+            await rpc.wait_event(lambda value: value == event, timeout=1)
+            self.assertEqual(observed, [event])
+            self.assertTrue(rpc.connected)
+            await self.peer.close()
+            self.assertTrue(await survivor)
+            self.assertFalse(reader.cancelled())
+        finally:
+            for task in (waiting, survivor):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(waiting, survivor, return_exceptions=True)
+
+    async def test_wait_reader_closed_rejects_invalid_timeout_even_after_eof(self):
+        rpc = await self.connect()
+        reader = rpc._reader
+        invalid = [True, False, -1, -0.1, float("nan"), float("inf"), -float("inf"), None, "1"]
+        for closed in (False, True):
+            if closed:
+                await self.peer.close()
+                self.assertTrue(await rpc.wait_reader_closed(timeout=1))
+            for timeout in invalid:
+                with self.subTest(closed=closed, timeout=timeout):
+                    with self.assertRaises(ValueError):
+                        await rpc.wait_reader_closed(timeout=timeout)
+            self.assertIs(rpc._reader, reader)
+            self.assertEqual(reader.done(), closed)
+            self.assertFalse(reader.cancelled())
+
 
 @pytest.mark.native
 class NativeCodexTests(unittest.IsolatedAsyncioTestCase):

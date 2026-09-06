@@ -546,7 +546,10 @@ def test_runtime_templates_install_without_replacing_local_instructions(tmp_path
     assert result["installed"][:2] == ["AGENTS.md", ".alice/prompts/autonomy-review.md"]
     assert "SOUL.md" in (store.workspace / "AGENTS.md").read_text()
     assert (store.workspace / ".alice/prompts/autonomy-review.md").is_file()
-    assert not (store.workspace / "SOUL.md").exists()
+    from alice_codex.identity import build_identity_bundle
+    assert build_identity_bundle(store.workspace).revision
+    for relative in ("SOUL.md", "USER.md", "memory/MEMORY.md"):
+        assert (store.workspace / relative).is_file()
     assert store.install_workspace_templates()["installed"] == []
     (store.workspace / "AGENTS.md").write_text("Deliberate local runtime rules\n")
     assert store.install_workspace_templates()["preserved"] == ["AGENTS.md"]
@@ -568,6 +571,8 @@ def test_installed_skill_tree_is_discoverable_and_preserves_customization(tmp_pa
     package = tmp_path / "package"
     put(package, "templates/AGENTS.md", "Generic runtime guidance")
     put(package, "templates/autonomy-review.md", "Generic review")
+    for name in ("SOUL.md", "USER.md", "MEMORY.md"):
+        put(package, "templates/" + name, "Synthetic identity default")
     put(
         package,
         "templates/.agents/skills/verify-outcome/SKILL.md",
@@ -620,3 +625,15 @@ def test_unsupported_index_schema_fails_without_recreating_data(tmp_path, damage
     with pytest.raises(MemoryError, match="schema"):
         MemoryStore(tmp_path / "data")
     assert store.index_path.read_bytes() == before
+
+
+def test_default_identity_templates_preserve_imported_and_edited_records(tmp_path):
+    store = MemoryStore(tmp_path / "data")
+    for relative in ("SOUL.md", "USER.md", "memory/MEMORY.md"):
+        target = store.workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"Synthetic preserved custom bytes\r\n")
+    result = store.install_workspace_templates()
+    assert set(result["preserved"]) == {"SOUL.md", "USER.md", "memory/MEMORY.md"}
+    for relative in result["preserved"]:
+        assert (store.workspace / relative).read_bytes() == b"Synthetic preserved custom bytes\r\n"

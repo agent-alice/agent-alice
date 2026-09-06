@@ -24,6 +24,9 @@ import alice_codex.service as service_module
 def service(tmp_path):
     config = RuntimeConfig(str(tmp_path), "/usr/bin/true", "codex-cli fixture", "unused")
     config.prepare_directories()
+    (config.workspace / "memory").mkdir(exist_ok=True)
+    for name in ("SOUL.md", "USER.md", "memory/MEMORY.md"):
+        (config.workspace / name).write_text("Synthetic service identity: " + name)
     item = Service(config)
     item.ready = True
     item.codex = Mock()
@@ -44,6 +47,7 @@ def service(tmp_path):
     item.rpc = Mock()
     item.rpc.request = AsyncMock(return_value={"data": []})
     item.rpc.close = AsyncMock()
+    item.rpc.wait_reader_closed = AsyncMock(return_value=True)
     yield item
     item.store.close()
     for socket in config.socket_dir.iterdir():
@@ -253,6 +257,7 @@ async def test_unloaded_thread_resumes_same_id_before_considering_empty_replacem
         service.state["intents"]["unknown"] = {"thread_id": "old-root", "status": "unknown"}
     service.save()
     service.codex.thread_read.side_effect = RpcError("thread not loaded: old-root", -32600)
+
     async def resume(thread_id, **kwargs):
         if thread_id == "old-root":
             raise RpcError("no rollout found for thread id old-root", -32600)
@@ -722,7 +727,7 @@ async def test_pause_during_resume_stops_late_goal_ack_and_keeps_pause(service, 
     assert any(call.args == ("root",) for call in service.codex.stop_tree.await_args_list)
 
 
-async def test_native_token_notifications_record_usage_once(service):
+async def test_unbound_token_notifications_are_rejected_without_disabling_archival(service):
     usage = {
         "inputTokens": 20,
         "cachedInputTokens": 8,
@@ -752,7 +757,9 @@ async def test_native_token_notifications_record_usage_once(service):
     try:
         await asyncio.wait_for(archived.wait(), 2)
         status = service.resources.status()
-        assert status["tokens"]["threads"]["root"]["totalTokens"] == 23
+        assert status["tokens"]["threads"] == {}
+        assert status["tokens"]["epochs"] == {}
+        assert service.stopping and "epoch" in service.error
         assert status["tokens"]["cost_microusd"] is None
         assert status["virtual_budget_enabled"] is False
     finally:
@@ -881,6 +888,7 @@ async def test_shutdown_archive_write_failure_still_closes_rpc_and_owned_process
 async def test_run_archives_before_ready_and_shutdown_tail_before_rpc_close(service, monkeypatch):
     # The actual Service.run/NativeJournal/CodexClient path, with a deterministic
     # process/transport boundary. This does not claim real Codex process coverage.
+    service.config.write_codex_config()
     service.ready = False
     service.state["tasks"]["main"] = {"thread_id": "root"}
     service.config.verify_binary = Mock()
@@ -894,12 +902,48 @@ async def test_run_archives_before_ready_and_shutdown_tail_before_rpc_close(serv
     monkeypatch.setattr(service_module.asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(service_module, "process_identity", lambda _: "fixture identity")
     monkeypatch.setattr(service_module, "process_birth", lambda _: "fixture birth")
+    monkeypatch.setattr(service_module.os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(
         service_module.RpcClient, "connect_unix", AsyncMock(return_value=service.rpc)
     )
     service.rpc.initialize = AsyncMock()
+    service.rpc.events, service.rpc.event_sequence = [], 0
 
     async def request(method, params):
+        if method == "hooks/list":
+            from alice_codex.identity import HOOK_STATUS
+
+            hooks = []
+            for event, groups in service.config.identity_hooks().items():
+                group, handler = groups[0], groups[0]["hooks"][0]
+                hooks.append(
+                    {
+                        "key": str(service.config.codex_home / "config.toml") + ":" + event,
+                        "eventName": event[0].lower() + event[1:],
+                        "handlerType": "command",
+                        "command": handler["command"],
+                        "async": False,
+                        "matcher": group.get("matcher"),
+                        "timeoutSec": 10,
+                        "statusMessage": HOOK_STATUS,
+                        "additionalContextLimit": handler.get("additionalContextLimit"),
+                        "source": "user",
+                        "sourcePath": str(service.config.codex_home / "config.toml"),
+                        "enabled": True,
+                        "currentHash": "sha256:" + "a" * 64,
+                        "trustStatus": "trusted",
+                    }
+                )
+            return {
+                "data": [
+                    {
+                        "cwd": str(service.config.workspace),
+                        "warnings": [],
+                        "errors": [],
+                        "hooks": hooks,
+                    }
+                ]
+            }
         if method == "thread/list":
             return {"data": [{"id": "root"}]}
         if method == "thread/items/list":
@@ -966,3 +1010,26 @@ async def test_run_archives_before_ready_and_shutdown_tail_before_rpc_close(serv
     assert at_close == [({"before-start", "shutdown-tail"}, "shutdown")]
     assert not service.ready
     assert json.loads(service.path.read_text())["journal"]["traversal_complete"] is True
+
+
+async def test_host_supplies_identity_without_a_model_read_tool(service):
+    from alice_codex.identity import build_identity_bundle
+
+    await service.ensure_thread("identity-root")
+    parameters = service.codex.thread_start.call_args.kwargs
+    assert (
+        parameters["developerInstructions"]
+        == build_identity_bundle(service.config.workspace).developer_instructions
+    )
+    assert "reference_data_not_instructions" in parameters["developerInstructions"]
+    service.codex.turn_start.assert_not_called()
+
+
+async def test_missing_identity_fails_before_creating_native_root(service):
+    from alice_codex.identity import IdentityError
+
+    (service.config.workspace / "USER.md").unlink()
+    with pytest.raises(IdentityError, match="missing_or_linked_file"):
+        await service.ensure_thread("missing-source")
+    service.codex.thread_start.assert_not_called()
+    assert "missing-source" not in service.state["tasks"]

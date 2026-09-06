@@ -6,7 +6,7 @@ caller cannot mark a candidate passed. The service lifecycle belongs to the CLI.
 No activation/rollback operation copies, migrates, or restores business data.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -96,6 +96,55 @@ def pytest_evidence(path: Path) -> str | None:
         return f"required pytest evidence is missing or invalid: {exc}"
 
 
+def summary_boundary_evidence(output: str) -> str | None:
+    """Validate the full installed structural probe, not its exit code alone."""
+    try:
+        report = json.loads(output)
+        if (
+            not isinstance(report, dict)
+            or report.get("status") != "passed"
+            or report.get("full_boundary_suite") is not True
+            or report.get("model_or_native_execution") is not False
+            or report.get("isolated_python") is not True
+        ):
+            raise ValueError("missing full isolated structural probe evidence")
+        cases = report.get("cases")
+        expected = {"single_17mib", "multiple_over_16mib", "short_10001"}
+        if (
+            not isinstance(cases, list)
+            or len(cases) != 3
+            or any(not isinstance(case, dict) for case in cases)
+            or {case.get("case") for case in cases} != expected
+            or any(case.get("status") != "passed" or case.get("debug_only") is not False for case in cases)
+        ):
+            raise ValueError("required full boundary cases are missing, failed or debug-only")
+        guards = report.get("guards")
+        expected_guards = {
+            "committed_missing_count_tampering_rejected",
+            "pending_rendered_and_hash_forgery_rejected",
+            "copied_l1_jsonl_without_local_proof_rejected",
+            "giant_copied_l1_tail_proof_without_local_proof_rejected",
+            "copied_l2_markdown_without_local_proof_rejected_by_l3",
+            "copied_l3_markdown_without_local_proof_rejected_by_l4",
+            "malformed_reserved_markdown_coverage_marker_rejected",
+            "valid_local_markdown_new_date_retains_ancestor_gap",
+        }
+        if (
+            report.get("regression_guards_passed") is not True
+            or type(report.get("regression_guard_count")) is not int
+            or report["regression_guard_count"] != 8
+            or not isinstance(guards, list)
+            or len(guards) != 8
+            or any(not isinstance(guard, dict) for guard in guards)
+            or {guard.get("name") for guard in guards} != expected_guards
+            or any(guard.get("passed") is not True for guard in guards)
+        ):
+            raise ValueError("required eight summary provenance/recovery guards did not pass")
+        return None
+    except (TypeError, ValueError) as error:
+        return "required installed summary boundary evidence is invalid: " + str(error)
+
+
 def run_check(
     name: str,
     command: list[str],
@@ -104,6 +153,7 @@ def run_check(
     env: dict[str, str],
     timeout: float,
     junit: Path | None = None,
+    output_limit: int | None = 12000,
 ) -> CheckResult:
     """Run a shell-free owned process group and retain its observed outcome."""
     started = time.monotonic()
@@ -144,14 +194,15 @@ def run_check(
     if process is not None:
         code = process.returncode
     return CheckResult(
-        name, command, code, status, round(time.monotonic() - started, 4), output[-12000:], detail
+        name, command, code, status, round(time.monotonic() - started, 4),
+        output if output_limit is None else output[-output_limit:], detail
     )
 
 
 class ReleaseManager:
     """Candidates live in home/releases; current.json is only a code selector."""
 
-    POLICY_VERSION = 5
+    POLICY_VERSION = 6
 
     def __init__(self, home: Path | str):
         self.home = Path(home).expanduser().resolve()
@@ -204,7 +255,7 @@ class ReleaseManager:
         if (
             not isinstance(manifest, dict)
             or manifest.get("id") != candidate_id
-            or manifest.get("policy_version") not in {4, self.POLICY_VERSION}
+            or manifest.get("policy_version") not in {4, 5, self.POLICY_VERSION}
         ):
             raise ReleaseError("invalid candidate manifest")
         return candidate, manifest
@@ -324,9 +375,22 @@ class ReleaseManager:
                     "import json,sys,importlib.metadata as m; from alice_codex.store import Store; "
                     "from alice_codex.memory import MemoryStore; "
                     "from alice_codex.resources import ResourceLedger; "
+                    "import importlib,importlib.util; "
+                    "service=importlib.import_module('alice_codex.service') if "
+                    "importlib.util.find_spec('alice_codex.service') is not None else None; "
+                    "identity=importlib.import_module('alice_codex.identity') if "
+                    "importlib.util.find_spec('alice_codex.identity') is not None else None; "
+                    "summary=importlib.import_module('alice_codex.summary_partitions') if "
+                    "importlib.util.find_spec('alice_codex.summary_partitions') is not None else None; "
+                    "heartbeat=importlib.import_module('alice_codex.heartbeat') if "
+                    "importlib.util.find_spec('alice_codex.heartbeat') is not None else None; "
                     "print(json.dumps({'python':sys.version, 'schedule_schema':Store.SCHEMA_VERSION, "
                     "'memory_schema':MemoryStore.SCHEMA_VERSION, "
                     "'resource_schema':ResourceLedger.SCHEMA_VERSION, "
+                    "'resource_epoch_capability':getattr(service,'RESOURCE_EPOCH_CAPABILITY',0), "
+                    "'identity_hook_compat_version':getattr(identity,'IDENTITY_HOOK_COMPAT_VERSION',0), "
+                    "'summary_commit_schema':getattr(summary,'SUMMARY_COMMIT_SCHEMA',0), "
+                    "'heartbeat_sources_config_version':getattr(heartbeat,'HEARTBEAT_SOURCES_CONFIG_VERSION',0), "
                     "'packages':sorted((d.metadata['Name'],d.version) for d in m.distributions())}))",
                 ],
                 cwd=candidate,
@@ -336,6 +400,10 @@ class ReleaseManager:
             if probe.status != "passed":
                 raise ReleaseError(f"installed candidate cannot load its schema: {probe.output}")
             installed_metadata = json.loads(probe.output)
+            self._epoch_capability(installed_metadata)
+            self._identity_capability(installed_metadata)
+            self._summary_capability(installed_metadata)
+            self._heartbeat_capability(installed_metadata)
             head = subprocess.run(
                 ["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True, timeout=10
             )
@@ -384,7 +452,7 @@ class ReleaseManager:
     def _candidate_pair(self, manifest: dict):
         if manifest.get("policy_version") != self.POLICY_VERSION:
             raise ReleaseError(
-                "legacy candidate needs a new paired-runtime verification; old report preserved"
+                "legacy candidate needs current-policy verification; old report preserved"
             )
         from .config import RuntimeConfig
         from .runtime_bundle import CodexBundle, verify_runtime_bundle
@@ -440,6 +508,7 @@ class ReleaseManager:
         return self._configured_pair(manifest).binary
 
     def _assert_unchanged(self, candidate: Path, manifest: dict) -> None:
+        self._require_format_metadata(manifest)
         if Path(manifest["wheel"]).name != manifest["wheel"]:
             raise ReleaseError("invalid wheel path in manifest")
         if sha256_file(candidate / manifest["wheel"]) != manifest["wheel_sha256"]:
@@ -448,6 +517,116 @@ class ReleaseManager:
             raise ReleaseError("pinned Codex binary changed")
         if self._environment_fingerprint(candidate) != manifest["environment_fingerprint"]:
             raise ReleaseError("installed candidate or dependency environment changed")
+        if self._probe_epoch_capability(self._python(candidate), candidate) != self._epoch_capability(
+            manifest["installed"]
+        ):
+            raise ReleaseError("installed resource epoch capability does not match candidate metadata")
+        if self._probe_identity_capability(
+            self._python(candidate), candidate
+        ) != self._identity_capability(manifest["installed"]):
+            raise ReleaseError("installed identity hook capability does not match candidate metadata")
+        if self._probe_summary_capability(
+            self._python(candidate), candidate
+        ) != self._summary_capability(manifest["installed"]):
+            raise ReleaseError("installed summary commit capability does not match candidate metadata")
+        if self._probe_heartbeat_capability(
+            self._python(candidate), candidate
+        ) != self._heartbeat_capability(manifest["installed"]):
+            raise ReleaseError("installed heartbeat source capability does not match candidate metadata")
+
+    @staticmethod
+    def _epoch_capability(installed: dict) -> int:
+        """Missing legacy declarations mean no support, never inferred support."""
+        if not isinstance(installed, dict):
+            raise ReleaseError("invalid installed compatibility metadata")
+        value = installed.get("resource_epoch_capability", 0)
+        if type(value) is not int or value not in {0, 1}:
+            raise ReleaseError("unsupported or invalid resource epoch capability")
+        return value
+
+    def _probe_epoch_capability(self, python: Path, directory: Path) -> int:
+        value = self._probe_capability(
+            python, directory, "alice_codex.service", "RESOURCE_EPOCH_CAPABILITY", "resource_epoch_capability"
+        )
+        return self._epoch_capability(value)
+
+    @staticmethod
+    def _identity_capability(installed: dict) -> int:
+        if not isinstance(installed, dict):
+            raise ReleaseError("invalid installed compatibility metadata")
+        value = installed.get("identity_hook_compat_version", 0)
+        if type(value) is not int or value not in {0, 1}:
+            raise ReleaseError("unsupported or invalid identity hook capability")
+        return value
+
+    def _probe_identity_capability(self, python: Path, directory: Path) -> int:
+        value = self._probe_capability(
+            python, directory, "alice_codex.identity", "IDENTITY_HOOK_COMPAT_VERSION", "identity_hook_compat_version"
+        )
+        return self._identity_capability(value)
+
+    @staticmethod
+    def _summary_capability(installed: dict) -> int:
+        if not isinstance(installed, dict):
+            raise ReleaseError("invalid installed compatibility metadata")
+        value = installed.get("summary_commit_schema", 0)
+        if type(value) is not int or value not in {0, 1, 2}:
+            raise ReleaseError("unsupported or invalid summary commit capability")
+        return value
+
+    @staticmethod
+    def _heartbeat_capability(installed: dict) -> int:
+        if not isinstance(installed, dict):
+            raise ReleaseError("invalid installed compatibility metadata")
+        value = installed.get("heartbeat_sources_config_version", 0)
+        if type(value) is not int or value not in {0, 1}:
+            raise ReleaseError("unsupported or invalid heartbeat source capability")
+        return value
+
+    def _require_format_metadata(self, manifest: dict) -> None:
+        installed = manifest.get("installed")
+        if not isinstance(installed, dict) or "summary_commit_schema" not in installed:
+            raise ReleaseError("candidate lacks explicit summary commit capability metadata; restage it")
+        if "heartbeat_sources_config_version" not in installed:
+            raise ReleaseError("candidate lacks explicit heartbeat source capability metadata; restage it")
+        self._summary_capability(installed)
+        self._heartbeat_capability(installed)
+
+    def _probe_summary_capability(self, python: Path, directory: Path) -> int:
+        return self._summary_capability(self._probe_capability(
+            python, directory, "alice_codex.summary_partitions", "SUMMARY_COMMIT_SCHEMA", "summary_commit_schema"
+        ))
+
+    def _probe_heartbeat_capability(self, python: Path, directory: Path) -> int:
+        return self._heartbeat_capability(self._probe_capability(
+            python, directory, "alice_codex.heartbeat", "HEARTBEAT_SOURCES_CONFIG_VERSION", "heartbeat_sources_config_version"
+        ))
+
+    def _probe_capability(
+        self, python: Path, directory: Path, module: str, constant: str, key: str
+    ) -> dict:
+        result = run_check(
+            "installed-" + key,
+            [
+                str(python), "-I", "-c",
+                "import importlib,importlib.util,json; "
+                f"module=importlib.import_module({module!r}) if "
+                f"importlib.util.find_spec({module!r}) is not None else None; "
+                f"print(json.dumps({{{key!r}:getattr(module,{constant!r},0)}}))",
+            ],
+            cwd=directory,
+            env=self._environment(directory / "compatibility-probe-home"),
+            timeout=30,
+        )
+        if result.status != "passed":
+            raise ReleaseError(f"installed {key} probe failed: " + result.output)
+        try:
+            value = json.loads(result.output)
+            if not isinstance(value, dict) or key not in value:
+                raise ValueError("missing capability value")
+            return value
+        except (TypeError, ValueError) as error:
+            raise ReleaseError(f"invalid installed {key} probe") from error
 
     def verify(
         self,
@@ -461,8 +640,11 @@ class ReleaseManager:
         candidate, manifest = self._manifest(candidate_id)
         if manifest.get("policy_version") != self.POLICY_VERSION:
             raise ReleaseError(
-                "legacy candidate needs new paired verification; old report preserved"
+                "legacy candidate needs current-policy verification; old report preserved"
             )
+        # Older same-policy reports lack these format declarations. Preserve
+        # them as evidence instead of silently assigning capabilities later.
+        self._require_format_metadata(manifest)
         # Invalidate a previous successful result before any new verification attempt.
         manifest["verified_report_sha256"] = None
         write_json(candidate / "candidate.json", manifest)
@@ -476,14 +658,27 @@ class ReleaseManager:
                 raise ReleaseError("source/checks changed since this candidate was built")
             if not (source / "tests" / "test_artifact_smoke.py").is_file():
                 raise ReleaseError("required installed-artifact smoke test is missing")
+            runs = candidate / "verification-runs"
+            if runs.is_symlink():
+                raise ReleaseError("verification evidence directory must not be a symbolic link")
+            verification_run = private_dir(private_dir(runs) / uuid4().hex)
             env = self._environment(candidate / "verification-home")
             # The verification interpreter may have another editable checkout
             # installed. Test this explicit source tree; installed-artifact
             # subprocesses use the candidate interpreter with -I instead.
             env["PYTHONPATH"] = str(source / "src")
             env["ALICE_ARTIFACT_PYTHON"] = str(self._python(candidate))
-            env["ALICE_TEST_CODEX_BINARY"] = str(self._runtime_codex_binary(manifest))
+            pair = self._candidate_pair(manifest)
+            env["ALICE_TEST_CODEX_BINARY"] = str(pair.binary)
+            env["ALICE_TEST_CODEX_SHA256"] = pair.binary_sha256
+            env["ALICE_TEST_CODEX_HOST_BINARY"] = str(pair.host)
+            env["ALICE_TEST_CODEX_HOST_SHA256"] = pair.host_sha256
             python = manifest["verification_python"]
+            summary_capability = self._summary_capability(manifest["installed"])
+            heartbeat_capability = self._heartbeat_capability(manifest["installed"])
+            summary_test = "tests/test_native_summary_partitions.py"
+            heartbeat_test = "tests/test_native_heartbeat_source_config.py"
+            summary_probe = source / "tests/fixtures/summary_partition_probe.py"
             static_paths = [name for name in ("src", "tests", "tools") if (source / name).exists()]
             commands: list[tuple[str, list[str], Path | None]] = [
                 (
@@ -518,17 +713,37 @@ class ReleaseManager:
                         python,
                         "-m",
                         "pytest",
-                        "tests/test_artifact_smoke.py",
+                        "tests",
                         "-m",
-                        "not live and not native",
+                        "artifact and not live and not native",
                         "-q",
                     ],
                     candidate / "artifact.xml",
                 ),
             ]
+            if summary_capability >= 2:
+                if not summary_probe.is_file():
+                    raise ReleaseError("required installed summary boundary probe is missing")
+                commands.append((
+                    "summary_boundary",
+                    [str(self._python(candidate)), "-I", str(summary_probe)],
+                    None,
+                ))
             if native:
                 if not (source / "tests/test_native_code_mode.py").is_file():
                     raise ReleaseError("required native Code Mode pair test is missing")
+                epoch_capability = self._epoch_capability(manifest["installed"])
+                epoch_test = "tests/test_native_service_resource_epochs.py"
+                identity_capability = self._identity_capability(manifest["installed"])
+                identity_test = "tests/test_identity_native.py"
+                if epoch_capability and not (source / epoch_test).is_file():
+                    raise ReleaseError("required native Service resource epoch test is missing")
+                if identity_capability and not (source / identity_test).is_file():
+                    raise ReleaseError("required native identity hook test is missing")
+                if summary_capability >= 2 and not (source / summary_test).is_file():
+                    raise ReleaseError("required native summary partition test is missing")
+                if heartbeat_capability and not (source / heartbeat_test).is_file():
+                    raise ReleaseError("required native heartbeat source test is missing")
                 commands.append(
                     (
                         "native",
@@ -538,8 +753,12 @@ class ReleaseManager:
                             "pytest",
                             "tests",
                             "--ignore=tests/test_native_code_mode.py",
+                            "--ignore=" + epoch_test,
+                            "--ignore=" + identity_test,
+                            "--ignore=" + summary_test,
+                            "--ignore=" + heartbeat_test,
                             "-m",
-                            "native and not live",
+                            "native and not live and not native_resource_epoch",
                             "-q",
                         ],
                         candidate / "native.xml",
@@ -560,6 +779,35 @@ class ReleaseManager:
                         candidate / "native-pair.xml",
                     )
                 )
+                if epoch_capability:
+                    commands.append(
+                        (
+                            "native_resource_epoch",
+                            [
+                                python, "-m", "pytest", epoch_test,
+                                "-m", "native and native_resource_epoch and not live", "-q",
+                            ],
+                            candidate / "native-resource-epoch.xml",
+                        )
+                    )
+                if identity_capability:
+                    commands.append(
+                        (
+                            "native_identity",
+                            [python, "-m", "pytest", identity_test, "-m", "native and not live", "-q"],
+                            candidate / "native-identity.xml",
+                        )
+                    )
+                for name, path, required in (
+                    ("native_summary", summary_test, summary_capability >= 2),
+                    ("native_heartbeat_sources", heartbeat_test, bool(heartbeat_capability)),
+                ):
+                    if required:
+                        commands.append((
+                            name,
+                            [python, "-m", "pytest", path, "-m", "native and not live", "-q"],
+                            candidate / (name.replace("_", "-") + ".xml"),
+                        ))
             if live:
                 commands.append(
                     (
@@ -571,10 +819,28 @@ class ReleaseManager:
             for name, command, junit in commands:
                 if junit is not None:
                     junit.unlink(missing_ok=True)
-                    command = [*command, f"--junitxml={junit}"]
-                results.append(
-                    run_check(name, command, cwd=source, env=env, timeout=timeout, junit=junit)
+                    # Pytest's global numbered-directory retention otherwise
+                    # deletes a failed earlier group's fixtures during this
+                    # same verification. A later verify gets a new run too.
+                    command = [
+                        *command, f"--junitxml={junit}",
+                        f"--basetemp={verification_run / name}",
+                    ]
+                check_env = (
+                    {**env, "ALICE_SUMMARY_RESOURCE_RECEIPTS": "1"}
+                    if name == "native_summary" else env
                 )
+                result = run_check(
+                    name, command, cwd=source, env=check_env, timeout=timeout, junit=junit,
+                    # Structured evidence must be parsed before any display
+                    # truncation. The fixed probe reports per-stage metrics.
+                    output_limit=None if name == "summary_boundary" else 12000,
+                )
+                if name == "summary_boundary" and result.status == "passed":
+                    detail = summary_boundary_evidence(result.output)
+                    if detail:
+                        result = replace(result, status="failed", detail=detail)
+                results.append(result)
             self._assert_unchanged(candidate, manifest)
             if source_fingerprint(source) != manifest["source_fingerprint"]:
                 raise ReleaseError("source/checks changed during candidate verification")
@@ -589,6 +855,10 @@ class ReleaseManager:
             "codex_sha256": manifest["codex_sha256"],
             "codex_code_mode_host_sha256": manifest["codex_code_mode_host_sha256"],
             "environment_fingerprint": manifest["environment_fingerprint"],
+            "resource_epoch_capability": self._epoch_capability(manifest["installed"]),
+            "identity_hook_compat_version": self._identity_capability(manifest["installed"]),
+            "summary_commit_schema": self._summary_capability(manifest["installed"]),
+            "heartbeat_sources_config_version": self._heartbeat_capability(manifest["installed"]),
             "native_required": native,
             "live_required": live,
             "checks": [asdict(result) for result in results],
@@ -618,6 +888,14 @@ class ReleaseManager:
         report = read_json(report_path)
         required = {"ruff", "unit", "artifact"}
         required.update({"native", "native_pair"})
+        if self._epoch_capability(manifest["installed"]):
+            required.add("native_resource_epoch")
+        if self._identity_capability(manifest["installed"]):
+            required.add("native_identity")
+        if self._summary_capability(manifest["installed"]) >= 2:
+            required.update({"summary_boundary", "native_summary"})
+        if self._heartbeat_capability(manifest["installed"]):
+            required.add("native_heartbeat_sources")
         if report.get("live_required"):
             required.add("live")
         checks = report.get("checks", [])
@@ -632,8 +910,17 @@ class ReleaseManager:
             )
             or report.get("wheel_sha256") != manifest["wheel_sha256"]
             or report.get("candidate_id") != candidate_id
+            or report.get("source_sha") != manifest["source_sha"]
+            or report.get("source_fingerprint") != manifest["source_fingerprint"]
+            or report.get("environment_fingerprint") != manifest["environment_fingerprint"]
+            or "summary_commit_schema" not in report
+            or "heartbeat_sources_config_version" not in report
             or report.get("codex_sha256") != manifest["codex_sha256"]
             or report.get("codex_code_mode_host_sha256") != manifest["codex_code_mode_host_sha256"]
+            or self._epoch_capability(report) != self._epoch_capability(manifest["installed"])
+            or self._identity_capability(report) != self._identity_capability(manifest["installed"])
+            or self._summary_capability(report) != self._summary_capability(manifest["installed"])
+            or self._heartbeat_capability(report) != self._heartbeat_capability(manifest["installed"])
         ):
             raise ReleaseError("candidate required checks did not all pass")
         return candidate, manifest
@@ -641,6 +928,10 @@ class ReleaseManager:
     def _check_data_schema(self, manifest: dict, requested: int | None) -> None:
         # These are database format guards, not a claim that every JSON/document
         # format or future migration can be reversed. No data is overwritten.
+        self._check_resource_epoch_compat(manifest)
+        self._check_identity_compat(manifest)
+        self._check_summary_commit_compat(manifest)
+        self._check_heartbeat_sources_compat(manifest)
         databases = {
             "schedule": self.home / "state/schedules.sqlite3",
             "memory": self.home / "memory-state/sources.sqlite3",
@@ -669,12 +960,84 @@ class ReleaseManager:
         if config_path.exists():
             self._configured_pair(manifest)
 
+    def _check_resource_epoch_compat(self, manifest: dict) -> None:
+        capability = self._epoch_capability(manifest["installed"])
+        path = self.home / "state/runtime.json"
+        if path.is_symlink() or path.parent.is_symlink():
+            raise ReleaseError("resource epoch runtime state must not be a symbolic link")
+        if not path.exists():
+            return
+        try:
+            state = read_json(path)
+            if not isinstance(state, dict):
+                raise ValueError("runtime state must be an object")
+            server = state.get("server")
+            present = "resource_epochs" in state or (
+                isinstance(server, dict) and "resource_epoch_id" in server
+            )
+            if not present:
+                return
+            if capability < 1:
+                raise ReleaseError("runtime resource epochs require an epoch-capable candidate")
+            if type(state.get("version")) is not int or state["version"] != 1:
+                raise ValueError("unsupported runtime state version with resource epochs")
+            # The same pure validator is owned by Service, so release checks
+            # cannot silently drift from the actual crash-recovery protocol.
+            from .service import validate_resource_epoch_journal
+
+            validate_resource_epoch_journal(state)
+        except (ImportError, OSError, TypeError, ValueError) as error:
+            raise ReleaseError(f"invalid resource epoch journal: {error}") from error
+
     def _check_bootstrap_policy(self, manifest: dict) -> None:
-        if not (self.home / "state/supervisor.json").exists():
+        path = self.home / "state/supervisor.json"
+        if path.is_symlink() or path.parent.is_symlink():
+            raise ReleaseError("supervisor compatibility state must not be a symbolic link")
+        if not path.exists():
             return
         from .bootstrap import checked_runtime
 
-        bootstrap = checked_runtime(self.home)["manifest"]
+        runtime = checked_runtime(self.home)
+        bootstrap = runtime["manifest"]
+        bootstrap_capability = self._epoch_capability(bootstrap["installed"])
+        bootstrap_python = Path(runtime["python"])
+        if self._probe_epoch_capability(
+            bootstrap_python, bootstrap_python.parents[2]
+        ) != bootstrap_capability:
+            raise ReleaseError("installed bootstrap resource epoch capability metadata changed")
+        if bootstrap_capability < self._epoch_capability(manifest["installed"]):
+            # Reject before the first capable service can introduce its new
+            # journal under a supervisor whose copied code cannot recover it.
+            raise ReleaseError(
+                "stop and uninstall the previous supervisor before introducing resource epochs"
+            )
+        bootstrap_identity = self._identity_capability(bootstrap["installed"])
+        if self._probe_identity_capability(
+            bootstrap_python, bootstrap_python.parents[2]
+        ) != bootstrap_identity:
+            raise ReleaseError("installed bootstrap identity hook capability metadata changed")
+        if bootstrap_identity < self._identity_capability(manifest["installed"]):
+            raise ReleaseError(
+                "stop and uninstall the previous supervisor before introducing identity hooks"
+            )
+        bootstrap_summary = self._summary_capability(bootstrap["installed"])
+        if self._probe_summary_capability(
+            bootstrap_python, bootstrap_python.parents[2]
+        ) != bootstrap_summary:
+            raise ReleaseError("installed bootstrap summary commit capability metadata changed")
+        if bootstrap_summary < self._summary_capability(manifest["installed"]):
+            raise ReleaseError(
+                "stop and uninstall the previous supervisor before introducing summary commit formats"
+            )
+        bootstrap_heartbeat = self._heartbeat_capability(bootstrap["installed"])
+        if self._probe_heartbeat_capability(
+            bootstrap_python, bootstrap_python.parents[2]
+        ) != bootstrap_heartbeat:
+            raise ReleaseError("installed bootstrap heartbeat source capability metadata changed")
+        if bootstrap_heartbeat < self._heartbeat_capability(manifest["installed"]):
+            raise ReleaseError(
+                "stop and uninstall the previous supervisor before introducing heartbeat source configuration"
+            )
         if (
             bootstrap.get("release_policy_version") != self.POLICY_VERSION
             or bootstrap.get("codex_sha256") != manifest["codex_sha256"]
@@ -684,6 +1047,87 @@ class ReleaseManager:
             raise ReleaseError(
                 "stop and uninstall the previous supervisor before changing its verified runtime pair"
             )
+
+    def _check_identity_compat(self, manifest: dict) -> None:
+        capability = self._identity_capability(manifest["installed"])
+        path = self.home / "state/identity-runtime.json"
+        delivery = self.home / "state/identity-delivery"
+        config_path = self.home / "codex/config.toml"
+        if any(item.is_symlink() for item in (path, path.parent, delivery, config_path, config_path.parent)):
+            raise ReleaseError("identity compatibility state must not be a symbolic link")
+        present = path.exists() or delivery.exists()
+        try:
+            if config_path.exists():
+                import tomllib
+                from .identity import has_owned_identity_hooks
+
+                document = tomllib.loads(config_path.read_text(encoding="utf-8"))
+                # init/configuration can write hooks before the ready manifest.
+                # Detect that prefix window with the owner's exact recognizer.
+                present = present or has_owned_identity_hooks(document)
+            if not present:
+                return
+            if capability < 1:
+                raise ReleaseError("runtime identity hooks require a rebinding-capable candidate")
+            if path.exists():
+                from .identity import IdentityError, validate_identity_runtime_manifest
+
+                try:
+                    validate_identity_runtime_manifest(read_json(path))
+                except IdentityError as error:
+                    raise ReleaseError(f"invalid identity runtime manifest: {error}") from error
+        except (ImportError, OSError, TypeError, ValueError) as error:
+            raise ReleaseError(f"invalid identity compatibility state: {error}") from error
+
+    def _check_summary_commit_compat(self, manifest: dict) -> None:
+        capability = self._summary_capability(manifest["installed"])
+        folder = self.home / "memory-state/commits"
+        if folder.is_symlink() or folder.parent.is_symlink():
+            raise ReleaseError("summary compatibility state must not be a symbolic link")
+        if not folder.exists():
+            return
+        if not folder.is_dir():
+            raise ReleaseError("summary commits must be a directory")
+        try:
+            for path in sorted(folder.glob("*.json")):
+                if path.is_symlink() or not path.is_file():
+                    raise ReleaseError("summary commit must be a regular unlinked record")
+                from .summary_partitions import validate_summary_commit_header
+
+                # Includes committed schema-2 records, not only pending work.
+                # The owner validates format headers; this does not reconstruct
+                # its partition DAG or restore old summaries.
+                from .memory import SummaryValidationError
+
+                try:
+                    validate_summary_commit_header(read_json(path), supported_schema=capability)
+                except SummaryValidationError as error:
+                    raise ReleaseError("invalid or unsupported summary commit compatibility header") from error
+        except (ImportError, OSError, TypeError, ValueError) as error:
+            raise ReleaseError("invalid or unsupported summary commit compatibility header") from error
+
+    def _check_heartbeat_sources_compat(self, manifest: dict) -> None:
+        capability = self._heartbeat_capability(manifest["installed"])
+        path = self.home / "config.json"
+        if path.is_symlink():
+            raise ReleaseError("heartbeat compatibility configuration must not be a symbolic link")
+        if not path.exists():
+            return
+        try:
+            document = read_json(path)
+            if not isinstance(document, dict):
+                raise ValueError("runtime configuration must be an object")
+            if "heartbeat_sources" not in document:
+                return
+            # Old strict RuntimeConfig cannot accept this key even when null
+            # or empty. Absence, rather than truthiness, is the legacy boundary.
+            if capability < 1:
+                raise ReleaseError("runtime heartbeat_sources requires a source-config-capable candidate")
+            from .heartbeat import parse_heartbeat_sources
+
+            parse_heartbeat_sources(document["heartbeat_sources"])
+        except (ImportError, OSError, TypeError, ValueError) as error:
+            raise ReleaseError("invalid heartbeat source compatibility configuration") from error
 
     def current(self) -> dict[str, Any] | None:
         path = self.root / "current.json"
@@ -711,6 +1155,7 @@ class ReleaseManager:
             return None
         candidate, manifest = self._verified(pointer["current"])
         self._check_data_schema(manifest, data_schema)
+        self._check_bootstrap_policy(manifest)
         canonical = {
             "current": manifest["id"],
             "previous": pointer.get("previous"),
@@ -793,6 +1238,7 @@ class ReleaseManager:
                 raise ReleaseError("no unfailed previous candidate is available")
             candidate, manifest = self._verified(previous)
             self._check_data_schema(manifest, None)
+            self._check_bootstrap_policy(manifest)
             pointer = {
                 "current": previous,
                 "previous": expected_current,
