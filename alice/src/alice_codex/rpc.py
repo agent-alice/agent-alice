@@ -8,6 +8,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -325,6 +326,26 @@ class RpcClient:
                 await self._changed.wait()
 
         return await asyncio.wait_for(wait(), timeout)
+
+    async def wait_reader_closed(self, *, timeout: float) -> bool:
+        """Wait for this connection's existing reader without cancelling it.
+
+        True means the reader ended (EOF, transport failure, or cancellation),
+        not that the remote notification history was complete. False means the
+        finite deadline expired; listeners and the reader remain active. Caller
+        cancellation propagates without cancelling the shared reader.
+        """
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
+            raise ValueError("Reader wait timeout must be a finite nonnegative number")
+        if self._reader.done():
+            return True
+        done, _ = await asyncio.wait({self._reader}, timeout=timeout)
+        return self._reader in done
 
     async def close(self) -> None:
         """Disconnect this client only. The shared App Server keeps running."""

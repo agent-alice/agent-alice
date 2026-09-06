@@ -74,6 +74,9 @@ class FakeRpc:
         self.connected = False
         self.listeners.clear()
 
+    async def wait_reader_closed(self, *, timeout):
+        return True
+
 
 def token(total=100, *, thread="root", turn="turn", last=None):
     counters = {

@@ -44,6 +44,7 @@ def service(tmp_path):
     item.rpc = Mock()
     item.rpc.request = AsyncMock(return_value={"data": []})
     item.rpc.close = AsyncMock()
+    item.rpc.wait_reader_closed = AsyncMock(return_value=True)
     yield item
     item.store.close()
     for socket in config.socket_dir.iterdir():
