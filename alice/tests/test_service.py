@@ -888,6 +888,7 @@ async def test_shutdown_archive_write_failure_still_closes_rpc_and_owned_process
 async def test_run_archives_before_ready_and_shutdown_tail_before_rpc_close(service, monkeypatch):
     # The actual Service.run/NativeJournal/CodexClient path, with a deterministic
     # process/transport boundary. This does not claim real Codex process coverage.
+    service.config.write_codex_config()
     service.ready = False
     service.state["tasks"]["main"] = {"thread_id": "root"}
     service.config.verify_binary = Mock()

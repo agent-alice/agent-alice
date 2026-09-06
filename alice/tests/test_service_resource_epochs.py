@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import json
 import sys
+import tomllib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -25,7 +26,8 @@ import alice_codex.service as service_module
 
 
 class FakeRpc:
-    def __init__(self):
+    def __init__(self, *, config=None):
+        self.config = config
         self.listeners = []
         self.events = deque()
         self.event_sequence = 0
@@ -61,6 +63,33 @@ class FakeRpc:
         return {"version": "synthetic"}
 
     async def request(self, method, params):
+        if method == "hooks/list" and self.config is not None:
+            from alice_codex.identity import HOOK_STATUS
+
+            config_path = self.config.codex_home / "config.toml"
+            state = tomllib.loads(config_path.read_text()).get("hooks", {}).get("state", {})
+            hooks = []
+            for event, groups in self.config.identity_hooks().items():
+                group, handler = groups[0], groups[0]["hooks"][0]
+                key = str(config_path) + ":" + event
+                current_hash = "sha256:" + "a" * 64
+                hooks.append({
+                    "key": key,
+                    "eventName": event[0].lower() + event[1:],
+                    "handlerType": "command",
+                    "command": handler["command"],
+                    "async": False,
+                    "matcher": group.get("matcher"),
+                    "timeoutSec": 10,
+                    "statusMessage": HOOK_STATUS,
+                    "additionalContextLimit": handler.get("additionalContextLimit"),
+                    "source": "user",
+                    "sourcePath": str(config_path),
+                    "enabled": True,
+                    "currentHash": current_hash,
+                    "trustStatus": "trusted" if state.get(key, {}).get("trusted_hash") == current_hash else "untrusted",
+                })
+            return {"data": [{"cwd": str(self.config.workspace), "warnings": [], "errors": [], "hooks": hooks}]}
         if self.on_request:
             result = self.on_request(method, params)
             return await result if inspect.isawaitable(result) else result
@@ -110,6 +139,12 @@ def started(thread, parent=None):
 def host(tmp_path, monkeypatch):
     config = RuntimeConfig(str(tmp_path), "/usr/bin/true", "codex-cli fixture", "unused")
     config.prepare_directories()
+    # Real identity prerequisites belong to modern Service initialization; do
+    # not bypass its snapshot reader just to reach the epoch fault injection.
+    (config.workspace / "memory").mkdir(exist_ok=True)
+    for name in ("SOUL.md", "USER.md", "memory/MEMORY.md"):
+        (config.workspace / name).write_text("Synthetic epoch test identity.\n")
+    config.write_codex_config()
     monkeypatch.setattr(config, "environment", lambda: {})
     service = Service(config)
     service.state["tasks"]["main"] = {"thread_id": "root", "paused": False}
@@ -542,7 +577,7 @@ async def test_run_persists_prepared_and_bound_identity_before_initialize_notifi
     host.config.verify_binary = Mock()
     host._recover_orphan = AsyncMock()
     process = SimpleNamespace(pid=424242, returncode=None)
-    rpc = FakeRpc()
+    rpc = FakeRpc(config=host.config)
     witnessed = {}
 
     async def spawn(*args, **kwargs):
