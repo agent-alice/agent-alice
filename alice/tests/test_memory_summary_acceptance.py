@@ -254,11 +254,11 @@ def test_summary_commit_reports_missing_source_without_writing(tmp_path, missing
 
 
 @pytest.mark.parametrize(
-    "relative_path,blocked",
-    [("2026-08-31.jsonl", False), ("2026-09-01/large.jsonl", True), ("unknown.jsonl", True)],
+    "relative_path,expected_count",
+    [("2026-08-31.jsonl", 1), ("2026-09-01/large.jsonl", 2), ("unknown.jsonl", None)],
 )
 def test_oversized_summary_record_uses_known_file_dates_conservatively(
-    tmp_path, relative_path, blocked
+    tmp_path, relative_path, expected_count
 ):
     store = MemoryStore(tmp_path / "data")
     root = store.workspace / "memory/chronicle/traces"
@@ -269,15 +269,27 @@ def test_oversized_summary_record_uses_known_file_dates_conservatively(
     oversized = root / relative_path
     oversized.parent.mkdir(exist_ok=True)
     oversized.write_text("x" * (memory._PARSE_CHARS + 1) + "\n")
-    if blocked:
-        with pytest.raises(SummaryValidationError, match="explicit partitioning"):
+    if expected_count is None:
+        with pytest.raises(SummaryValidationError, match="no valid timestamp"):
             store.prepare_summary("L1", "2026-09-01T00:00", now=NOW)
         assert list(store.batches.iterdir()) == []
     else:
         batch = store.prepare_summary("L1", "2026-09-01T00:00", now=NOW)
-        assert batch["source_count"] == 1
+        assert batch["source_count"] == expected_count
         manifest = json.loads(Path(batch["manifest_path"]).read_text())
-        assert manifest["files"][0]["path"].endswith("traces/2026-09-01.jsonl")
+        catalog = Path(batch["manifest_path"]).parent / manifest["files"]["path"]
+        files = [json.loads(line) for line in catalog.read_text().splitlines()]
+        assert any(entry["path"].endswith("traces/2026-09-01.jsonl") for entry in files)
+        assert len(files) == expected_count
+        if expected_count == 2:
+            page = store.summary_partition_next(batch["batch_id"])
+            sources = [
+                source
+                for node in page["ready"]
+                for source in json.loads(Path(node["manifest_path"]).read_text())["sources"]
+                if source["path"].endswith("large.jsonl")
+            ]
+            assert sources and all(source["parse_error"] for source in sources)
     assert oversized.stat().st_size == memory._PARSE_CHARS + 2
 
 

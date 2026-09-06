@@ -35,6 +35,8 @@ UNATTENDED_TOOLS = (
     "memory_read",
     "memory_prepare_summary",
     "memory_commit_summary",
+    "memory_summary_partition_next",
+    "memory_commit_summary_partition",
     "resources_status",
     "resources_record_observation",
 )
