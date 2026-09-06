@@ -560,6 +560,80 @@ class Service:
                     task.pop("resource_pause_pending", None)
                     self.save()
 
+    def _thread_has_input(self, task: dict) -> bool:
+        return bool(task.get("has_input")) or any(
+            intent["thread_id"] == task["thread_id"] for intent in self.state["intents"].values()
+        )
+
+    async def _bootstrap_thread(
+        self, task: dict, native_thread: dict, *, fresh: bool = False
+    ) -> None:
+        """Make an unused owned root resumable without manufacturing a model turn."""
+        thread_id = task["thread_id"]
+        bootstrap = task.get("bootstrap")
+        if bootstrap is not None and (
+            not isinstance(bootstrap, dict)
+            or bootstrap.get("version") != 1
+            or bootstrap.get("thread_id") != thread_id
+            or bootstrap.get("state") not in {"pending", "sending", "unknown", "ready"}
+        ):
+            raise RpcError("Unsupported native bootstrap state; reconcile without replacing root")
+        if bootstrap and bootstrap["state"] == "ready":
+            return
+        if not bootstrap and self._thread_has_input(task):
+            return  # Existing real work must not acquire another initialization entry.
+
+        async def confirm_rollout():
+            await self.codex.thread_resume(
+                thread_id,
+                cwd=str(self.config.workspace),
+                model=self.config.model,
+                **self.config.native_permission_params(),
+            )
+
+        if not fresh:
+            try:
+                await confirm_rollout()
+            except RpcError as error:
+                if (
+                    error.code != -32600
+                    or str(error) != f"no rollout found for thread id {thread_id}"
+                ):
+                    raise
+            else:
+                task["bootstrap"] = {"version": 1, "thread_id": thread_id, "state": "ready"}
+                self.save()
+                return  # Raw developer entries are not necessarily exposed by items/list.
+
+        if bootstrap and bootstrap["state"] in {"sending", "unknown"}:
+            raise RpcError("Native bootstrap outcome is unknown; reconcile without replay")
+        if self._thread_has_input(task) or native_thread.get("status", {}).get("type") != "idle":
+            raise RpcError("Native bootstrap requires an unused idle owned thread")
+        # Do not request full history here: Codex's unmaterialized paginated
+        # roots cannot service turns/list or read(includeTurns=True). A new root
+        # is not returned to an attach caller until bootstrap has finished;
+        # legacy roots also require the exact no-rollout response above.
+        current = native_thread if fresh else (await self.codex.thread_read(thread_id))["thread"]
+        if (
+            self._thread_has_input(task)
+            or current.get("status", {}).get("type") != "idle"
+            or current.get("turns")
+        ):
+            raise RpcError("Native input arrived during bootstrap; initialization not sent")
+        if self.stopping:
+            raise DeferredDispatch("Service is stopping")
+        task["bootstrap"] = {"version": 1, "thread_id": thread_id, "state": "sending"}
+        self.save()  # An uncertain inject must never be sent a second time automatically.
+        try:
+            await self.codex.record_runtime_initialization(thread_id)
+            await confirm_rollout()
+        except Exception:
+            task["bootstrap"]["state"] = "unknown"
+            self.save()
+            raise
+        task["bootstrap"]["state"] = "ready"  # Rollout observed, not a user-input receipt.
+        self.save()
+
     async def ensure_thread(self, key: str) -> dict:
         if not isinstance(key, str) or not key or len(key) > 150:
             raise ValueError("Task name must contain 1–150 characters")
@@ -592,18 +666,30 @@ class Service:
                             model=self.config.model,
                             **self.config.native_permission_params(),
                         )
-                    return task
                 except RpcError as error:
-                    untouched = not task.get("has_input") and not any(
-                        intent["thread_id"] == task["thread_id"]
-                        for intent in self.state["intents"].values()
-                    )
-                    if not untouched or "no rollout found" not in str(error):
+                    bootstrap = task.get("bootstrap")
+                    if (
+                        self._thread_has_input(task)
+                        or (
+                            bootstrap is not None
+                            and (
+                                not isinstance(bootstrap, dict)
+                                or bootstrap.get("version") != 1
+                                or bootstrap.get("thread_id") != task["thread_id"]
+                                or bootstrap.get("state") != "pending"
+                            )
+                        )
+                        or error.code != -32600
+                        or str(error) != f"no rollout found for thread id {task['thread_id']}"
+                    ):
                         raise
                     # Codex intentionally doesn't persist an unused empty thread.
                     # Never use this fallback after any acknowledged/unknown input.
                     # Retain the old alias and its pause flags until replacement
                     # succeeds, including if this process dies during thread/start.
+                else:
+                    await self._bootstrap_thread(task, result["thread"])
+                    return task
             if self.stopping:
                 raise DeferredDispatch("Service is stopping")
             result = await self.codex.thread_start(
@@ -620,7 +706,7 @@ class Service:
                 ),
             )
             if task:
-                if task.get("has_input"):
+                if self._thread_has_input(task):
                     raise RpcError("Input was observed while replacing an empty thread")
                 self.state.setdefault("replaced_empty_threads", []).append(task["thread_id"])
             task = {
@@ -629,9 +715,15 @@ class Service:
                 "paused": bool(task and task.get("paused")),
                 "created_at": time.time(),
                 "has_input": False,
+                "bootstrap": {
+                    "version": 1,
+                    "thread_id": result["thread"]["id"],
+                    "state": "pending",
+                },
             }
             self.state["tasks"][key] = task
-            self.save()
+            self.save()  # Preserve the alias before the first native history write.
+            await self._bootstrap_thread(task, result["thread"], fresh=True)
             return task
 
     async def is_busy(self, target: str) -> bool:

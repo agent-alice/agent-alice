@@ -83,7 +83,7 @@ class CodexClient:
                 self._active_turns.pop(thread_id, None)
 
     async def thread_start(self, params: dict | None = None, **overrides: Any) -> dict:
-        """Start an owned thread; its ID is not durable until a turn materializes.
+        """Start an owned thread; its ID may not yet have durable native history.
 
         Codex may return an ID for an empty thread with no persisted rollout. The host
         must record this distinction; a later failed resume must not silently replace
@@ -94,6 +94,37 @@ class CodexClient:
         self.register_root(thread["id"])
         self._remember_thread(thread)
         return result
+
+    async def record_runtime_initialization(self, thread_id: str) -> dict:
+        """Append a real host lifecycle fact without a user message or model turn.
+
+        The host must reconcile uncertain outcomes before calling again. This
+        public operation has no idempotency key and is not a history replacement.
+        """
+        self._require_owned(thread_id)
+        return await self.rpc.request(
+            "thread/inject_items",
+            {
+                "threadId": thread_id,
+                "items": [
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "Alice host lifecycle record: the runtime has registered this thread "
+                                    "as an Alice-owned task. This initialization record is not a user "
+                                    "request or an assistant response and does not authorize a model "
+                                    "turn, an external action, or a persistent Goal."
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
 
     async def thread_resume(self, thread_id: str, **overrides: Any) -> dict:
         self._require_owned(thread_id)
