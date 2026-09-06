@@ -268,7 +268,9 @@ async def test_configured_collection_failure_after_restart_is_unknown_not_unconf
         runtime.codex.turn_start.assert_awaited_once()
 
 
-@pytest.mark.parametrize("invalid", ["later_binding", "future_version"])
+@pytest.mark.parametrize(
+    "invalid", ["later_binding", "future_version", "target_surrogate", "spec_surrogate"]
+)
 def test_invalid_source_batch_fails_before_any_service_component_or_persistent_write(
     tmp_path, monkeypatch, invalid
 ):
@@ -279,8 +281,12 @@ def test_invalid_source_batch_fails_before_any_service_component_or_persistent_w
         second = deepcopy(document["sources"][0])
         second.update(target="other-monitor", wait_seconds=0)
         document["sources"].append(second)
-    else:
+    elif invalid == "future_version":
         document["version"] = 99
+    elif invalid == "target_surrogate":
+        document["sources"][0]["target"] = "monitor-\ud800"
+    else:
+        document["sources"][0]["spec"]["subject"] = "member-\udfff"
     config.heartbeat_sources = document  # Direct construction must validate too.
     config.database.write_bytes(b"synthetic unopened business state\x00")
     (config.root / "state/resources.sqlite3").write_bytes(b"synthetic resource state\x00")

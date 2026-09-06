@@ -54,7 +54,12 @@ print(json.dumps({'python':sys.executable, 'module':str(module), 'version':dist.
         timeout=10,
     )
     assert probe.returncode == 0, probe.stderr
-    assert Path(json.loads(probe.stdout)["python"]).absolute() == Path(python)
+    actual_python = Path(json.loads(probe.stdout)["python"])
+    expected_python = Path(python)
+    # Normalize macOS /tmp aliases without following the venv's executable
+    # symlink to a base Python that could be shared by an unrelated candidate.
+    assert actual_python.parent.resolve() == expected_python.parent.resolve()
+    assert actual_python.name == expected_python.name
     return python
 
 

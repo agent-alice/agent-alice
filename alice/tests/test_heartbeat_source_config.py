@@ -240,6 +240,68 @@ def test_unknown_spec_field_is_rejected_without_echoing_its_name_or_value():
     assert "private-secret" not in str(caught.value)
 
 
+@pytest.mark.parametrize("escape", [r"\ud800", r"\udfff"])
+@pytest.mark.parametrize(
+    "field", ["target", "source_id", "subject", "collection", "auth_context_version", "url"]
+)
+def test_json_escaped_surrogates_fail_during_parsing_without_echoing_text(escape, field):
+    raw = source_config()
+    invalid = "fixture-private-text" + json.loads('"' + escape + '"')
+    if field == "target":
+        raw["sources"][0][field] = invalid
+    else:
+        raw["sources"][0]["spec"][field] = (
+            "https://example.invalid/answers?filter=" + invalid if field == "url" else invalid
+        )
+    # Valid JSON syntax can still decode to text that UTF-8 cannot represent.
+    serialized = json.dumps(raw)
+    assert escape in serialized
+    decoded = json.loads(serialized)
+    before = deepcopy(decoded)
+    with pytest.raises(ValueError) as caught:
+        parse_heartbeat_sources(decoded)
+    assert type(caught.value) is ValueError
+    assert "heartbeat" in str(caught.value)
+    assert "fixture-private-text" not in str(caught.value)
+    assert "example.invalid" not in str(caught.value)
+    assert caught.value.__suppress_context__
+    assert decoded == before
+
+
+def test_valid_json_surrogate_pair_decodes_to_supported_unicode_text():
+    text = json.loads(r'"fixture-\ud83d\ude80"')
+    raw = source_config(target=text)
+    raw["sources"][0]["spec"]["subject"] = text
+    binding = parse_heartbeat_sources(raw)[0]
+    assert binding.target == binding.spec.subject == "fixture-🚀"
+    adapter = heartbeat_module.HostHeartbeatAdapter()
+    adapter.register(binding.target, binding.spec)
+    assert len(binding.spec.scope_sha256) == 64
+
+
+@pytest.mark.parametrize("field", ["target", "subject"])
+def test_escaped_invalid_unicode_cannot_be_saved_or_loaded_as_runtime_configuration(runtime, field):
+    runtime.save()
+    path = runtime.root / "config.json"
+    original = path.read_bytes()
+    raw = source_config()
+    owner = raw["sources"][0] if field == "target" else raw["sources"][0]["spec"]
+    owner[field] = json.loads(r'"fixture-private-text-\ud800"')
+    runtime.heartbeat_sources = raw
+    with pytest.raises(ValueError) as save_error:
+        runtime.save()
+    assert "fixture-private-text" not in str(save_error.value)
+    assert path.read_bytes() == original
+    document = json.loads(original)
+    document["heartbeat_sources"] = raw
+    path.write_text(json.dumps(document))
+    damaged = path.read_bytes()
+    with pytest.raises(ValueError) as load_error:
+        load_config(runtime.root)
+    assert "fixture-private-text" not in str(load_error.value)
+    assert path.read_bytes() == damaged
+
+
 def test_scope_preserves_authentication_binding_but_excludes_wait_and_fetch_budgets():
     raw = source_config()
     initial = parse_heartbeat_sources(raw)[0]

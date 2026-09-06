@@ -180,6 +180,10 @@ def parse_heartbeat_sources(raw: object) -> tuple[HeartbeatSourceBinding, ...]:
         if not isinstance(entry, dict) or set(entry) != {"target", "wait_seconds", "spec"}:
             raise ValueError("heartbeat source requires target, wait_seconds and spec")
         target = _text(entry["target"], "heartbeat target", maximum=150)
+        try:
+            target.encode("utf-8")
+        except UnicodeError:
+            raise ValueError("heartbeat target must be valid UTF-8 text") from None
         if target == "new" or target.startswith(("summary:", "scheduled:")):
             raise ValueError("heartbeat source requires a stable named target")
         if target in targets:
@@ -204,6 +208,9 @@ def parse_heartbeat_sources(raw: object) -> tuple[HeartbeatSourceBinding, ...]:
             values["header_env"] = tuple(tuple(pair) for pair in headers)
         try:
             spec = CollectionSpec(**values)
+            # Registration hashes the scope after Service opens its stores.
+            # Reject text that cannot be hashed here, before any host side effects.
+            spec.scope_sha256
         except (TypeError, ValueError, OverflowError):
             # Never interpolate configuration values or expose constructor errors
             # that could contain a private URL or credential material.

@@ -175,7 +175,7 @@ async def recover_owned_server(config: RuntimeConfig, state: dict) -> None:
 
 class Service:
     def __init__(self, config: RuntimeConfig):
-        # Validate the complete host configuration before opening business
+        # Validate the complete source configuration before opening business
         # stores or starting native work, including direct embedded callers.
         heartbeat_sources = parse_heartbeat_sources(config.heartbeat_sources)
         self.config = config
