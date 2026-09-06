@@ -35,6 +35,10 @@
 
 控制进程 SIGKILL 后，新实例核对并回收原 Codex 孤儿，再恢复原 thread/intent 关联。Codex SIGKILL 后服务停止派发并保持人工暂停；native inProgress/缺失终态只保留待对账状态，不推断 completed，不换 ID 重放。公开 inventory 分页扫描 archived 与未 archived 列表，并核对父链；只接管属于已登记 roots 的后代。
 
+`service.recover_owned_server(config, state)` 是独立的异步孤儿清理入口，供持有 `service.lock` 且已确认旧 daemon 退出的调用者使用；`Service._recover_orphan` 委托给它。入口不构造 `Service`，不打开业务 SQLite、不验证或迁移业务 schema，也不写 Alice runtime、别名或暂停状态，因此业务数据库损坏或来自更新版本仍可清理已确认的自有进程。调用者提供已读取的 runtime，清理只使用 server 身份及可读取的 task root ID；runtime 无法读取或 server 身份不能验证时，不能推断进程归属。
+
+清理逐个尝试所有有效根的原生 `stop_tree`，精确的根 not-loaded/not-found 错误先按同 ID resume 再停树；这可能更新 Codex 自己的原生状态，但不会重建根、提交输入或恢复 Alice 派发。一个空别名无 rollout 或其他单根异常不会跳过其余根。原生连接或停树失败后仍按出生身份和进程组再次核对，仅终止自己的原有组。函数正常返回只证明原组已退出或原进程已不存在，不证明无法访问的原生后代、脱离原组的进程或外部副作用都已消除；不能据此把未知任务标记完成。supervisor 的锁与退出顺序由集成线接入，本入口自身不取得第二把锁。
+
 ## 兼容与回退
 
 本次不变更 runtime version 1、SQLite schema 1、事件 ID、路径和 CLI/config/MCP 接口。新增的 runtime 字段可由旧版本读取/保留；旧数据缺少 `automatic` 时不推断原生 Goal 的来源，需集成负责人在暂停状态下核对旧根归属。旧版错误写成 failed 的窗口不会被自动重置，因为旧记录不足以证明没有外部副作用。
@@ -54,6 +58,7 @@ python tools/check.py --source . --codex-binary "$ALICE_CODEX" --native \
 ```
 
 - `test_service.py`、`test_scheduler.py`、`test_store.py`、`test_calendar.py`：重复 ID、原子准入、并发 claim、发送边界暂停、跨窗口/时区依赖、配额停树及持久待停止恢复。属合成传输与隔离本地数据证据。
+- `test_owned_recovery.py`：业务存储不可用时独立清理、逐根停止、精确同 ID 恢复及身份变化拒绝发送信号；使用合成 RPC 和隔离自有进程，不作为真实 Codex 协议证据。
 - `test_native_service.py`：实际 CLI + 真实 Codex + 实际必需 MCP；重复请求、原生中断/迟到响应、普通重启、控制进程 SIGKILL 后孤儿回收、活动 Codex SIGKILL 后恢复、MCP 初始化失败且原数据保留。
 - `test_rpc.py` 的 native 用例：公开协议和真实 V2 子代理执行、发现与停止。`main` 是持久受控根；独立命名 target 通过 thread/start 建立另一受控根；V2 子代理由 Codex 原生协作创建，Alice 只按父链识别并停止，不建立另一代理循环。
 - `test_artifact_smoke.py`：安装 wheel 的实际入口和故障演练，所用 fake Codex 不作为原生协议证据。完整检查器另将 `ALICE_ARTIFACT_PYTHON` 指向同一个 wheel 的解释器，native service 子进程以 `-I` 运行该产物。

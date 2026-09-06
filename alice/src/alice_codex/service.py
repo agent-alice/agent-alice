@@ -36,7 +36,7 @@ from .store import DispatchReceipt, Store
 
 def process_identity(pid: int) -> str | None:
     result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="],
+        ["ps", "-ww", "-p", str(pid), "-o", "lstart=", "-o", "command="],
         capture_output=True,
         text=True,
         timeout=5,
@@ -49,6 +49,122 @@ def process_birth(pid: int) -> str | None:
         ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, timeout=5
     )
     return result.stdout.strip() or None
+
+
+async def _stop_native_root(
+    client: CodexClient, config: RuntimeConfig, thread_id: str, *, timeout: float | None = None
+) -> dict:
+    options = {} if timeout is None else {"timeout": timeout}
+    try:
+        return await client.stop_tree(thread_id, **options)
+    except RpcError as error:
+        if error.code != -32600 or str(error) not in {
+            f"thread not loaded: {thread_id}",
+            f"thread not found: {thread_id}",
+        }:
+            raise
+        await client.thread_resume(
+            thread_id,
+            cwd=str(config.workspace),
+            model=config.model,
+            **config.native_permission_params(),
+        )
+        return await client.stop_tree(thread_id, **options)
+
+
+async def recover_owned_server(config: RuntimeConfig, state: dict) -> None:
+    """Stop a recorded orphan without constructing Service or opening business stores.
+
+    The caller must hold service.lock and ensure the previous daemon has exited.
+    Only the server identity and valid task root IDs are read; no runtime schema
+    migration, root replacement, pause change or Alice state write occurs. Native stop
+    failures fall back to termination of the verified owned group; returning does
+    not prove that detached processes or external business effects were undone.
+    """
+    previous = state.get("server")
+    if previous is None:
+        return
+    if not isinstance(previous, dict) or type(previous.get("pid")) is not int:
+        raise RuntimeError("Invalid recorded server identity; refusing recovery")
+    pid = previous["pid"]
+    if pid <= 0:
+        raise RuntimeError("Invalid recorded server identity; refusing recovery")
+    current = process_identity(pid)
+    if not current:
+        return
+    born = process_birth(pid)
+    if born is None:
+        return  # The owned process can exit between observations.
+    same_identity = (
+        born == previous["birth"] if previous.get("birth") else current == previous.get("identity")
+    )
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    if not same_identity or pgid != pid or str(config.codex_socket) not in current:
+        raise RuntimeError("Recorded server identity changed; refusing to signal another process")
+
+    tasks = state.get("tasks")
+    roots = list(
+        dict.fromkeys(
+            task["thread_id"]
+            for task in (tasks.values() if isinstance(tasks, dict) else [])
+            if isinstance(task, dict)
+            and isinstance(task.get("thread_id"), str)
+            and task["thread_id"]
+        )
+    )
+    # An orphan can own native terminals outside its original process group.
+    # Try every known root, even if an earlier empty alias has no saved rollout.
+    recovered_rpc = None
+    try:
+        recovered_rpc = await RpcClient.connect_unix(
+            config.codex_socket, timeout=2, request_timeout=5
+        )
+        await recovered_rpc.initialize(name="alice_recovery")
+        recovered = CodexClient(recovered_rpc, owned_root_ids=roots)
+        try:
+            for thread_id in roots:
+                try:
+                    await _stop_native_root(recovered, config, thread_id, timeout=5)
+                except Exception:
+                    # No failure authorizes a new root or another input attempt.
+                    continue
+        finally:
+            recovered.close()
+    except Exception:
+        pass  # Transport failure still requires verified owned-group cleanup.
+    finally:
+        if recovered_rpc:
+            with suppress(Exception):
+                await recovered_rpc.close()
+
+    def same_group_alive() -> bool:
+        observed_birth = process_birth(pid)
+        if observed_birth is None:
+            return False
+        if observed_birth != born:
+            raise RuntimeError("Owned server identity changed during recovery")
+        try:
+            if os.getpgid(pid) != pid:
+                raise RuntimeError("Owned server process group changed during recovery")
+        except ProcessLookupError:
+            return False
+        return True
+
+    for termination in (signal.SIGTERM, signal.SIGKILL):
+        if not same_group_alive():
+            return
+        try:
+            os.killpg(pid, termination)
+        except ProcessLookupError:
+            return
+        for _ in range(100):
+            if process_birth(pid) != born:
+                return
+            await asyncio.sleep(0.05)
+    raise RuntimeError("Owned orphan server did not exit")
 
 
 class Service:
@@ -102,64 +218,7 @@ class Service:
         return self._task_locks.setdefault(key, asyncio.Lock())
 
     async def _recover_orphan(self) -> None:
-        previous = self.state.get("server")
-        if not previous:
-            return
-        pid = previous["pid"]
-        current = process_identity(pid)
-        if not current:
-            return
-        born = process_birth(pid)
-        same_identity = (
-            born == previous["birth"] if previous.get("birth") else current == previous["identity"]
-        )
-        if (
-            not same_identity
-            or os.getpgid(pid) != pid
-            or str(self.config.codex_socket) not in current
-        ):
-            raise RuntimeError(
-                "Recorded server identity changed; refusing to signal another process"
-            )
-        # An orphan can still own terminals in other process groups. Ask its
-        # native runtime to stop them before terminating our original group.
-        recovered_rpc = None
-        try:
-            recovered_rpc = await RpcClient.connect_unix(
-                self.config.codex_socket, timeout=2, request_timeout=5
-            )
-            await recovered_rpc.initialize(name="alice_recovery")
-            recovered = CodexClient(
-                recovered_rpc,
-                owned_root_ids=[task["thread_id"] for task in self.state["tasks"].values()],
-            )
-            try:
-                for key in list(self.state["tasks"]):
-                    await self._stop_task(key, codex=recovered, timeout=5)
-            finally:
-                recovered.close()
-        except Exception:
-            # Transport failure doesn't authorize another invocation. The only
-            # fallback is termination of this verified, owned process group.
-            pass
-        finally:
-            if recovered_rpc:
-                await recovered_rpc.close()
-        if process_birth(pid) != born or os.getpgid(pid) != pid:
-            raise RuntimeError("Owned server identity changed during recovery")
-        os.killpg(pid, signal.SIGTERM)
-        for _ in range(100):
-            if process_birth(pid) != born:
-                return
-            await asyncio.sleep(0.05)
-        # Only the same verified process group, never a PID found by name alone.
-        if process_birth(pid) == born and os.getpgid(pid) == pid:
-            os.killpg(pid, signal.SIGKILL)
-        for _ in range(100):
-            if process_birth(pid) != born:
-                return
-            await asyncio.sleep(0.05)
-        raise RuntimeError("Owned orphan server did not exit")
+        await recover_owned_server(self.config, self.state)
 
     async def run(self) -> None:
         self.config.prepare_directories()
@@ -852,23 +911,8 @@ class Service:
         client = codex or self.codex
         task = self.state["tasks"][key]
         thread_id = task["thread_id"]
-        options = {} if timeout is None else {"timeout": timeout}
         try:
-            try:
-                return await client.stop_tree(thread_id, **options)
-            except RpcError as error:
-                if error.code != -32600 or str(error) not in {
-                    f"thread not loaded: {thread_id}",
-                    f"thread not found: {thread_id}",
-                }:
-                    raise
-                await client.thread_resume(
-                    thread_id,
-                    cwd=str(self.config.workspace),
-                    model=self.config.model,
-                    **self.config.native_permission_params(),
-                )
-                return await client.stop_tree(thread_id, **options)
+            return await _stop_native_root(client, self.config, thread_id, timeout=timeout)
         except RpcError as error:
             untouched = not task.get("has_input") and not any(
                 intent["thread_id"] == thread_id for intent in self.state["intents"].values()
