@@ -1124,6 +1124,12 @@ class MemoryStore:
                             )
                         if not eligible:
                             continue
+                        from .summary_partitions import embedded_references
+
+                        if embedded_references(self, path, obj=obj):
+                            raise _PartitionRequired(
+                                "Embedded partition coverage requires the partition protocol"
+                            )
                         source_id = _source_id("workspace", rel, digest, line)
                         if level in {"L1", "L2"} and not _valid_record_time(level, obj):
                             error = error or "missing_or_invalid_timestamp"

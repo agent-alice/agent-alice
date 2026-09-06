@@ -17,6 +17,7 @@ READ_BYTES = 65536
 MAX_JSON_DEPTH = 128
 MAX_METADATA_CHARS = 256
 _TIME_KEYS = frozenset({"timestamp", "time_start"})
+_KEY_CHARS = max(map(len, _TIME_KEYS | {"coverage_ref"}))
 _STRING_SPECIAL = re.compile(r'["\\\x00-\x1f]')
 _ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 _WHITESPACE = frozenset(" \t\r\n")
@@ -31,6 +32,7 @@ class RecordSpan:
     byte_end: int
     metadata: dict[str, str] = field(default_factory=dict)
     parse_error: str | None = None
+    has_coverage_ref: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class _JsonScanner:
         self.object_root = False
         self.error: str | None = None
         self.metadata: dict[str, str] = {}
+        self.has_coverage_ref = False
         self.seen_times: set[str] = set()
         self.mode: str | None = None
         self.string_state = "normal"
@@ -105,9 +108,9 @@ class _JsonScanner:
 
     def _string_store(self, text):
         self.string_size += len(text)
-        limit = max(map(len, _TIME_KEYS)) if self.string_key else MAX_METADATA_CHARS
+        limit = _KEY_CHARS if self.string_key else MAX_METADATA_CHARS
         if self.string_size > limit:
-            # A long key cannot name either selected field. Its syntax is still
+            # A long key cannot name a selected field. Its syntax is still
             # validated, but retaining the key would make memory input-sized.
             self.capture = False
             self.string_parts = []
@@ -124,6 +127,10 @@ class _JsonScanner:
         if self.string_key:
             frame = self.stack[-1]
             frame.key, frame.state = value, "colon"
+            if len(self.stack) == 1 and value == "coverage_ref":
+                # Presence is enough to require the host's proof verification.
+                # Its value is grammar-checked without being materialized here.
+                self.has_coverage_ref = True
             if len(self.stack) == 1 and value in _TIME_KEYS:
                 if value in self.seen_times:
                     self._fail("duplicate_time_key")
@@ -339,7 +346,8 @@ class _RecordScanner:
         self.feed(b"", final=True)
         error = "invalid_utf8" if self.invalid_utf8 else self.json.finish() if self.json else None
         metadata = dict(self.json.metadata) if self.json and not error else {}
-        return RecordSpan(line, start, end, metadata, error)
+        proof = bool(self.json and not error and self.json.has_coverage_ref)
+        return RecordSpan(line, start, end, metadata, error, proof)
 
 
 def scan_records(path: str | Path) -> Iterator[RecordSpan]:
@@ -351,6 +359,8 @@ def scan_records(path: str | Path) -> Iterator[RecordSpan]:
     Invalid records are drained to their line end and carry no trusted
     metadata. An unterminated final line is included. JSON duplicate time keys,
     non-string time values, deep nesting and invalid UTF-8 are explicit errors.
+    has_coverage_ref reports only a complete valid object's top-level key; the
+    caller must verify that proof. This helper does not retain its value.
     """
     path = Path(path)
     document = path.suffix.lower() in {".md", ".markdown"}

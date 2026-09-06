@@ -182,3 +182,80 @@ def test_legacy_commit_api_cannot_complete_a_partition_without_its_root(tmp_path
     assert not (store.workspace / "memory/chronicle/hourly/2026-09-01.jsonl").exists()
     drain(store, batch)
     assert store.summary_partition_next(batch["batch_id"])["complete"]
+
+
+def test_committed_coverage_count_cannot_hide_an_ancestor_gap(tmp_path):
+    store, source, batch = make_window(tmp_path, broken=True)
+    drain(store, batch)
+    intent_path = store.state / "commits" / f"{batch['batch_id']}.json"
+    intent = json.loads(intent_path.read_text())
+    target = store.workspace / intent["target"]
+    source_before, target_before = source.read_bytes(), target.read_bytes()
+    assert intent["manifest"]["coverage_ref"]["missing_fragments"] == 1
+    intent["manifest"]["coverage_ref"]["missing_fragments"] = 0
+    intent_path.write_text(json.dumps(intent))
+    damaged_intent = intent_path.read_bytes()
+
+    with pytest.raises((MemoryConflictError, SummaryValidationError)):
+        MemoryStore(store.data_dir)
+
+    assert source.read_bytes() == source_before
+    assert target.read_bytes() == target_before
+    assert intent_path.read_bytes() == damaged_intent
+
+
+@pytest.mark.parametrize("target_written", [False, True], ids=["before-target", "after-target"])
+def test_pending_rendered_output_is_bound_to_root_candidate(tmp_path, monkeypatch, target_written):
+    store, source, batch = make_window(tmp_path)
+    plan = json.loads(Path(batch["manifest_path"]).read_text())
+    for _ in range(100):
+        page = store.summary_partition_next(batch["batch_id"])
+        root = next(
+            (node for node in page["ready"] if node["node_id"] == plan["root_node_id"]),
+            None,
+        )
+        if root is not None:
+            break
+        assert page["ready"]
+        for node in page["ready"]:
+            store.commit_summary_partition(batch["batch_id"], node["node_id"], candidate(node))
+    else:
+        pytest.fail("Synthetic DAG did not make its root ready")
+
+    target = store.workspace / plan["target"]
+    intent_path = store.state / "commits" / f"{batch['batch_id']}.json"
+    atomic = memory._atomic
+
+    def stop_at_boundary(path, raw):
+        if (not target_written and Path(path) == target) or (
+            target_written
+            and Path(path) == intent_path
+            and json.loads(raw).get("status") == "committed"
+        ):
+            raise RuntimeError("Synthetic interruption with a durable pending intent")
+        return atomic(path, raw)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(memory, "_atomic", stop_at_boundary)
+        with pytest.raises(RuntimeError, match="durable pending intent"):
+            store.commit_summary_partition(batch["batch_id"], root["node_id"], candidate(root))
+
+    assert target.exists() == target_written
+    target_before = target.read_bytes() if target_written else None
+    source_before = source.read_bytes()
+    intent = json.loads(intent_path.read_text())
+    assert intent["status"] == "pending"
+    # A matching self-reported hash cannot authorize text the root never committed.
+    intent["rendered"] = "Unvalidated synthetic replacement of the approved summary.\n"
+    intent["after_sha256"] = hashlib.sha256(intent["rendered"].encode()).hexdigest()
+    intent_path.write_text(json.dumps(intent))
+    damaged_intent = intent_path.read_bytes()
+
+    with pytest.raises((MemoryConflictError, SummaryValidationError)):
+        MemoryStore(store.data_dir)
+
+    assert target.exists() == target_written
+    if target_written:
+        assert target.read_bytes() == target_before
+    assert source.read_bytes() == source_before
+    assert intent_path.read_bytes() == damaged_intent

@@ -174,6 +174,86 @@ def test_time_metadata_limit_does_not_limit_other_object_keys_or_values(tmp_path
     assert invalid.metadata == {} and invalid.parse_error == "time_metadata_exceeds_limit"
 
 
+@pytest.mark.parametrize("read_bytes", [1, 7, 65536])
+def test_top_level_coverage_presence_matches_independent_json_key_decoding(
+    tmp_path, monkeypatch, read_bytes
+):
+    monkeypatch.setattr(stream, "READ_BYTES", read_bytes)
+    variants = [
+        b'{"coverage_ref":null}', b'{"coverage_ref":true}', b'{"coverage_ref":42}',
+        b'{"coverage_ref":"proof value is not retained"}',
+        b'{"cover\\u0061ge_ref":{"path":"coverage.jsonl"},"timestamp":"t"}',
+        b'{"coverage_re\\u0066":[],"coverage_ref":{}}',
+        b'{"nested":{"coverage_ref":{}},"items":[{"coverage_ref":{}}]}',
+        b'{"content":"\\\"coverage_ref\\\": {}","timestamp":"t"}',
+        b'{"coverage_refs":{},"xcoverage_ref":{},"coverage_refx":{}}',
+        b'{"coverage_ref":{},"nested":{"coverage_ref":null}}',
+    ]
+    rng = random.Random(492601)
+    for _ in range(180):
+        raw = rng.choice(variants[:10])
+        at = rng.randrange(len(raw) + 1)
+        if rng.randrange(2):
+            changed = raw[:at] + bytes([rng.choice(b'{}[],:"\\abcdefghijklmnopqrstuvwxyz012 ' )]) + raw[at:]
+        else:
+            changed = raw[:at] + raw[at + 1:]
+        variants.append(changed)
+    valid = invalid = 0
+    for raw in variants:
+        record, = stream.scan_records(source(tmp_path, raw + b"\n"))
+        metadata, error = reference_metadata(raw)
+        if error is not None:
+            invalid += 1
+            assert record.parse_error is not None and not record.has_coverage_ref
+        else:
+            valid += 1
+            value = json.loads(raw)
+            assert record.parse_error is None and record.metadata == metadata
+            assert record.has_coverage_ref == ("coverage_ref" in value)
+    assert valid >= 10 and invalid >= 50
+
+
+@pytest.mark.parametrize("raw", [
+    b'{"coverage_ref":{}', b'{"coverage_ref":{"bad":[1,]}}',
+    b'{"coverage_ref":{},"content":"bad\xff"}',
+    b'{"coverage_ref":{},"timestamp":"one","timestamp":"two"}',
+])
+def test_invalid_record_never_publishes_a_trusted_coverage_flag(tmp_path, raw):
+    records = list(stream.scan_records(source(tmp_path, raw + b"\n{}\n")))
+    assert len(records) == 2
+    assert records[0].parse_error is not None and not records[0].has_coverage_ref
+    assert records[0].metadata == {} and records[1].parse_error is None
+    assert not records[1].has_coverage_ref
+
+
+@pytest.mark.parametrize("placement", ["before", "after", "giant_value"])
+def test_coverage_before_after_or_containing_giant_string_keeps_bounded_heap(
+    tmp_path, placement, record_property
+):
+    path = tmp_path / "giant-proof.jsonl"
+    prefix, suffix = {
+        "before": (b'{"coverage_ref":{},"content":"', b'","timestamp":"t"}\n'),
+        "after": (b'{"content":"', b'","coverage_ref":{},"timestamp":"t"}\n'),
+        "giant_value": (b'{"coverage_ref":"', b'","timestamp":"t"}\n'),
+    }[placement]
+    with path.open("wb") as handle:
+        handle.write(prefix)
+        for _ in range(256):
+            handle.write(b"x" * 65536)
+        handle.write(suffix)
+    tracemalloc.start()
+    try:
+        record, = stream.scan_records(path)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert record == stream.RecordSpan(1, 0, path.stat().st_size, {"timestamp": "t"}, None, True)
+    assert path.stat().st_size > 16 * 1024 * 1024
+    assert peak < 2 * 1024 * 1024
+    record_property("coverage_source_bytes", path.stat().st_size)
+    record_property("coverage_peak_python_bytes", peak)
+
+
 @pytest.mark.parametrize("read_bytes", [1, 5, 65536])
 def test_selected_metadata_decodes_surrogate_pairs_before_its_character_limit(tmp_path, monkeypatch, read_bytes):
     monkeypatch.setattr(stream, "READ_BYTES", read_bytes)

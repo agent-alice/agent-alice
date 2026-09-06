@@ -49,6 +49,9 @@ NODE_OUTPUT_BYTES = 16 * 1024
 FAN_IN = 8
 _HEX = re.compile(r"[a-f0-9]{64}\Z")
 _NODE = re.compile(r"n([0-9]{4})-([0-9]{12})\Z")
+_COVERAGE_MARKER = re.compile(rb"<!-- anima-coverage:([a-f0-9]{64}):([a-f0-9]{64}) -->")
+_COVERAGE_START = re.compile(rb"<!-- anima-coverage:")
+_COVERAGE_MARKER_BYTES = len(b"<!-- anima-coverage:") + 64 + 1 + 64 + len(b" -->")
 
 
 def validate_summary_commit_header(
@@ -178,13 +181,83 @@ def has_upstream(memory, targets):
     return False
 
 
-def _upstream(memory, targets):
+def _embedded_reference(memory, reference):
+    if (
+        not isinstance(reference, dict)
+        or not isinstance(reference.get("partition_plan"), str)
+        or not _HEX.fullmatch(reference["partition_plan"])
+    ):
+        raise SummaryValidationError("Embedded coverage reference is invalid or unverifiable")
+    identifier = reference["partition_plan"]
+    path = _join(memory.state, f"commits/{identifier}.json")
+    if not path.exists():
+        raise SummaryValidationError(
+            "Embedded coverage proof is missing; cannot discard its unknown gaps"
+        )
+    intent = _load(path)
+    if intent.get("schema_version") != 2 or intent.get("status") != "committed":
+        raise SummaryValidationError("Embedded coverage proof is not a committed partition")
+    recover_plan(memory, intent)
+    if reference != intent["manifest"]["coverage_ref"]:
+        raise SummaryValidationError(
+            "Embedded coverage reference does not match its committed proof"
+        )
+    return identifier
+
+
+def embedded_references(memory, path, *, obj=None, record=None):
+    """Validate source-carried references, including imported summaries without local state."""
+    found = set()
+    if path.suffix.lower() == ".jsonl":
+        if record is not None and getattr(record, "has_coverage_ref", False):
+            if record.byte_end - record.byte_start > 1024 * 1024:
+                raise SummaryValidationError(
+                    "Embedded coverage reference in an oversized record cannot be verified"
+                )
+            with path.open("rb") as source:
+                source.seek(record.byte_start)
+                obj = json.loads(source.read(record.byte_end - record.byte_start))
+        if isinstance(obj, dict) and "coverage_ref" in obj:
+            found.add(_embedded_reference(memory, obj["coverage_ref"]))
+    elif path.suffix.lower() in {".md", ".markdown"}:
+        tail = b""
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(65536)
+                value = tail + chunk
+                for start in _COVERAGE_START.finditer(value):
+                    match = _COVERAGE_MARKER.match(value, start.start())
+                    if match is None:
+                        if chunk and len(value) - start.start() < _COVERAGE_MARKER_BYTES:
+                            continue  # The remaining marker may cross the next read boundary.
+                        raise SummaryValidationError("Embedded coverage marker is malformed")
+                    identifier, digest = (item.decode("ascii") for item in match.groups())
+                    receipt_path = _join(memory.state, f"commits/{identifier}.json")
+                    if not receipt_path.exists():
+                        raise SummaryValidationError(
+                            "Embedded coverage proof is missing; cannot discard its unknown gaps"
+                        )
+                    receipt = _load(receipt_path)
+                    reference = receipt.get("manifest", {}).get("coverage_ref", {})
+                    if reference.get("sha256") != digest:
+                        raise SummaryValidationError(
+                            "Embedded coverage marker does not match its proof"
+                        )
+                    if identifier not in found:
+                        found.add(_embedded_reference(memory, reference))
+                tail = value[-160:]
+                if not chunk:
+                    break
+    return found
+
+
+def _upstream(memory, targets, explicit):
     for path in sorted(_join(memory.state, "commits").glob("*.json")):
         intent = _load(path)
         if (
             intent.get("schema_version") != 2
             or intent.get("status") != "committed"
-            or intent.get("target") not in targets
+            or (intent.get("target") not in targets and intent.get("batch_id") not in explicit)
         ):
             continue
         validate_summary_commit_header(intent)
@@ -214,6 +287,7 @@ def prepare(memory, level, period, *, now=None, timezone="Asia/Shanghai"):
         pending, pending_bytes = [], 0
         latest_hash = None
         selected_targets = set()
+        explicit_upstream = set()
         with (
             (staging / "files.jsonl").open("w") as files,
             (staging / "records.jsonl").open("w") as records,
@@ -265,6 +339,7 @@ def prepare(memory, level, period, *, now=None, timezone="Asia/Shanghai"):
                         )
                     if not _in_period(level, path, record.metadata, start, end):
                         continue
+                    explicit_upstream.update(embedded_references(memory, path, record=record))
                     error = record.parse_error or (
                         None if valid_time else "missing_or_invalid_timestamp"
                     )
@@ -364,7 +439,7 @@ def prepare(memory, level, period, *, now=None, timezone="Asia/Shanghai"):
                 os.fsync(stream.fileno())
         upstream_count, inherited_gaps = 0, False
         with (staging / "upstream.jsonl").open("w") as upstream:
-            for entry in _upstream(memory, selected_targets):
+            for entry in _upstream(memory, selected_targets, explicit_upstream):
                 _row(upstream, entry)
                 upstream_count += 1
                 coverage = entry["coverage_ref"]
@@ -511,6 +586,129 @@ def recover_plan(memory, intent):
             raise MemoryConflictError(
                 "Partition commit candidate does not match its validated root"
             )
+        _check_coverage(directory, plan, reference, receipt)
+        final = _final_image(memory, directory, plan, manifest, receipt["candidate"])
+        if any(
+            intent.get(key) != final[key] for key in ("before_sha256", "after_sha256", "rendered")
+        ):
+            raise MemoryConflictError(
+                "Partition rendering differs from its fixed before image and validated root"
+            )
+
+
+def _check_coverage(directory, plan, reference, root):
+    """Recount the immutable evidence, rather than inheriting mutable receipt totals."""
+    records = iter(_catalog(directory, plan["records"]))
+    record = None
+    offset = fragments = missing = record_count = fragments_in_record = 0
+    proof = {
+        "path": reference["path"],
+        "sha256": reference["sha256"],
+        "count": plan["fragment_count"],
+    }
+    for row in _catalog(directory, proof):
+        if record is None:
+            record = next(records, None)
+            if record is None:
+                raise MemoryConflictError("Coverage proof contains extra records")
+            offset, fragments_in_record = record["byte_start"], 0
+        if (
+            row.get("parent_source_id") != record["parent_source_id"]
+            or row.get("byte_start") != offset
+            or type(row.get("byte_end")) is not int
+            or not offset <= row["byte_end"] <= record["byte_end"]
+            or row.get("status") not in {"covered", "missing"}
+        ):
+            raise MemoryConflictError("Coverage proof no longer matches the frozen record ranges")
+        if row["status"] == "missing" and (
+            not isinstance(row.get("reason"), str) or not row["reason"].strip()
+        ):
+            raise MemoryConflictError("Coverage proof has an unexplained missing fragment")
+        offset = row["byte_end"]
+        fragments += 1
+        fragments_in_record += 1
+        missing += row["status"] == "missing"
+        if offset == record["byte_end"]:
+            if fragments_in_record != record["fragment_count"]:
+                raise MemoryConflictError(
+                    "Coverage proof fragment count differs from the frozen plan"
+                )
+            record_count += 1
+            record = None
+    actual = {"records": record_count, "fragments": fragments, "missing_fragments": missing}
+    if (
+        record is not None
+        or next(records, None) is not None
+        or record_count != plan["source_count"]
+        or fragments != plan["fragment_count"]
+        or any(
+            type(reference.get(key)) is not int or reference[key] != count
+            for key, count in actual.items()
+        )
+        or root["coverage"] != {"fragments": fragments, "missing_fragments": missing}
+    ):
+        raise MemoryConflictError(
+            "Coverage counts differ from the frozen plan, root or coverage proof"
+        )
+
+
+def _final_image(memory, directory, plan, manifest, candidate, *, create=False):
+    """Bind recovery to a durable before image and the already validated root.
+
+    The mutable intent is only a replay copy of this finalization record. An
+    interrupted attempt reuses its original before image, including when the
+    canonical target was written but its completion receipt was not.
+    """
+    # JSON object order is not semantic. Normalize before the very first render
+    # so a restart from sorted durable JSON reconstructs exactly the same bytes.
+    manifest, candidate = json.loads(_json(manifest)), json.loads(_json(candidate))
+    path = _join(directory, "finalization.json")
+    before_path = _join(directory, "final-before.bin")
+    if not path.exists():
+        if not create:
+            raise MemoryConflictError("Partition finalization evidence is missing; preserved")
+        target = _join(memory.workspace, plan["target"])
+        before = target.read_bytes() if target.exists() else None
+        _atomic(before_path, before if before is not None else b"")
+        rendered = _render_summary(manifest, candidate, before)
+        _atomic(
+            path,
+            _json(
+                {
+                    "schema_version": 1,
+                    "format": "summary-finalization-v1",
+                    "batch_id": plan["batch_id"],
+                    "manifest": manifest,
+                    "candidate_sha256": _digest(_json(candidate)),
+                    "before_exists": before is not None,
+                    "before_sha256": _digest(before) if before is not None else None,
+                    "after_sha256": _digest(rendered),
+                }
+            ),
+        )
+    anchor = _load(path)
+    if (
+        anchor.get("schema_version") != 1
+        or anchor.get("format") != "summary-finalization-v1"
+        or anchor.get("batch_id") != plan["batch_id"]
+        or anchor.get("manifest") != manifest
+        or anchor.get("candidate_sha256") != _digest(_json(candidate))
+        or type(anchor.get("before_exists")) is not bool
+    ):
+        raise MemoryConflictError("Partition finalization does not match its validated root")
+    before_bytes = before_path.read_bytes()
+    if not anchor["before_exists"] and before_bytes:
+        raise MemoryConflictError("Partition absent-target before image was modified")
+    before = before_bytes if anchor["before_exists"] else None
+    before_hash = _digest(before) if before is not None else None
+    rendered = _render_summary(manifest, candidate, before)
+    if before_hash != anchor["before_sha256"] or _digest(rendered) != anchor["after_sha256"]:
+        raise MemoryConflictError("Partition finalization before image or rendering was modified")
+    return {
+        "before_sha256": before_hash,
+        "after_sha256": _digest(rendered),
+        "rendered": rendered.decode(),
+    }
 
 
 def _template(name, **values):
@@ -958,10 +1156,8 @@ def _finalize(memory, directory, plan):
             "has_inherited_gaps": inherited_gaps,
         },
     }
-    target = _join(memory.workspace, plan["target"])
-    before = target.read_bytes() if target.exists() else None
     candidate = root["candidate"]
-    rendered = _render_summary(manifest, candidate, before)
+    final = _final_image(memory, directory, plan, manifest, candidate, create=True)
     _atomic(
         intent_path,
         _json(
@@ -973,9 +1169,7 @@ def _finalize(memory, directory, plan):
                 "status": "pending",
                 "target": plan["target"],
                 "candidate_sha256": root["candidate_sha256"],
-                "before_sha256": _digest(before) if before is not None else None,
-                "after_sha256": _digest(rendered),
-                "rendered": rendered.decode(),
+                **final,
                 "candidate": candidate,
                 "manifest": manifest,
             }
