@@ -86,3 +86,54 @@ def test_offline_resource_receipts_are_idempotent_and_virtual_budget_stays_disab
     assert status["virtual_budget_enabled"] is False
     assert status["tokens"]["cost_microusd"] is None
     assert status["virtual_budget"]["balance_microusd"] is None
+
+
+def test_cli_freshness_limit_rejects_an_otherwise_complete_cached_collection(tmp_path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            content = json.dumps(
+                {
+                    "data": [{"id": "zero", "voteup_count": 0, "comment_count": 0}],
+                    "paging": {"is_end": True},
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Age", "120")
+            self.send_header("Cache-Control", "max-age=300")
+            self.end_headers()
+            self.wfile.write(content)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        output = tmp_path / "receipt.json"
+        args = [
+            "collect",
+            f"http://127.0.0.1:{server.server_port}/answers",
+            "--subject",
+            "fixture",
+            "--collection",
+            "answers",
+            "--output",
+            output,
+        ]
+        code, result = run(*args)
+        assert code == 0 and result["complete"] is True
+        assert result["summary"]["metrics"]["voteup_count"]["value"] == 0
+        code, result = run(*args, "--max-age-seconds", "60")
+        assert code == 2 and result["complete"] is False
+        assert result["summary"]["metrics"]["voteup_count"]["value"] is None
+        assert result["summary"]["coverage"]["freshness"] == "stale"
+        assert (
+            json.loads(output.read_text())["observation"]["pages"][0]["items"][0]["voteup_count"]
+            == 0
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)

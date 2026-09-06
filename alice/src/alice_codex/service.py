@@ -36,7 +36,7 @@ from .store import DispatchReceipt, Store
 
 def process_identity(pid: int) -> str | None:
     result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="],
+        ["ps", "-ww", "-p", str(pid), "-o", "lstart=", "-o", "command="],
         capture_output=True,
         text=True,
         timeout=5,
@@ -49,6 +49,122 @@ def process_birth(pid: int) -> str | None:
         ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, timeout=5
     )
     return result.stdout.strip() or None
+
+
+async def _stop_native_root(
+    client: CodexClient, config: RuntimeConfig, thread_id: str, *, timeout: float | None = None
+) -> dict:
+    options = {} if timeout is None else {"timeout": timeout}
+    try:
+        return await client.stop_tree(thread_id, **options)
+    except RpcError as error:
+        if error.code != -32600 or str(error) not in {
+            f"thread not loaded: {thread_id}",
+            f"thread not found: {thread_id}",
+        }:
+            raise
+        await client.thread_resume(
+            thread_id,
+            cwd=str(config.workspace),
+            model=config.model,
+            **config.native_permission_params(),
+        )
+        return await client.stop_tree(thread_id, **options)
+
+
+async def recover_owned_server(config: RuntimeConfig, state: dict) -> None:
+    """Stop a recorded orphan without constructing Service or opening business stores.
+
+    The caller must hold service.lock and ensure the previous daemon has exited.
+    Only the server identity and valid task root IDs are read; no runtime schema
+    migration, root replacement, pause change or Alice state write occurs. Native stop
+    failures fall back to termination of the verified owned group; returning does
+    not prove that detached processes or external business effects were undone.
+    """
+    previous = state.get("server")
+    if previous is None:
+        return
+    if not isinstance(previous, dict) or type(previous.get("pid")) is not int:
+        raise RuntimeError("Invalid recorded server identity; refusing recovery")
+    pid = previous["pid"]
+    if pid <= 0:
+        raise RuntimeError("Invalid recorded server identity; refusing recovery")
+    current = process_identity(pid)
+    if not current:
+        return
+    born = process_birth(pid)
+    if born is None:
+        return  # The owned process can exit between observations.
+    same_identity = (
+        born == previous["birth"] if previous.get("birth") else current == previous.get("identity")
+    )
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    if not same_identity or pgid != pid or str(config.codex_socket) not in current:
+        raise RuntimeError("Recorded server identity changed; refusing to signal another process")
+
+    tasks = state.get("tasks")
+    roots = list(
+        dict.fromkeys(
+            task["thread_id"]
+            for task in (tasks.values() if isinstance(tasks, dict) else [])
+            if isinstance(task, dict)
+            and isinstance(task.get("thread_id"), str)
+            and task["thread_id"]
+        )
+    )
+    # An orphan can own native terminals outside its original process group.
+    # Try every known root, even if an earlier empty alias has no saved rollout.
+    recovered_rpc = None
+    try:
+        recovered_rpc = await RpcClient.connect_unix(
+            config.codex_socket, timeout=2, request_timeout=5
+        )
+        await recovered_rpc.initialize(name="alice_recovery")
+        recovered = CodexClient(recovered_rpc, owned_root_ids=roots)
+        try:
+            for thread_id in roots:
+                try:
+                    await _stop_native_root(recovered, config, thread_id, timeout=5)
+                except Exception:
+                    # No failure authorizes a new root or another input attempt.
+                    continue
+        finally:
+            recovered.close()
+    except Exception:
+        pass  # Transport failure still requires verified owned-group cleanup.
+    finally:
+        if recovered_rpc:
+            with suppress(Exception):
+                await recovered_rpc.close()
+
+    def same_group_alive() -> bool:
+        observed_birth = process_birth(pid)
+        if observed_birth is None:
+            return False
+        if observed_birth != born:
+            raise RuntimeError("Owned server identity changed during recovery")
+        try:
+            if os.getpgid(pid) != pid:
+                raise RuntimeError("Owned server process group changed during recovery")
+        except ProcessLookupError:
+            return False
+        return True
+
+    for termination in (signal.SIGTERM, signal.SIGKILL):
+        if not same_group_alive():
+            return
+        try:
+            os.killpg(pid, termination)
+        except ProcessLookupError:
+            return
+        for _ in range(100):
+            if process_birth(pid) != born:
+                return
+            await asyncio.sleep(0.05)
+    raise RuntimeError("Owned orphan server did not exit")
 
 
 class Service:
@@ -102,64 +218,7 @@ class Service:
         return self._task_locks.setdefault(key, asyncio.Lock())
 
     async def _recover_orphan(self) -> None:
-        previous = self.state.get("server")
-        if not previous:
-            return
-        pid = previous["pid"]
-        current = process_identity(pid)
-        if not current:
-            return
-        born = process_birth(pid)
-        same_identity = (
-            born == previous["birth"] if previous.get("birth") else current == previous["identity"]
-        )
-        if (
-            not same_identity
-            or os.getpgid(pid) != pid
-            or str(self.config.codex_socket) not in current
-        ):
-            raise RuntimeError(
-                "Recorded server identity changed; refusing to signal another process"
-            )
-        # An orphan can still own terminals in other process groups. Ask its
-        # native runtime to stop them before terminating our original group.
-        recovered_rpc = None
-        try:
-            recovered_rpc = await RpcClient.connect_unix(
-                self.config.codex_socket, timeout=2, request_timeout=5
-            )
-            await recovered_rpc.initialize(name="alice_recovery")
-            recovered = CodexClient(
-                recovered_rpc,
-                owned_root_ids=[task["thread_id"] for task in self.state["tasks"].values()],
-            )
-            try:
-                for key in list(self.state["tasks"]):
-                    await self._stop_task(key, codex=recovered, timeout=5)
-            finally:
-                recovered.close()
-        except Exception:
-            # Transport failure doesn't authorize another invocation. The only
-            # fallback is termination of this verified, owned process group.
-            pass
-        finally:
-            if recovered_rpc:
-                await recovered_rpc.close()
-        if process_birth(pid) != born or os.getpgid(pid) != pid:
-            raise RuntimeError("Owned server identity changed during recovery")
-        os.killpg(pid, signal.SIGTERM)
-        for _ in range(100):
-            if process_birth(pid) != born:
-                return
-            await asyncio.sleep(0.05)
-        # Only the same verified process group, never a PID found by name alone.
-        if process_birth(pid) == born and os.getpgid(pid) == pid:
-            os.killpg(pid, signal.SIGKILL)
-        for _ in range(100):
-            if process_birth(pid) != born:
-                return
-            await asyncio.sleep(0.05)
-        raise RuntimeError("Owned orphan server did not exit")
+        await recover_owned_server(self.config, self.state)
 
     async def run(self) -> None:
         self.config.prepare_directories()
@@ -501,6 +560,80 @@ class Service:
                     task.pop("resource_pause_pending", None)
                     self.save()
 
+    def _thread_has_input(self, task: dict) -> bool:
+        return bool(task.get("has_input")) or any(
+            intent["thread_id"] == task["thread_id"] for intent in self.state["intents"].values()
+        )
+
+    async def _bootstrap_thread(
+        self, task: dict, native_thread: dict, *, fresh: bool = False
+    ) -> None:
+        """Make an unused owned root resumable without manufacturing a model turn."""
+        thread_id = task["thread_id"]
+        bootstrap = task.get("bootstrap")
+        if bootstrap is not None and (
+            not isinstance(bootstrap, dict)
+            or bootstrap.get("version") != 1
+            or bootstrap.get("thread_id") != thread_id
+            or bootstrap.get("state") not in {"pending", "sending", "unknown", "ready"}
+        ):
+            raise RpcError("Unsupported native bootstrap state; reconcile without replacing root")
+        if bootstrap and bootstrap["state"] == "ready":
+            return
+        if not bootstrap and self._thread_has_input(task):
+            return  # Existing real work must not acquire another initialization entry.
+
+        async def confirm_rollout():
+            await self.codex.thread_resume(
+                thread_id,
+                cwd=str(self.config.workspace),
+                model=self.config.model,
+                **self.config.native_permission_params(),
+            )
+
+        if not fresh:
+            try:
+                await confirm_rollout()
+            except RpcError as error:
+                if (
+                    error.code != -32600
+                    or str(error) != f"no rollout found for thread id {thread_id}"
+                ):
+                    raise
+            else:
+                task["bootstrap"] = {"version": 1, "thread_id": thread_id, "state": "ready"}
+                self.save()
+                return  # Raw developer entries are not necessarily exposed by items/list.
+
+        if bootstrap and bootstrap["state"] in {"sending", "unknown"}:
+            raise RpcError("Native bootstrap outcome is unknown; reconcile without replay")
+        if self._thread_has_input(task) or native_thread.get("status", {}).get("type") != "idle":
+            raise RpcError("Native bootstrap requires an unused idle owned thread")
+        # Do not request full history here: Codex's unmaterialized paginated
+        # roots cannot service turns/list or read(includeTurns=True). A new root
+        # is not returned to an attach caller until bootstrap has finished;
+        # legacy roots also require the exact no-rollout response above.
+        current = native_thread if fresh else (await self.codex.thread_read(thread_id))["thread"]
+        if (
+            self._thread_has_input(task)
+            or current.get("status", {}).get("type") != "idle"
+            or current.get("turns")
+        ):
+            raise RpcError("Native input arrived during bootstrap; initialization not sent")
+        if self.stopping:
+            raise DeferredDispatch("Service is stopping")
+        task["bootstrap"] = {"version": 1, "thread_id": thread_id, "state": "sending"}
+        self.save()  # An uncertain inject must never be sent a second time automatically.
+        try:
+            await self.codex.record_runtime_initialization(thread_id)
+            await confirm_rollout()
+        except Exception:
+            task["bootstrap"]["state"] = "unknown"
+            self.save()
+            raise
+        task["bootstrap"]["state"] = "ready"  # Rollout observed, not a user-input receipt.
+        self.save()
+
     async def ensure_thread(self, key: str) -> dict:
         if not isinstance(key, str) or not key or len(key) > 150:
             raise ValueError("Task name must contain 1–150 characters")
@@ -533,18 +666,30 @@ class Service:
                             model=self.config.model,
                             **self.config.native_permission_params(),
                         )
-                    return task
                 except RpcError as error:
-                    untouched = not task.get("has_input") and not any(
-                        intent["thread_id"] == task["thread_id"]
-                        for intent in self.state["intents"].values()
-                    )
-                    if not untouched or "no rollout found" not in str(error):
+                    bootstrap = task.get("bootstrap")
+                    if (
+                        self._thread_has_input(task)
+                        or (
+                            bootstrap is not None
+                            and (
+                                not isinstance(bootstrap, dict)
+                                or bootstrap.get("version") != 1
+                                or bootstrap.get("thread_id") != task["thread_id"]
+                                or bootstrap.get("state") != "pending"
+                            )
+                        )
+                        or error.code != -32600
+                        or str(error) != f"no rollout found for thread id {task['thread_id']}"
+                    ):
                         raise
                     # Codex intentionally doesn't persist an unused empty thread.
                     # Never use this fallback after any acknowledged/unknown input.
                     # Retain the old alias and its pause flags until replacement
                     # succeeds, including if this process dies during thread/start.
+                else:
+                    await self._bootstrap_thread(task, result["thread"])
+                    return task
             if self.stopping:
                 raise DeferredDispatch("Service is stopping")
             result = await self.codex.thread_start(
@@ -561,7 +706,7 @@ class Service:
                 ),
             )
             if task:
-                if task.get("has_input"):
+                if self._thread_has_input(task):
                     raise RpcError("Input was observed while replacing an empty thread")
                 self.state.setdefault("replaced_empty_threads", []).append(task["thread_id"])
             task = {
@@ -570,9 +715,15 @@ class Service:
                 "paused": bool(task and task.get("paused")),
                 "created_at": time.time(),
                 "has_input": False,
+                "bootstrap": {
+                    "version": 1,
+                    "thread_id": result["thread"]["id"],
+                    "state": "pending",
+                },
             }
             self.state["tasks"][key] = task
-            self.save()
+            self.save()  # Preserve the alias before the first native history write.
+            await self._bootstrap_thread(task, result["thread"], fresh=True)
             return task
 
     async def is_busy(self, target: str) -> bool:
@@ -852,23 +1003,8 @@ class Service:
         client = codex or self.codex
         task = self.state["tasks"][key]
         thread_id = task["thread_id"]
-        options = {} if timeout is None else {"timeout": timeout}
         try:
-            try:
-                return await client.stop_tree(thread_id, **options)
-            except RpcError as error:
-                if error.code != -32600 or str(error) not in {
-                    f"thread not loaded: {thread_id}",
-                    f"thread not found: {thread_id}",
-                }:
-                    raise
-                await client.thread_resume(
-                    thread_id,
-                    cwd=str(self.config.workspace),
-                    model=self.config.model,
-                    **self.config.native_permission_params(),
-                )
-                return await client.stop_tree(thread_id, **options)
+            return await _stop_native_root(client, self.config, thread_id, timeout=timeout)
         except RpcError as error:
             untouched = not task.get("has_input") and not any(
                 intent["thread_id"] == thread_id for intent in self.state["intents"].values()
