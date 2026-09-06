@@ -7,9 +7,11 @@ accounts, loads cookie files, or treats one collection as an entire account.
 """
 
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import time
@@ -81,6 +83,43 @@ def _headers(header_env: dict | None) -> dict:
     return headers
 
 
+def _cache_evidence(headers) -> dict:
+    """Keep bounded numeric cache evidence, never arbitrary header text."""
+    result = {}
+    age = headers.get("Age")
+    if age is not None:
+        if len(age) > 16 or not age.isascii() or not age.isdecimal():
+            result["error"] = "cache_metadata_invalid"
+        else:
+            result["cache_age_seconds"] = int(age)
+    directives = headers.get("Cache-Control", "").split(",")
+    lifetimes = []
+    for directive in directives:
+        name, separator, value = directive.strip().partition("=")
+        if name.lower() not in {"max-age", "s-maxage"}:
+            continue
+        match = re.fullmatch(r'(?:"([0-9]{1,16})"|([0-9]{1,16}))', value.strip())
+        if not separator or match is None:
+            result["error"] = "cache_metadata_invalid"
+        else:
+            lifetimes.append(int(match.group(1) or match.group(2)))
+    if lifetimes:
+        result["cache_max_age_seconds"] = min(lifetimes)
+        if age is None:
+            try:
+                dated = parsedate_to_datetime(headers.get("Date", ""))
+                if dated.tzinfo is None:
+                    raise ValueError("cache date has no timezone")
+                result["cache_age_seconds"] = max(
+                    0, (datetime.now(timezone.utc) - dated).total_seconds()
+                )
+            except (TypeError, ValueError, OverflowError):
+                result["error"] = "cache_metadata_invalid"
+    if re.search(r"(?:^|,)\s*11[01]\s", headers.get("Warning", "")):
+        result["error"] = "stale_cache"
+    return result
+
+
 def collect_collection(
     url: str,
     *,
@@ -96,6 +135,7 @@ def collect_collection(
     total_seconds: float = 60,
     expected_count: int | None = None,
     independent: dict | None = None,
+    max_age_seconds: float | None = None,
 ) -> dict:
     """GET one explicit collection, following same-origin, same-path next links.
 
@@ -110,6 +150,9 @@ def collect_collection(
     I/O operation can exceed that budget by at most request_timeout. Limits are
     conservative stops, never proof that pagination is complete. independent is
     a separately supplied browser observation in business schema v1.
+    max_age_seconds optionally checks snapshot/cache age at collection completion.
+    HTTP cache lifetime/Age/Warning evidence is retained when supplied; missing
+    metadata cannot prove that an origin is current or that a cache revalidated.
     """
     origin = _origin(url)
     for value, maximum, name in (
@@ -122,6 +165,17 @@ def collect_collection(
             raise ValueError(f"{name} is outside its supported bound")
     if not 0 < request_timeout <= 60 or not 0 < total_seconds <= 600:
         raise ValueError("timeouts must be positive and bounded")
+    if max_age_seconds is not None:
+        try:
+            valid_age = (
+                type(max_age_seconds) in (int, float)
+                and math.isfinite(max_age_seconds)
+                and max_age_seconds >= 0
+            )
+        except OverflowError:
+            valid_age = False
+        if not valid_age:
+            raise ValueError("max_age_seconds must be a finite nonnegative number")
     document = {
         "schema_version": 1,
         "subject": subject,
@@ -133,6 +187,11 @@ def collect_collection(
         document["expected_count"] = expected_count
     if independent is not None:
         document["independent"] = independent
+    if max_age_seconds is not None:
+        document["freshness"] = {
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "max_age_seconds": max_age_seconds,
+        }
     # Validate the caller contract before using credentials or doing any I/O.
     summarize_observation(document)
     if independent and len(independent["items"]) + max_items > MAX_ITEMS:
@@ -151,7 +210,7 @@ def collect_collection(
             "status": "error",
             "items": [],
         }
-        diagnostic = {"page": number + 1, "source": page["source"]}
+        diagnostic = {"page": number + 1, "source": page["source"], "bytes_received": 0}
         document["pages"].append(page)
         diagnostics.append(diagnostic)
         if current in seen:
@@ -166,6 +225,7 @@ def collect_collection(
             request = Request(current, headers=headers, method="GET")
             with opener.open(request, timeout=min(request_timeout, remaining)) as response:
                 diagnostic["http_status"] = response.status
+                page.update(_cache_evidence(response.headers))
                 if response.status != 200:
                     diagnostic["error"] = "unexpected_http_status"
                     break
@@ -188,6 +248,7 @@ def collect_collection(
                         break
                     data.extend(chunk)
                     total_bytes += len(chunk)
+                    diagnostic["bytes_received"] += len(chunk)
                     if len(data) > max_response_bytes:
                         diagnostic["error"] = "response_too_large"
                         break
@@ -223,7 +284,9 @@ def collect_collection(
             item = {}
             if isinstance(row, dict):
                 identity = row.get("id")
-                if type(identity) is int or isinstance(identity, str) and len(identity) <= 256:
+                if type(identity) is int or (
+                    isinstance(identity, str) and 0 < len(identity) <= 256
+                ):
                     item["id"] = identity
                 for metric in required_metrics:
                     if metric in row:
@@ -267,6 +330,19 @@ def collect_collection(
             diagnostic["error"] = "page_limit"
             break
         current, cursor = next_url, page["next_cursor"]
+    for page, diagnostic in zip(document["pages"], diagnostics):
+        for field in ("http_status", "error"):
+            if field in diagnostic:
+                page[field] = diagnostic[field]
+        if diagnostic.get("error") in {
+            "truncated_response",
+            "response_too_large",
+            "total_byte_limit",
+            "item_limit",
+        }:
+            page["truncated"] = True
+    if "freshness" in document:
+        document["freshness"]["as_of"] = datetime.now(timezone.utc).isoformat()
     summary = summarize_observation(document)
     return {"observation": document, "summary": summary, "fetches": diagnostics}
 
