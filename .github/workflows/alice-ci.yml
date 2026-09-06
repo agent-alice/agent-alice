@@ -2,8 +2,8 @@ name: Alice regression gates
 
 on:
   pull_request:
-    paths: ['alice/**', '.github/workflows/alice-ci.yml']
   push:
+    branches: [main]
     paths: ['alice/**', '.github/workflows/alice-ci.yml']
   workflow_dispatch:
 
