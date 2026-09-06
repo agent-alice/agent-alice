@@ -168,8 +168,9 @@ def install_rpc(monkeypatch, rpc):
     return connect
 
 
+@pytest.mark.parametrize("startup_placeholder", [False, True], ids=["full-identity", "startup-identity"])
 async def test_long_argv_owned_process_cleanup_preserves_corrupt_business_databases(
-    config, monkeypatch
+    config, monkeypatch, startup_placeholder
 ):
     # A narrow caller environment must not hide the socket at the command tail.
     # Recovery must still inspect the full command before signalling this group.
@@ -179,25 +180,32 @@ async def test_long_argv_owned_process_cleanup_preserves_corrupt_business_databa
         sys.executable,
         "-I",
         "-c",
-        "import time; time.sleep(60)",
+        "import time; print('ready', flush=True); time.sleep(60)",
         long_argument,
         str(config.codex_socket),
         start_new_session=True,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env={"PATH": "/usr/bin:/bin", "HOME": str(config.root)},
     )
     try:
+        # Prove the fixture has executed Python before inspecting its full argv;
+        # process creation alone can race macOS command-line visibility.
+        assert await asyncio.wait_for(process.stdout.readline(), 5) == b"ready\n"
         assert os.getpgid(process.pid) == process.pid
         identity = service_module.process_identity(process.pid)
         assert identity is not None
         assert identity.endswith(str(config.codex_socket))
+        birth = service_module.process_birth(process.pid)
+        assert birth is not None
+        # Simulate the startup observation while keeping the real generation.
+        # Recovery must inspect the current full command before signalling it.
         state = recorded_state(
             config,
             process.pid,
-            service_module.process_birth(process.pid),
-            identity,
+            birth,
+            "(python-startup-placeholder)" if startup_placeholder else identity,
         )
         original_state = copy.deepcopy(state)
         original_files = preserve_fixture_data(config, state)

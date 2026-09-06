@@ -2,9 +2,11 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import time
@@ -12,7 +14,7 @@ from uuid import uuid4
 
 from . import __version__
 from .config import default_home, initialize_config, load_config
-from .control import request
+from .control import ControlError, request
 from .files import atomic_write, read_json
 from .memory import MemoryStore
 from .store import Store
@@ -260,6 +262,62 @@ async def _start_unsupervised(config) -> dict:
     )
 
 
+def _check_chat_local_policy(config, target: str) -> None:
+    """Reject known limits without opening the service's writable Store."""
+    bounded = config.task_policy is not None and (
+        target not in {"main", "new"} and not target.startswith(("summary:", "scheduled:"))
+    )
+    if not bounded and config.database.exists():
+        # This additive settings key also survives rollback to an older service
+        # that does not implement task_policy_status. Presence is sufficient:
+        # a malformed record must not become permission to bypass admission.
+        key = "task_policy/" + hashlib.sha256(target.encode()).hexdigest()
+        connection = sqlite3.connect(config.database.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            # Resource-epoch schema 2 retains the schema 1 policy settings key.
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if version not in {1, 2}:
+                raise ValueError(
+                    "Cannot verify task policy for native chat: unsupported database schema"
+                )
+            bounded = connection.execute(
+                "SELECT 1 FROM settings WHERE key = ?", (key,)
+            ).fetchone() is not None
+        finally:
+            connection.close()
+    if bounded:
+        raise ValueError(
+            f"Target {target!r} has an Alice task policy; native chat cannot enforce its limits. "
+            "Use alice ask with --target to submit work through Alice admission."
+        )
+
+
+async def _check_chat_policy(config, target: str) -> None:
+    _check_chat_local_policy(config, target)
+    try:
+        status = await request(config.control_socket, "task_policy_status", {"target": target})
+    except ControlError as error:
+        # Only the known unsupported operation/target responses permit legacy
+        # attachment. Transport failures and other errors do not prove no policy.
+        unsupported = str(error) == "ValueError: Unknown Alice operation: task_policy_status"
+        reserved = target == "new" or target.startswith(("summary:", "scheduled:"))
+        unsupported_target = reserved and str(error) == (
+            "ValueError: Task policy requires a stable named target, not recurring summary roots"
+        )
+        if not (unsupported or unsupported_target):
+            raise
+        _check_chat_local_policy(config, target)
+        return
+    if not isinstance(status, dict) or status.get("target") != target or "policy" not in status:
+        raise ValueError("Cannot verify task policy for native chat: invalid service response")
+    if status["policy"] is not None:
+        raise ValueError(
+            f"Target {target!r} has an Alice task policy; native chat cannot enforce its limits. "
+            "Use alice ask with --target to submit work through Alice admission."
+        )
+    _check_chat_local_policy(config, target)
+
+
 async def execute(args) -> dict | None:
     if args.command == "collect":
         from .collector import collect_collection
@@ -494,8 +552,11 @@ async def execute(args) -> dict | None:
             "service": await running(config),
         }
     if args.command == "chat":
+        _check_chat_local_policy(config, args.target)
         await start(config)
+        await _check_chat_policy(config, args.target)
         task = await request(config.control_socket, "thread", {"target": args.target})
+        await _check_chat_policy(config, args.target)
         os.execve(
             config.codex_binary,
             [
