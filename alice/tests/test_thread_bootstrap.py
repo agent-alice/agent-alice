@@ -9,6 +9,7 @@ import pytest
 
 from alice_codex.codex import CodexClient
 from alice_codex.config import RuntimeConfig
+from alice_codex.memory import MemoryStore
 from alice_codex.rpc import RpcError, RpcTimeout
 from alice_codex.service import Service
 
@@ -105,6 +106,7 @@ class BootstrapRuntime:
 def runtime(tmp_path):
     config = RuntimeConfig(str(tmp_path), "/usr/bin/true", "codex-cli fixture", "unused")
     config.prepare_directories()
+    MemoryStore(config.root).install_workspace_templates()
     item = BootstrapRuntime(config)
     yield item
     for service in item.instances:

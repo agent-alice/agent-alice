@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from alice_codex.config import RuntimeConfig
+from alice_codex.memory import MemoryStore
 from alice_codex.resources import TaskPolicy
 from alice_codex.rpc import RpcError, RpcTimeout
 from alice_codex.scheduler import RejectedDispatch
@@ -72,6 +73,7 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(service_module.time, "time", lambda: clock.now)
     config = RuntimeConfig(str(tmp_path), "/usr/bin/true", "codex-cli fixture", "unused")
     config.prepare_directories()
+    MemoryStore(config.root).install_workspace_templates()
     runtime = PolicyRuntime(config, clock)
     yield runtime
     for service in runtime.instances:

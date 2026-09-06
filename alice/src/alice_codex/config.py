@@ -16,6 +16,13 @@ from tomlkit.items import InlineTable
 
 from .files import SingletonLock, atomic_write, private_dir, read_json, sha256_file, write_json
 from .runtime_bundle import inspect_bundle, pin_bundle, verify_runtime_bundle
+from .identity import (
+    IDENTITY_HEADER,
+    IdentityBundle,
+    identity_hook_groups,
+    is_owned_identity_handler,
+    validate_identity_hooks,
+)
 
 
 CONFIG_VERSION = 1
@@ -78,6 +85,7 @@ class RuntimeConfig:
     network_access: bool = True
     task_policy: dict | None = None
     version: int = CONFIG_VERSION
+    heartbeat_sources: dict | None = None
 
     @property
     def root(self) -> Path:
@@ -133,10 +141,17 @@ class RuntimeConfig:
 
     def save(self) -> None:
         self.validate()
-        write_json(self.root / "config.json", asdict(self))
+        value = asdict(self)
+        if self.heartbeat_sources is None:
+            value.pop("heartbeat_sources")
+        write_json(self.root / "config.json", value)
 
     def validate(self) -> None:
         from zoneinfo import ZoneInfo
+
+        from .heartbeat import parse_heartbeat_sources
+
+        parse_heartbeat_sources(self.heartbeat_sources)
 
         if self.version != CONFIG_VERSION:
             raise ValueError(f"Unsupported Alice config version {self.version}")
@@ -210,7 +225,9 @@ class RuntimeConfig:
         }
         return {"permissions": "alice", "config": {"permissions.alice": profile}}
 
-    def write_codex_config(self, *, python: str | None = None) -> None:
+    def write_codex_config(
+        self, *, python: str | None = None, identity: IdentityBundle | None = None
+    ) -> None:
         """Merge owned settings, preserving CLI-installed plugins/MCP and comments.
 
         Invalid or concurrently edited input is never reset to defaults. Only
@@ -290,6 +307,7 @@ class RuntimeConfig:
             "respect_system_proxy": True,
         }.items():
             features[key] = value
+        self._merge_identity_config(document, python=python, identity=identity)
         server = _table(document, "mcp_servers", "alice")
         if "url" in server:
             raise ValueError(
@@ -324,6 +342,111 @@ class RuntimeConfig:
         current = path.read_bytes() if path.exists() else None
         if current != original:
             raise ValueError("Codex configuration changed during update; concurrent edit preserved")
+        if rendered != original:
+            atomic_write(path, rendered)
+
+    def write_identity_config(self, identity: IdentityBundle, *, python: str | None = None) -> None:
+        """Refresh identity on direct serve without repairing unrelated configuration.
+
+        Initialization and the launcher coordinate the full Alice configuration.
+        Service itself must preserve an explicitly broken required MCP so native
+        initialization can fail visibly instead of silently replacing its command.
+        """
+        self.validate()
+        path = self.codex_home / "config.toml"
+        if self.codex_home.is_symlink() or path.is_symlink():
+            raise ValueError("Managed Codex configuration cannot be a symlink; original preserved")
+        original = path.read_bytes()
+        try:
+            document = tomlkit.parse(original.decode("utf-8"))
+        except (UnicodeError, ParseError) as error:
+            raise ValueError("Invalid Codex TOML; original file preserved") from error
+        self._merge_identity_config(document, python=python or sys.executable, identity=identity)
+        rendered = tomlkit.dumps(document).encode("utf-8")
+        try:
+            tomllib.loads(rendered.decode("utf-8"))
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError("Merged Codex TOML is invalid; original file preserved") from error
+        if self.codex_home.is_symlink() or path.is_symlink() or path.read_bytes() != original:
+            raise ValueError("Codex configuration changed during update; concurrent edit preserved")
+        if rendered != original:
+            atomic_write(path, rendered)
+
+    def _merge_identity_config(
+        self, document: MutableMapping, *, python: str, identity: IdentityBundle | None
+    ) -> None:
+        if identity is not None:
+            previous = document.get("developer_instructions")
+            if previous is not None and not str(previous).startswith(IDENTITY_HEADER):
+                raise ValueError(
+                    "Custom developer instructions conflict with managed identity; original preserved"
+                )
+            document["developer_instructions"] = identity.developer_instructions
+        _table(document, "features")["hooks"] = True
+        hooks = _table(document, "hooks")
+        for event, groups in self.identity_hooks(python=python).items():
+            current_groups = hooks.get(event, [])
+            if not isinstance(current_groups, list):
+                raise ValueError("Invalid hook configuration; original file preserved")
+            retained = []
+            for group in current_groups:
+                if not isinstance(group, MutableMapping) or not isinstance(
+                    group.get("hooks"), list
+                ):
+                    raise ValueError("Invalid hook group; original file preserved")
+                handlers = [
+                    handler for handler in group["hooks"] if not is_owned_identity_handler(handler)
+                ]
+                if handlers:
+                    if len(handlers) != len(group["hooks"]):
+                        group["hooks"] = handlers
+                    retained.append(group)
+            if current_groups != retained + groups:
+                hooks[event] = retained + groups
+
+    def identity_hooks(self, *, python: str | None = None) -> dict:
+        return identity_hook_groups(
+            python or sys.executable,
+            self.workspace,
+            state_dir=self.root / "state/identity-delivery",
+            socket_path=self.codex_socket,
+        )
+
+    def trust_identity_hooks(self, listing: dict, *, python: str | None = None) -> None:
+        """Trust native hashes for exact Alice commands, preserving other settings.
+
+        Run before loading any native thread. A trusted hooks/list does not reload
+        hooks already captured by an existing thread.
+        """
+        path = self.codex_home / "config.toml"
+        states = validate_identity_hooks(
+            listing, path, self.workspace, self.identity_hooks(python=python)
+        )
+        if path.is_symlink():
+            raise ValueError("Linked Codex configuration; original preserved")
+        original = path.read_bytes()
+        try:
+            document = tomlkit.parse(original.decode("utf-8"))
+        except (UnicodeError, ParseError) as error:
+            raise ValueError("Invalid Codex TOML; original preserved") from error
+        # Revalidate source commands against the exact configuration still on disk;
+        # a listing captured before someone edited the file cannot authorize it.
+        hooks = document.get("hooks", {})
+        for event, groups in self.identity_hooks(python=python).items():
+            commands = [
+                handler.get("command")
+                for group in hooks.get(event, [])
+                for handler in group.get("hooks", [])
+                if is_owned_identity_handler(handler)
+            ]
+            if commands != [group["hooks"][0]["command"] for group in groups]:
+                raise ValueError("Identity hooks changed after listing; original preserved")
+        target = _table(document, "hooks", "state")
+        for key, value in states.items():
+            _table(target, key)["trusted_hash"] = value["trusted_hash"]
+        if path.is_symlink() or path.read_bytes() != original:
+            raise ValueError("Codex configuration changed during trust update; original preserved")
+        rendered = tomlkit.dumps(document).encode("utf-8")
         if rendered != original:
             atomic_write(path, rendered)
 
