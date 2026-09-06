@@ -1,6 +1,7 @@
 """Regressions for lifecycle faults and durable intent reconciliation."""
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from alice_codex.memory import MemoryError
 from alice_codex.rpc import RpcError
 from alice_codex.scheduler import RejectedDispatch
 from alice_codex.service import Service
+from alice_codex.store import DispatchReceipt
 import alice_codex.service as service_module
 
 
@@ -74,7 +76,7 @@ async def test_stop_arriving_during_read_prevents_input_rpc(service):
         await service.submit("main", "write result", intent_id="stable")
     service.codex.turn_start.assert_not_called()
     service.codex.queue_add.assert_not_called()
-    assert service.state["intents"]["stable"]["status"] == "failed"
+    assert "stable" not in service.state["intents"]  # Definitely not sent; safe stable-ID retry.
 
 
 async def test_request_id_retries_same_input_but_rejects_different_input(service):
@@ -84,6 +86,139 @@ async def test_request_id_retries_same_input_but_rejects_different_input(service
     with pytest.raises(ValueError, match="different input"):
         await service.submit("main", "publish different result", intent_id="stable")
     service.codex.turn_start.assert_awaited_once()
+
+
+async def test_request_id_is_global_even_across_concurrent_targets(service):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def create_thread(**kwargs):
+        entered.set()
+        await release.wait()
+        return {"thread": {"id": "new-root"}}
+
+    service.codex.thread_start.side_effect = create_thread
+    first = asyncio.create_task(service.submit("main", "input", intent_id="global-id"))
+    await entered.wait()
+    second = asyncio.create_task(service.submit("other", "input", intent_id="global-id"))
+    await asyncio.sleep(0)
+    release.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert results[0]["target"] == "main"
+    assert isinstance(results[1], ValueError)
+    assert service.state["intents"]["global-id"]["target"] == "main"
+    service.codex.turn_start.assert_awaited_once()
+
+
+async def test_automatic_retry_returns_receipt_while_paused(service):
+    first = await service.submit("main", "input", intent_id="stable", automatic=True)
+    service.store.set_autonomy_paused(True)
+    assert await service.submit("main", "input", intent_id="stable", automatic=True) == first
+    service.codex.turn_start.assert_awaited_once()
+
+
+async def test_concurrent_automatic_inputs_reserve_capacity_until_reconciled(service):
+    service.config.max_active_tasks = 1
+    # Native status can lag its acknowledgement. An unresolved durable intent
+    # must reserve the slot until history or a terminal event resolves it.
+    results = await asyncio.gather(
+        service.submit("main", "one", intent_id="one", automatic=True),
+        service.submit("other", "two", intent_id="two", automatic=True),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(isinstance(result, RejectedDispatch) for result in results) == 1
+    service.codex.turn_start.assert_awaited_once()
+    service._complete_turn("new-root", {"id": "turn-1", "status": "completed"})
+    assert (await service.submit("other", "two", intent_id="two", automatic=True))[
+        "status"
+    ] == "accepted"
+
+
+async def test_automatic_input_does_not_queue_behind_active_or_unknown_work(service):
+    service.state["tasks"]["main"] = {"thread_id": "root", "paused": False}
+    service.codex.thread_read.return_value = {"thread": {"status": {"type": "active"}}}
+    with pytest.raises(RejectedDispatch):
+        await service.submit("main", "automatic", automatic=True)
+    service.codex.queue_add.assert_not_called()
+    service.codex.thread_read.return_value = {"thread": {"status": {"type": "idle"}}}
+    service.state["intents"]["unknown"] = {
+        "id": "unknown",
+        "thread_id": "root",
+        "target": "main",
+        "status": "unknown",
+    }
+    with pytest.raises(RejectedDispatch):
+        await service.submit("main", "new automatic", automatic=True)
+    service.codex.turn_start.assert_not_called()
+
+
+async def test_scheduled_pause_after_sending_marker_retries_same_window_after_restart(service):
+    job = service.store.create_job(name="one shot", schedule_type="at", schedule_value=10, now=0)
+    service.scheduler.clock = lambda: 10
+    original_mark = service.store.mark_sending
+
+    def pause_after_marker(*args, **kwargs):
+        marked = original_mark(*args, **kwargs)
+        service.store.set_autonomy_paused(True)
+        return marked
+
+    service.store.mark_sending = pause_after_marker
+    deferred = (await service.scheduler.poll())[0]
+    assert deferred.status == "pending"
+    assert not service.state["intents"]
+    service.codex.turn_start.assert_not_called()
+    restarted = Service(service.config)
+    restarted.ready, restarted.codex = True, service.codex
+    restarted.scheduler.clock = lambda: 20
+    try:
+        assert await restarted.scheduler.poll() == []
+        restarted.store.set_autonomy_paused(False)
+        delivered = (await restarted.scheduler.poll())[0]
+        assert delivered.id == deferred.id
+        assert (delivered.due_at, delivered.through_at) == (10, 10)
+        assert delivered.status == "accepted"
+        assert restarted.store.get_job(job.id).next_due is None
+        service.codex.turn_start.assert_awaited_once()
+    finally:
+        restarted.store.close()
+
+
+async def test_summary_dispatch_waits_for_its_window_and_ignores_unrelated_failed_history(service):
+    def timestamp(value):
+        return datetime.fromisoformat(value).replace(tzinfo=timezone.utc).timestamp()
+
+    for name, level, due in [
+        ("old", "L1", "2000-01-01T02:05:00"),
+        ("current", "L1", "2000-02-01T02:05:00"),
+        ("daily", "L2", "2000-02-02T00:15:00"),
+    ]:
+        service.store.create_job(
+            job_id=name,
+            name="summary:" + level,
+            target="summary:" + level,
+            schedule_type="at",
+            schedule_value=timestamp(due),
+            now=0,
+        )
+    now = timestamp("2000-02-02T01:00:00")
+    service.store.acquire_lease("fixture", now=now)
+    events = {event.job_id: event for event in service.store.materialize_due("fixture", now=now)}
+
+    def complete(name, status):
+        event = events[name]
+        service.store.claim_event(event.id, "fixture", now=now)
+        service.store.mark_sending(event.id, "fixture", now=now)
+        service.store.record_receipt(event.id, DispatchReceipt(status))
+
+    complete("old", "failed")
+    assert not await service.is_busy("summary:L2")  # Capacity check is window-independent.
+    with pytest.raises(RejectedDispatch, match="lower summary"):
+        await service.dispatch(events["daily"])
+    service.codex.turn_start.assert_not_called()
+    complete("current", "completed")
+    result = await service.dispatch(events["daily"])
+    assert result.status == "completed" and "No source records" in result.detail
+    assert service.store.get_event(events["old"].id).status == "failed"
 
 
 async def test_empty_thread_only_can_be_replaced_without_history_or_intent(service):
@@ -97,6 +232,161 @@ async def test_empty_thread_only_can_be_replaced_without_history_or_intent(servi
         await service.ensure_thread("main")
     assert service.state["tasks"]["main"]["thread_id"] == "important"
     service.codex.thread_start.assert_awaited_once()
+
+
+@pytest.mark.parametrize("input_state", ["empty", "observed", "unknown"])
+async def test_unloaded_thread_resumes_same_id_before_considering_empty_replacement(
+    service, input_state
+):
+    old = {"thread_id": "old-root", "paused": True, "has_input": input_state == "observed"}
+    service.state["tasks"]["main"] = old
+    if input_state == "unknown":
+        service.state["intents"]["unknown"] = {"thread_id": "old-root", "status": "unknown"}
+    service.save()
+    service.codex.thread_read.side_effect = RpcError("thread not loaded: old-root", -32600)
+    service.codex.thread_resume = AsyncMock(
+        side_effect=RpcError("no rollout found for thread id old-root", -32600)
+    )
+    if input_state == "empty":
+        replacement = await service.ensure_thread("main")
+        assert replacement["thread_id"] == "new-root" and replacement["paused"]
+        assert json.loads(service.path.read_text())["tasks"]["main"]["paused"]
+        service.codex.thread_start.assert_awaited_once()
+    else:
+        with pytest.raises(RpcError, match="no rollout"):
+            await service.ensure_thread("main")
+        assert service.state["tasks"]["main"] == old
+        service.codex.thread_start.assert_not_called()
+    assert service.codex.thread_resume.await_args.args == ("old-root",)
+
+
+async def test_unloaded_durable_history_is_resumed_without_replacement(service):
+    service.state["tasks"]["main"] = {"thread_id": "root", "paused": True, "has_input": True}
+    service.codex.thread_read.side_effect = RpcError("thread not loaded: root", -32600)
+    service.codex.thread_resume = AsyncMock(return_value={"thread": {"status": {"type": "idle"}}})
+    assert (await service.ensure_thread("main"))["thread_id"] == "root"
+    service.codex.thread_start.assert_not_called()
+
+
+async def test_failed_empty_replacement_preserves_alias_and_pause(service):
+    old = {"thread_id": "root", "paused": True, "has_input": False}
+    service.state["tasks"]["main"] = old
+    service.save()
+    service.codex.thread_read.side_effect = RpcError("no rollout found for thread id root", -32600)
+    service.codex.thread_start.side_effect = RpcError("required MCP failed")
+    with pytest.raises(RpcError, match="MCP"):
+        await service.ensure_thread("main")
+    assert json.loads(service.path.read_text())["tasks"]["main"] == old
+    assert not service.state.get("replaced_empty_threads")
+
+
+@pytest.mark.parametrize("has_input", [False, True])
+@pytest.mark.parametrize("native_error", ["thread not loaded", "thread not found"])
+async def test_pause_checks_unloaded_empty_alias_without_creating_a_thread(
+    service, has_input, native_error
+):
+    service.state["tasks"]["empty"] = {"thread_id": "empty-root", "has_input": has_input}
+    service.codex.stop_tree.side_effect = RpcError(f"{native_error}: empty-root", -32600)
+    service.codex.thread_resume = AsyncMock(
+        side_effect=RpcError("no rollout found for thread id empty-root", -32600)
+    )
+    if has_input:
+        with pytest.raises(RuntimeError, match="Could not prove"):
+            await service.pause()
+        assert service.stop_event.is_set()
+    else:
+        result = await service.pause()
+        assert result["tasks"]["empty"]["absent_empty_thread"] == "empty-root"
+        assert not service.stop_event.is_set()
+    assert service.state["tasks"]["empty"]["paused"]
+    assert service.state["tasks"]["empty"]["thread_id"] == "empty-root"
+    service.codex.thread_start.assert_not_called()
+
+
+@pytest.mark.parametrize("has_input", [False, True])
+async def test_shutdown_restart_global_resume_and_due_dispatch_hydrates_original_task(
+    service, tmp_path, has_input
+):
+    service.state["tasks"]["main"] = {
+        "thread_id": "old-root",
+        "paused": False,
+        "has_input": has_input,
+    }
+    service.store.create_job(name="due", schedule_type="at", schedule_value=10, now=0)
+    await service._shutdown((tmp_path / "shutdown.log").open("ab"))
+    assert not json.loads(service.path.read_text())["tasks"]["main"]["paused"]
+    restarted = Service(service.config)
+    restarted.ready, restarted.codex = True, service.codex
+    restarted.scheduler.clock = lambda: 20
+    loaded = set()
+
+    async def read(thread_id):
+        if thread_id == "old-root" and thread_id not in loaded:
+            raise RpcError("thread not loaded: old-root", -32600)
+        return {"thread": {"id": thread_id, "status": {"type": "idle"}}}
+
+    async def resume(thread_id, **kwargs):
+        if not has_input:
+            raise RpcError("no rollout found for thread id old-root", -32600)
+        loaded.add(thread_id)
+        return await read(thread_id)
+
+    restarted.codex.thread_read.side_effect = read
+    restarted.codex.thread_resume = AsyncMock(side_effect=resume)
+    try:
+        assert restarted.store.is_autonomy_paused()
+        assert await restarted.handle("resume", {}) == {"resumed": "autonomy"}
+        events = await restarted.scheduler.poll()
+        assert len(events) == 1 and events[0].status == "accepted"
+        assert not restarted.stop_event.is_set()
+        expected = "old-root" if has_input else "new-root"
+        assert events[0].receipt.thread_id == expected
+        assert restarted.state["tasks"]["main"]["thread_id"] == expected
+        if has_input:
+            restarted.codex.thread_start.assert_not_called()
+        else:
+            restarted.codex.thread_start.assert_awaited_once()
+        restarted.codex.turn_start.assert_awaited_once()
+    finally:
+        restarted.store.close()
+
+
+async def test_capacity_query_does_not_hydrate_unrelated_paused_root(service):
+    service.state["tasks"]["paused"] = {
+        "thread_id": "paused-root",
+        "paused": True,
+        "has_input": True,
+    }
+    service.codex.thread_read.side_effect = RpcError("thread not loaded: paused-root", -32600)
+    service.codex.thread_resume = AsyncMock()
+    assert not await service.is_busy("new")
+    service.codex.thread_resume.assert_not_called()
+    service.codex.thread_start.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["turn/started", "item/completed"])
+async def test_native_input_marks_history_durable_before_archive_worker(service, method):
+    service.state["tasks"]["main"] = {"thread_id": "root", "paused": True, "has_input": False}
+    service._on_notification(
+        {
+            "method": method,
+            "params": {
+                "threadId": "root",
+                "turn": {"id": "tui-turn"},
+                "item": {"type": "userMessage", "id": "tui-message"},
+            },
+        }
+    )
+    assert json.loads(service.path.read_text())["tasks"]["main"]["has_input"]
+    restarted = Service(service.config)
+    restarted.codex = service.codex
+    service.codex.thread_read.side_effect = RpcError("no rollout found for thread id root", -32600)
+    try:
+        with pytest.raises(RpcError):
+            await restarted.ensure_thread("main")
+        service.codex.thread_start.assert_not_called()
+    finally:
+        restarted.store.close()
 
 
 async def test_unknown_dispatch_absence_never_replays(service):
@@ -248,6 +538,174 @@ async def test_native_quota_blocks_automatic_work_without_enabling_virtual_budge
     assert not service.resources.can_dispatch(automatic=True)["allowed"]
     await service.submit("main", "explicit manual task")
     service.codex.turn_start.assert_awaited_once()
+
+
+async def test_quota_exhaustion_persists_and_stops_only_automatic_roots(service):
+    await service.submit("automatic", "automatic work", intent_id="auto", automatic=True)
+    service.state["tasks"]["manual"] = {
+        "thread_id": "manual-root",
+        "paused": False,
+        "automatic": False,
+    }
+    service.state["tasks"]["legacy"] = {"thread_id": "legacy-root", "paused": False}
+    service._on_notification(
+        {
+            "method": "account/rateLimits/updated",
+            "params": {"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 100}}},
+        }
+    )
+    persisted = json.loads(service.path.read_text())
+    assert persisted["tasks"]["automatic"]["resource_pause_pending"]
+    assert persisted["tasks"]["automatic"]["paused"]
+    assert persisted["intents"]["auto"]["automatic"] is True
+    assert not persisted["tasks"]["manual"]["paused"]
+    assert not persisted["tasks"]["legacy"]["paused"]
+    # Simulate a crash between durable pause and native stop. Even replenished
+    # quota cannot undo that unacknowledged stop obligation on restart.
+    restarted = Service(service.config)
+    restarted.codex = service.codex
+    try:
+        restarted.rpc = Mock(
+            request=AsyncMock(return_value={"rateLimits": {"primary": {"usedPercent": 20}}})
+        )
+        await restarted.refresh_resources()
+        await restarted._stop_resource_paused_tasks()
+        service.codex.stop_tree.assert_awaited_once_with("new-root")
+        task = json.loads(service.path.read_text())["tasks"]["automatic"]
+        assert task["paused"] and "resource_pause_pending" not in task
+        assert restarted.resources.can_dispatch(automatic=True)["allowed"]
+    finally:
+        restarted.store.close()
+
+
+async def test_quota_stop_failure_preserves_obligation_and_fails_closed(service):
+    service.state["tasks"]["auto"] = {"thread_id": "root", "paused": False, "automatic": True}
+    service.codex.stop_tree.side_effect = RpcError("native stop failed")
+    service.rpc.request.return_value = {"rateLimits": {"primary": {"usedPercent": 100}}}
+    with pytest.raises(RuntimeError, match="Could not prove"):
+        await service.refresh_resources()
+    assert service.stop_event.is_set() and service.store.is_autonomy_paused()
+    assert json.loads(service.path.read_text())["tasks"]["auto"]["resource_pause_pending"]
+
+
+async def test_manual_followup_cannot_detach_an_automatic_tree_from_quota_stop(service):
+    await service.submit("main", "automatic goal", automatic=True)
+    service.codex.thread_read.return_value = {"thread": {"status": {"type": "active"}}}
+    await service.submit("main", "manual follow-up")
+    service.codex.queue_add.assert_awaited_once()
+    service.rpc.request.return_value = {"rateLimits": {"primary": {"usedPercent": 100}}}
+    await service.refresh_resources()
+    assert service.state["tasks"]["main"]["automatic"] is True
+    assert service.state["tasks"]["main"]["paused"] is True
+    service.codex.stop_tree.assert_awaited_once_with("new-root")
+
+
+async def test_quota_policy_stops_mixed_root_after_direct_tui_input(service):
+    await service.submit("main", "heartbeat", intent_id="heartbeat", automatic=True)
+    service._complete_turn("new-root", {"id": "turn-1", "status": "completed"})
+    recorded = asyncio.Event()
+    service.journal = Mock(record_live=lambda event: recorded.set())
+    # No Alice request/client ID exists for this new manual TUI input. Root
+    # ownership must not be represented as evidence that this turn is automatic.
+    service._on_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "new-root",
+                "turnId": "tui-manual",
+                "item": {
+                    "id": "tui-input",
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": "manual"}],
+                },
+            },
+        }
+    )
+    worker = asyncio.create_task(service._record_events())
+    try:
+        await asyncio.wait_for(recorded.wait(), 2)
+        assert set(service.state["intents"]) == {"heartbeat"}
+        service.rpc.request.return_value = {"rateLimits": {"primary": {"usedPercent": 100}}}
+        await service.refresh_resources()
+        # Deliberate conservative policy: the whole mixed root is paused, even
+        # its manual turn, because autonomous Goals/descendants can outlive input.
+        service.codex.stop_tree.assert_awaited_once_with("new-root")
+        assert service.state["tasks"]["main"]["paused"]
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.parametrize("automatic", [1, "true", None])
+async def test_automatic_admission_requires_boolean_ownership(service, automatic):
+    with pytest.raises(ValueError, match="boolean"):
+        await service.submit("main", "input", automatic=automatic)
+    service.codex.turn_start.assert_not_called()
+
+
+@pytest.mark.parametrize("pause_kind", ["quota", "manual", "other_task"])
+async def test_pause_during_resume_stops_late_goal_ack_and_keeps_pause(service, pause_kind):
+    service.state["tasks"]["main"] = {
+        "thread_id": "root",
+        "paused": True,
+        "automatic": True,
+        "has_input": True,
+    }
+    service.state["tasks"]["other"] = {"thread_id": "other-root", "paused": False}
+    service.store.set_autonomy_paused(True)
+    service.codex.queue_list = AsyncMock(return_value={"data": []})
+    entered, release = asyncio.Event(), asyncio.Event()
+    goal_state = "paused"
+
+    async def rpc(method, params):
+        nonlocal goal_state
+        if method == "thread/goal/get":
+            return {"goal": {"status": goal_state}}
+        if method == "thread/goal/set":
+            entered.set()
+            await release.wait()
+            goal_state = "active"
+        return {}
+
+    async def stop_tree(*args):
+        nonlocal goal_state
+        if args[0] == "root":
+            goal_state = "paused"
+        return {"stopped": [args[0]]}
+
+    service.rpc.request.side_effect = rpc
+    service.codex.stop_tree.side_effect = stop_tree
+    resuming = asyncio.create_task(service.handle("resume", {}))
+    await asyncio.wait_for(entered.wait(), 2)
+    if pause_kind == "quota":
+        service._on_notification(
+            {
+                "method": "account/rateLimits/updated",
+                "params": {"rateLimits": {"primary": {"usedPercent": 100}}},
+            }
+        )
+        assert json.loads(service.path.read_text())["tasks"]["main"]["resource_pause_pending"]
+        stopping = asyncio.create_task(service._stop_resource_paused_tasks())
+    elif pause_kind == "other_task":
+        stopping = asyncio.create_task(service.pause("other"))
+    else:
+        stopping = asyncio.create_task(service.pause())
+    await asyncio.sleep(0)
+    release.set()
+    results = await asyncio.wait_for(asyncio.gather(resuming, stopping, return_exceptions=True), 2)
+    assert not isinstance(results[1], BaseException)
+    if pause_kind == "other_task":
+        assert results[0] == {"resumed": "autonomy"}
+        assert goal_state == "active"
+        assert not service.state["tasks"]["main"]["paused"]
+        assert service.state["tasks"]["other"]["paused"]
+        service.codex.stop_tree.assert_awaited_once_with("other-root")
+        return
+    assert isinstance(results[0], RejectedDispatch)
+    assert goal_state == "paused"
+    assert service.state["tasks"]["main"]["paused"]
+    assert service.store.is_autonomy_paused()
+    assert any(call.args == ("root",) for call in service.codex.stop_tree.await_args_list)
 
 
 async def test_native_token_notifications_record_usage_once(service):

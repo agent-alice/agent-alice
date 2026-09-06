@@ -388,7 +388,7 @@ class Store:
                 first, last, following = due_window(job, now)
                 existing = (
                     db.execute(
-                        "SELECT id FROM events WHERE job_id=? AND status='pending' ORDER BY due_at LIMIT 1",
+                        "SELECT id,due_at FROM events WHERE job_id=? AND status='pending' ORDER BY due_at LIMIT 1",
                         (job.id,),
                     ).fetchone()
                     if job.kind == "heartbeat"
@@ -398,7 +398,7 @@ class Store:
                     event_id = existing[0]
                     db.execute(
                         "UPDATE events SET through_at=?,catch_up=? WHERE id=?",
-                        (last, int(job.catch_up and last > first), event_id),
+                        (last, int(job.catch_up and last > existing["due_at"]), event_id),
                     )
                 else:
                     event_id = str(
@@ -470,6 +470,36 @@ class Store:
                 "UPDATE events SET status='pending',owner=NULL WHERE id=? AND status='claimed' AND owner=?",
                 (event_id, owner),
             )
+
+    def defer_event(self, event_id: str, owner: str, *, now: float) -> DispatchEvent:
+        """Return a definitively unsent dispatch to the same pending occurrence.
+
+        Only its current leased owner may attest that sending had no external
+        effect. Changed or deleted definitions cancel the old occurrence; an
+        unknown result or a durable receipt can never be reset for replay.
+        """
+        with self._transaction() as db:
+            self._require_lease(db, owner, _timestamp(now))
+            row = db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+            if row is None:
+                raise KeyError(event_id)
+            if row["status"] != "sending" or row["owner"] != owner:
+                raise ValueError("only an owned sending event can be deferred")
+            job_row = db.execute(
+                "SELECT definition FROM jobs WHERE id=?", (row["job_id"],)
+            ).fetchone()
+            current = self._job(job_row[0]) if job_row is not None else None
+            planned = self._job(row["definition"])
+            status = (
+                "pending"
+                if current is not None and current.enabled and current.revision == planned.revision
+                else "cancelled"
+            )
+            db.execute(
+                "UPDATE events SET status=?,owner=NULL,receipt=NULL WHERE id=?",
+                (status, event_id),
+            )
+        return self.get_event(event_id)
 
     def record_receipt(self, event_id: str, receipt: DispatchReceipt) -> DispatchEvent:
         """Record explicit acknowledgement/completion or reconcile unknown state.
