@@ -24,8 +24,10 @@ async def control(config, respond):
     async def handle(reader, writer):
         try:
             message = json.loads(await reader.readline())
-            writer.write(json.dumps(respond(message)).encode() + b"\n")
-            await writer.drain()
+            result = respond(message)
+            if result is not None:
+                writer.write(json.dumps(result).encode() + b"\n")
+                await writer.drain()
         finally:
             writer.close()
             await writer.wait_closed()
@@ -69,6 +71,33 @@ async def test_supervisor_can_recover_before_cli_resolves_damaged_current(tmp_pa
     async with control(config, respond):
         assert (await cli.start(config))["ready"] is True
     assert started == [config.home]
+
+
+async def test_supervised_start_recovers_read_only_status_disconnect(tmp_path, monkeypatch):
+    config = fixture_config(tmp_path)
+    write_json(config.root / "state/supervisor.json", {"installed": True})
+    started = []
+    monkeypatch.setattr(launchd, "start", lambda value: started.append(value.home))
+
+    def respond(message):
+        if not started:
+            return None
+        return {"ok": True, "result": {"ready": True}}
+
+    async with control(config, respond):
+        assert (await cli.start(config))["ready"] is True
+    assert started == [config.home]
+
+
+async def test_status_disconnect_remains_an_error_for_offline_write_guards(tmp_path):
+    from alice_codex.control import ControlError
+
+    config = fixture_config(tmp_path)
+    async with control(config, lambda message: None):
+        with pytest.raises(ControlError, match="disconnected"):
+            await cli.running(config)
+        with pytest.raises(ControlError, match="disconnected"):
+            await cli.start(config)
 
 
 async def test_supervisor_blocked_is_reported_without_waiting_for_timeout(tmp_path, monkeypatch):

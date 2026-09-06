@@ -155,10 +155,25 @@ async def running(config) -> dict | None:
 
 
 async def start(config) -> dict:
-    status = await running(config)
+    from .control import ControlError
+
+    supervised = (config.root / "state/supervisor.json").exists()
+
+    async def observe():
+        try:
+            return await running(config)
+        except ControlError:
+            # An installed supervisor can reconcile an interrupted status read
+            # using owned process identities. Do not weaken running(), which also
+            # guards offline data writes, or tolerate unknown mutation outcomes.
+            if supervised:
+                return None
+            raise
+
+    status = await observe()
     if status and status.get("ready"):
         return status
-    if (config.root / "state/supervisor.json").exists():
+    if supervised:
         from .launchd import start as start_supervisor
         from .launchd import status as supervisor_status
 
@@ -168,12 +183,12 @@ async def start(config) -> dict:
         deadline = time.monotonic() + 180
         next_supervisor_check = 0
         while time.monotonic() < deadline:
-            status = await running(config)
+            status = await observe()
             if status and status.get("ready"):
                 return status
             if time.monotonic() >= next_supervisor_check:
-                supervised = await asyncio.to_thread(supervisor_status, config)
-                state = supervised.get("supervisor") or {}
+                supervision = await asyncio.to_thread(supervisor_status, config)
+                state = supervision.get("supervisor") or {}
                 if state.get("lifecycle") == "blocked":
                     raise RuntimeError(
                         "Supervisor could not start a compatible verified release; "
