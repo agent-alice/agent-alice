@@ -356,7 +356,7 @@ def test_corrupt_or_future_database_is_preserved(tmp_path):
     other = tmp_path / "future.sqlite3"
     ResourceLedger(other)
     with sqlite3.connect(other) as db:
-        db.execute("PRAGMA user_version=2")
+        db.execute(f"PRAGMA user_version={ResourceLedger.SCHEMA_VERSION + 1}")
     before = other.read_bytes()
     with pytest.raises(ResourceError, match="unsupported"):
         ResourceLedger(other)
@@ -412,7 +412,7 @@ def test_reference_import_is_idempotent_and_never_configures_accounting(ledger):
     before.pop("historical_rule_reference")
     assert after == before
     with sqlite3.connect(ledger.path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert db.execute("PRAGMA user_version").fetchone()[0] == ResourceLedger.SCHEMA_VERSION
         assert db.execute("SELECT COUNT(*) FROM money").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM settlements").fetchone()[0] == 0
     with pytest.raises(ResourceError, match="baseline"):
