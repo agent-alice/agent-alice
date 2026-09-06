@@ -65,6 +65,11 @@ def runtime(tmp_path):
     fake = tmp_path / "fake_codex.py"
     shutil.copyfile(Path(__file__).parent / "fixtures/fake_codex.py", fake)
     fake.chmod(0o700)
+    # Preserve the synthetic distribution layout; this companion deliberately
+    # fails if executed and does not substitute for the real Code Mode gate.
+    fake_host = tmp_path / "codex-code-mode-host"
+    shutil.copyfile(Path(__file__).parent / "fixtures/codex-code-mode-host", fake_host)
+    fake_host.chmod(0o700)
 
     def cli(*args, check=True, timeout=30):
         result = subprocess.run(
