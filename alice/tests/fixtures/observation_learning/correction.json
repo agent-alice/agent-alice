@@ -1,0 +1,6 @@
+{
+  "failure_case": "training-expired-cache",
+  "cause_hypothesis": "Completeness used cursor and field coverage but did not include declared cache age, truncation, permission or independent-source validity.",
+  "change": "Propagate bounded collection diagnostics into observation v1 and require trustworthy source metadata before totals or readback can be known.",
+  "scope": "Deterministic observation v1 and independently supplied readback metadata on the fixed synthetic suite; no live-model transfer or general-learning claim."
+}

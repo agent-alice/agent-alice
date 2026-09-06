@@ -1,0 +1,687 @@
+{
+  "schema_version": 1,
+  "fixture_version": "observation-learning-v1",
+  "cases": [
+    {
+      "id": "training-expired-cache",
+      "phase": "training",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "training-cached",
+                "count": 4
+              }
+            ],
+            "cache_age_seconds": 80,
+            "cache_max_age_seconds": 60
+          }
+        ]
+      }
+    },
+    {
+      "id": "unseen-old-observation",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "fresh-shape-old-time",
+                "count": 13
+              }
+            ]
+          }
+        ],
+        "freshness": {
+          "as_of": "2026-09-06T10:02:01Z",
+          "max_age_seconds": 120
+        }
+      }
+    },
+    {
+      "id": "unseen-explicit-truncation",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "tail-truncated",
+                "count": 8
+              }
+            ],
+            "truncated": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "unseen-permission-metadata",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "partial-visible",
+                "count": 2
+              }
+            ],
+            "http_status": 403
+          }
+        ]
+      }
+    },
+    {
+      "id": "unseen-denied-empty",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "error",
+            "items": [],
+            "http_status": 401,
+            "error": "http_error"
+          }
+        ]
+      }
+    },
+    {
+      "id": "unseen-independent-scope",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "a",
+                "count": 3
+              }
+            ]
+          }
+        ],
+        "independent": {
+          "source": "synthetic-browser",
+          "observed_at": "2026-09-06T10:00:01Z",
+          "subject": "fixture-subject",
+          "collection": "different-collection",
+          "coverage": "complete",
+          "items": [
+            {
+              "id": "a",
+              "count": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "unseen-reused-source",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "b",
+                "count": 5
+              }
+            ]
+          }
+        ],
+        "independent": {
+          "source": "synthetic-api",
+          "observed_at": "2026-09-06T10:00:01Z",
+          "subject": "fixture-subject",
+          "collection": "items",
+          "coverage": "complete",
+          "items": [
+            {
+              "id": "b",
+              "count": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "unseen-independent-cache",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "c",
+                "count": 7
+              }
+            ]
+          }
+        ],
+        "independent": {
+          "source": "synthetic-browser",
+          "observed_at": "2026-09-06T10:00:01Z",
+          "subject": "fixture-subject",
+          "collection": "items",
+          "coverage": "complete",
+          "items": [
+            {
+              "id": "c",
+              "count": 7
+            }
+          ],
+          "cache_age_seconds": 121,
+          "cache_max_age_seconds": 120
+        }
+      }
+    },
+    {
+      "id": "unseen-missing-field",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "missing"
+              },
+              {
+                "id": "zero",
+                "count": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "unseen-invalid-field-shapes",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "null",
+                "count": null
+              },
+              {
+                "id": "bool",
+                "count": false
+              },
+              {
+                "id": "negative",
+                "count": -1
+              },
+              {
+                "id": "string",
+                "count": "0"
+              },
+              {
+                "id": "known",
+                "count": 3
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "unseen-missing-page",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": "unseen-second-page",
+            "status": "ok",
+            "items": [
+              {
+                "id": "first",
+                "count": 11
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "unseen-source-contradiction",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "d",
+                "count": 9
+              }
+            ]
+          }
+        ],
+        "independent": {
+          "source": "synthetic-browser",
+          "observed_at": "2026-09-06T10:00:01Z",
+          "subject": "fixture-subject",
+          "collection": "items",
+          "coverage": "complete",
+          "items": [
+            {
+              "id": "d",
+              "count": 10
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "unseen-browser-only-record",
+      "phase": "unseen",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "e",
+                "count": 1
+              }
+            ]
+          }
+        ],
+        "independent": {
+          "source": "synthetic-browser",
+          "observed_at": "2026-09-06T10:00:01Z",
+          "subject": "fixture-subject",
+          "collection": "items",
+          "coverage": "complete",
+          "items": [
+            {
+              "id": "web-only",
+              "count": 2
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "counterexample-true-zero",
+      "phase": "counterexample",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "actual-zero",
+                "count": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "counterexample-empty-collection",
+      "phase": "counterexample",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": []
+          }
+        ]
+      }
+    },
+    {
+      "id": "counterexample-complete-pages",
+      "phase": "counterexample",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": "next",
+            "status": "ok",
+            "items": [
+              {
+                "id": "one",
+                "count": 4
+              }
+            ]
+          },
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": "next",
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "two",
+                "count": 6
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "counterexample-fresh-cache",
+      "phase": "counterexample",
+      "operation": "observation",
+      "input": {
+        "schema_version": 1,
+        "subject": "fixture-subject",
+        "collection": "items",
+        "required_metrics": [
+          "count"
+        ],
+        "pages": [
+          {
+            "source": "synthetic-api",
+            "observed_at": "2026-09-06T10:00:00Z",
+            "cursor": null,
+            "next_cursor": null,
+            "status": "ok",
+            "items": [
+              {
+                "id": "current",
+                "count": 12
+              }
+            ],
+            "cache_age_seconds": 10,
+            "cache_max_age_seconds": 60
+          }
+        ],
+        "freshness": {
+          "as_of": "2026-09-06T10:00:30Z",
+          "max_age_seconds": 120
+        }
+      }
+    },
+    {
+      "id": "counterexample-bound-readback",
+      "phase": "counterexample",
+      "operation": "reconciliation",
+      "input": {
+        "intent": {
+          "action_id": "synthetic-action",
+          "subject": "fixture-subject",
+          "target": "fixture-target",
+          "status": "unknown",
+          "external_id": "fixture-object",
+          "content_sha256": "bd7129398c087c5d863bc324bf752afb769486de4d5c83095e48682e097addd2",
+          "sent_at": "2026-09-06T10:00:00Z"
+        },
+        "evidence": {
+          "source": "synthetic-readback",
+          "observed_at": "2026-09-06T10:00:01Z",
+          "receipts": [
+            {
+              "action_id": "synthetic-action",
+              "subject": "fixture-subject",
+              "target": "fixture-target",
+              "status": "unknown",
+              "external_id": "fixture-object",
+              "content_sha256": "bd7129398c087c5d863bc324bf752afb769486de4d5c83095e48682e097addd2",
+              "sent_at": "2026-09-06T10:00:00Z",
+              "kind": "read_back",
+              "visible": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "unseen-readback-before-action",
+      "phase": "unseen",
+      "operation": "reconciliation",
+      "input": {
+        "intent": {
+          "action_id": "synthetic-action",
+          "subject": "fixture-subject",
+          "target": "fixture-target",
+          "status": "unknown",
+          "external_id": "fixture-object",
+          "content_sha256": "bd7129398c087c5d863bc324bf752afb769486de4d5c83095e48682e097addd2",
+          "sent_at": "2026-09-06T10:00:00Z"
+        },
+        "evidence": {
+          "source": "synthetic-readback",
+          "observed_at": "2026-09-06T09:59:59Z",
+          "receipts": [
+            {
+              "action_id": "synthetic-action",
+              "subject": "fixture-subject",
+              "target": "fixture-target",
+              "status": "unknown",
+              "external_id": "fixture-object",
+              "content_sha256": "bd7129398c087c5d863bc324bf752afb769486de4d5c83095e48682e097addd2",
+              "sent_at": "2026-09-06T10:00:00Z",
+              "kind": "read_back",
+              "visible": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "unseen-http-success-only",
+      "phase": "unseen",
+      "operation": "reconciliation",
+      "input": {
+        "intent": {
+          "action_id": "synthetic-action",
+          "subject": "fixture-subject",
+          "target": "fixture-target",
+          "status": "unknown",
+          "external_id": "fixture-object",
+          "content_sha256": "bd7129398c087c5d863bc324bf752afb769486de4d5c83095e48682e097addd2",
+          "sent_at": "2026-09-06T10:00:00Z"
+        },
+        "evidence": {
+          "source": "synthetic-readback",
+          "observed_at": "2026-09-06T10:00:01Z",
+          "receipts": [
+            {
+              "action_id": "synthetic-action",
+              "subject": "fixture-subject",
+              "target": "fixture-target",
+              "status": "unknown",
+              "external_id": "fixture-object",
+              "content_sha256": "bd7129398c087c5d863bc324bf752afb769486de4d5c83095e48682e097addd2",
+              "sent_at": "2026-09-06T10:00:00Z",
+              "kind": "submission_ack",
+              "visible": true,
+              "http_status": 201
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
