@@ -50,6 +50,8 @@ _SENSITIVE_NAMES = {
 }
 _CITATION = re.compile(r"\[source:(s_[a-f0-9]{64})\]")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_READ_CHARS = 65536
+_PARSE_CHARS = 1024 * 1024
 
 
 class MemoryError(RuntimeError):
@@ -172,9 +174,14 @@ def _stable_copy(source: Path, target: Path) -> dict[str, Any]:
             raise SourceChangedError("Source changed before copying")
         out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(out, "wb") as destination, os.fdopen(fd, "rb", closefd=False) as stream:
-            while block := stream.read(1024 * 1024):
+            remaining = before[2]
+            while remaining:
+                block = stream.read(min(remaining, 1024 * 1024))
+                if not block:
+                    raise SourceChangedError("Source was truncated while copying")
                 digest.update(block)
                 destination.write(block)
+                remaining -= len(block)
             destination.flush()
             os.fsync(destination.fileno())
         if before != _fingerprint(source):
@@ -238,27 +245,67 @@ def _kind(rel: str) -> str:
 
 
 def _records(path: Path) -> Iterator[tuple[int, str, dict[str, Any] | None, str | None]]:
-    """Keep malformed JSONL as addressable raw records; do not drop bad lines."""
-    if path.suffix.lower() == ".jsonl":
-        with path.open("r", encoding="utf-8", errors="replace") as stream:
-            for number, text in enumerate(stream, 1):
-                error = None
-                try:
-                    obj = json.loads(text)
-                    if not isinstance(obj, dict):
-                        error, obj = "json_not_object", None
-                except (json.JSONDecodeError, ValueError):
-                    error, obj = "invalid_json", None
-                yield number, text, obj, error
-    else:
-        # Log lines stay independently queryable; Markdown is one document so
-        # handwritten/automatic sections and citations remain together.
-        if path.suffix.lower() in {".md", ".markdown"}:
-            yield 0, path.read_text(encoding="utf-8", errors="replace"), None, None
-        else:
-            with path.open("r", encoding="utf-8", errors="replace") as stream:
-                for number, text in enumerate(stream, 1):
-                    yield number, text, None, None
+    """Bound parsing, retaining oversized/malformed originals as addressable gaps."""
+    for number, text, total in _record_slices(path, _PARSE_CHARS):
+        error, obj = None, None
+        if total > _PARSE_CHARS:
+            error = "record_exceeds_parse_limit"
+        elif path.suffix.lower() == ".jsonl":
+            try:
+                obj = json.loads(text)
+                if not isinstance(obj, dict):
+                    error, obj = "json_not_object", None
+            except (ValueError, RecursionError):
+                error, obj = "invalid_json", None
+        yield number, text, obj, error
+
+
+def _record_slices(
+    path: Path, max_chars: int, offset_chars: int = 0
+) -> Iterator[tuple[int, str, int]]:
+    """Scan in fixed chunks, retaining only the requested character range.
+
+    Universal-newline/replacement decoding matches the schema-1 reader. Markdown
+    remains record 0; other files retain physical line numbers and source IDs.
+    Raw bytes are never decoded or truncated during archival copying.
+    """
+    document = path.suffix.lower() in {".md", ".markdown"}
+    number, total, parts = (0 if document else 1), 0, []
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        while True:
+            chunk = stream.read(_READ_CHARS) if document else stream.readline(_READ_CHARS)
+            if not chunk:
+                if total or document:
+                    yield number, "".join(parts), total
+                return
+            end = total + len(chunk)
+            left, right = max(offset_chars, total), min(offset_chars + max_chars, end)
+            if left < right:
+                parts.append(chunk[left - total : right - total])
+            total = end
+            if not document and chunk.endswith("\n"):
+                yield number, "".join(parts), total
+                number, total, parts = number + 1, 0, []
+
+
+def _atomic_copy(source: Path, target: Path, expected: str, before: str | None) -> None:
+    """Seed large documents without loading the full archive into memory."""
+    _mkdir(target.parent)
+    fd, name = tempfile.mkstemp(prefix=".seed-", dir=target.parent)
+    os.close(fd)
+    temporary = Path(name)
+    temporary.unlink()
+    try:
+        if _stable_copy(source, temporary)["sha256"] != expected:
+            raise MemoryError("Snapshot content integrity check failed")
+        if target.is_symlink():
+            raise MemoryError("Cannot replace a symlink")
+        if (_hash_file(target) if target.exists() else None) != before:
+            raise MemoryConflictError("Workspace seed conflicts with a later edit")
+        os.replace(temporary, target)
+        _fsync_dir(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class MemoryStore:
@@ -453,9 +500,17 @@ class MemoryStore:
             if not roots[rel].exists() and not roots[rel].is_symlink():
                 raise MemoryError("Explicit archive source does not exist")
         for path in roots.values():
+            # Default allowlist entries may begin below a symlinked parent
+            # without the leaf itself being a symlink. Do not traverse those.
+            if path != source_root and path.is_relative_to(source_root):
+                parent = path.parent
+                while parent != source_root:
+                    if parent.is_symlink():
+                        raise MemoryError("Archive source parent cannot be a symlink")
+                    parent = parent.parent
             resolved = path.resolve()
-            if resolved == self.data_dir or resolved in self.data_dir.parents:
-                raise MemoryError("Archive input cannot contain its output directory")
+            if resolved.is_relative_to(self.data_dir) or resolved in self.data_dir.parents:
+                raise MemoryError("Archive input and output directories must be separate")
         snapshot_id = (
             snapshot_id
             or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
@@ -499,9 +554,29 @@ class MemoryStore:
                 entries = []
                 for rel, path in selected.items():
                     target = _join(staging / "files", rel)
-                    details = _stable_copy(path, target)
-                    entry = {"path": rel, **details, "source_path": str(path)}
                     old = previous_files.get(rel)
+                    unchanged = False
+                    if old and old["size"] == before[rel][2]:
+                        digest = _hash_file(path, before[rel][2])
+                        if before[rel] != _fingerprint(path):
+                            raise SourceChangedError("Source changed while checking increment")
+                        unchanged = digest == old["sha256"]
+                    if unchanged:
+                        prior_file = _join(
+                            _join(self.archives, previous_snapshot_id) / "files", rel
+                        )
+                        if _hash_file(prior_file) != old["sha256"]:
+                            raise MemoryError("Previous snapshot integrity check failed")
+                        _mkdir(target.parent)
+                        os.link(prior_file, target)
+                        details = {
+                            "sha256": digest,
+                            "size": before[rel][2],
+                            "fingerprint": list(before[rel]),
+                        }
+                    else:
+                        details = _stable_copy(path, target)
+                    entry = {"path": rel, **details, "source_path": str(path)}
                     entry["change"] = (
                         "unchanged"
                         if old and old["sha256"] == details["sha256"]
@@ -509,14 +584,6 @@ class MemoryStore:
                         if old
                         else "added"
                     )
-                    if entry["change"] == "unchanged":
-                        prior_file = _join(
-                            _join(self.archives, previous_snapshot_id) / "files", rel
-                        )
-                        if _hash_file(prior_file) != details["sha256"]:
-                            raise MemoryError("Previous snapshot integrity check failed")
-                        target.unlink()
-                        os.link(prior_file, target)
                     entries.append(entry)
                 after, _ = _inventory(roots)
                 changed = sorted(
@@ -580,6 +647,8 @@ class MemoryStore:
             raise MemoryError("Invalid snapshot identifier")
         path = _join(self.archives, snapshot_id + "/manifest.json")
         manifest = json.loads(path.read_text())
+        if manifest.get("schema_version") != self.SCHEMA_VERSION:
+            raise MemoryError("Unsupported snapshot schema version; original preserved")
         check = dict(manifest)
         expected = check.pop("manifest_sha256")
         if expected != _digest(_json(check)) or manifest["snapshot_id"] != snapshot_id:
@@ -635,7 +704,28 @@ class MemoryStore:
             )
 
     def _seed(self, manifest: dict, destination: Path, previous: dict | None) -> list[dict]:
-        old = {e["path"]: e for e in previous["files"]} if previous else {}
+        seed_state = _join(self.state, "last-seed.json")
+        seeded_previous = seed_state.exists()
+        baseline = None
+        if seeded_previous:
+            last = json.loads(seed_state.read_text())
+            if last["snapshot_id"] == manifest["snapshot_id"]:
+                # Recovery of indexing is allowed; replaying a completed seed
+                # must never resurrect deleted notes or overwrite newer data.
+                return last["conflicts"]
+            ancestor, seen = previous, set()
+            while ancestor is not None and ancestor["snapshot_id"] != last["snapshot_id"]:
+                if ancestor["snapshot_id"] in seen:
+                    raise MemoryConflictError("Snapshot ancestry contains a cycle")
+                seen.add(ancestor["snapshot_id"])
+                parent_id = ancestor["previous_snapshot_id"]
+                ancestor = self._load_manifest(parent_id) if parent_id else None
+            if ancestor is None:
+                raise MemoryConflictError("Workspace seed must extend the latest seeded snapshot")
+            # Archive-only increments advance archival ancestry, not the
+            # workspace merge base. Compare against the last actual seed.
+            baseline = ancestor
+        old = {e["path"]: e for e in baseline["files"]} if baseline else {}
         conflicts = []
         for entry in manifest["files"]:
             rel = entry["path"]
@@ -644,6 +734,11 @@ class MemoryStore:
             ):
                 continue
             target = _join(self.workspace, rel)
+            actual = None
+            if not target.exists() and rel in old and seeded_previous:
+                if old[rel]["sha256"] != entry["sha256"]:
+                    conflicts.append({"path": rel, "reason": "workspace_deleted_source_changed"})
+                continue
             if target.exists():
                 actual = _hash_file(target)
                 if actual == entry["sha256"]:
@@ -659,7 +754,12 @@ class MemoryStore:
                             }
                         )
                     continue
-            _atomic(target, _join(destination / "files", rel).read_bytes())
+            _atomic_copy(_join(destination / "files", rel), target, entry["sha256"], actual)
+        removed = sorted(set(old) - {entry["path"] for entry in manifest["files"]})
+        for rel in removed:
+            target = _join(self.workspace, rel)
+            if target.is_file() and _hash_file(target) != old[rel]["sha256"]:
+                conflicts.append({"path": rel, "reason": "source_deleted_workspace_changed"})
         _atomic(
             self.state / "last-seed.json",
             _json({"snapshot_id": manifest["snapshot_id"], "conflicts": conflicts}),
@@ -711,7 +811,7 @@ class MemoryStore:
         _join(self.data_dir, path.relative_to(self.data_dir).as_posix())
         if _hash_file(path) != row["file_sha256"]:
             raise MemoryError("Source archive integrity check failed")
-        for line, text, _, _ in _records(path):
+        for line, text, total in _record_slices(path, max_chars, offset_chars):
             if line == row["line_number"]:
                 result = {
                     k: row[k]
@@ -727,11 +827,11 @@ class MemoryStore:
                 }
                 end = offset_chars + max_chars
                 result.update(
-                    content=text[offset_chars:end],
-                    truncated=len(text) > end,
+                    content=text,
+                    truncated=total > end,
                     offset_chars=offset_chars,
-                    total_chars=len(text),
-                    next_offset=end if len(text) > end else None,
+                    total_chars=total,
+                    next_offset=end if total > end else None,
                 )
                 return result
         raise MemoryError("Source record is missing")
@@ -934,77 +1034,140 @@ class MemoryStore:
             raise SummaryValidationError("Summary period has not closed")
         lower = {"L1": "traces", "L2": "hourly", "L3": "diary", "L4": "weekly"}[level]
         root = _join(self.workspace, "memory/chronicle/" + lower)
-        selected: list[dict] = []
-        files: dict[str, dict] = {}
-        total_bytes = 0
-        if root.exists():
+
+        def inventory() -> dict[str, tuple[int, int, int, int, int]]:
+            found = {}
             for path in sorted(root.rglob("*")):
-                if path.is_symlink() or not path.is_file():
+                mode = path.lstat().st_mode
+                if stat.S_ISLNK(mode):
+                    raise SummaryValidationError("Summary source symlinks are not allowed")
+                if stat.S_ISDIR(mode):
                     continue
-                _join(self.workspace, path.relative_to(self.workspace).as_posix())
+                if not stat.S_ISREG(mode):
+                    raise SummaryValidationError("Summary source is not a regular file")
                 rel = path.relative_to(self.workspace).as_posix()
-                before = _fingerprint(path)
-                digest = _hash_file(path)
-                for line, text, obj, error in _records(path):
-                    if not _in_period(level, path, obj, start, end):
-                        continue
-                    source_id = _source_id("workspace", rel, digest, line)
-                    if level in {"L1", "L2"} and not _valid_record_time(level, obj):
-                        error = error or "missing_or_invalid_timestamp"
-                    selected.append(
-                        {"source_id": source_id, "path": rel, "line": line, "parse_error": error}
-                    )
-                    total_bytes += len(text.encode())
-                    files[rel] = {"path": rel, "sha256": digest, "size": before[2]}
-                    if len(selected) > 10000 or total_bytes > 16 * 1024 * 1024:
-                        raise SummaryValidationError(
-                            "Summary batch needs explicit partitioning; no sources were silently truncated"
-                        )
-                if before != _fingerprint(path):
-                    raise SourceChangedError("Summary input changed while selecting records")
-        if not selected:
-            raise NoSourcesError("No source records cover this period")
-        manifest = {
-            "schema_version": 1,
-            "level": level,
-            "period": period,
-            "timezone": timezone,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "prompt_version": "chronicle-v1",
-            "files": list(files.values()),
-            "sources": selected,
-            "target": _summary_target(level, period),
-        }
-        batch_id = _digest(_json(manifest))
-        manifest["batch_id"] = batch_id
-        directory = _join(self.batches, batch_id)
-        with self._lock():
-            if not directory.exists():
-                staging = Path(tempfile.mkdtemp(prefix=".batch-", dir=self.batches))
+                found[rel] = _fingerprint(_join(self.workspace, rel))
+            return found
+
+        def dated_path(path: Path) -> bool:
+            labels = (path.stem, path.parent.name) if level in {"L1", "L2"} else (path.stem,)
+            for label in labels:
                 try:
-                    for entry in manifest["files"]:
-                        info = _stable_copy(
-                            _join(self.workspace, entry["path"]),
-                            _join(staging / "files", entry["path"]),
+                    if level == "L4":
+                        _period_bounds("L3", label, timezone)
+                        return True
+                    if dt.date.fromisoformat(label).isoformat() == label:
+                        return True
+                except (ValueError, SummaryValidationError):
+                    continue
+            return False
+
+        with self._lock():
+            try:
+                initial = inventory()
+                selected: list[dict] = []
+                files: dict[str, dict] = {}
+                total_bytes = 0
+                for rel, before in initial.items():
+                    path = _join(self.workspace, rel)
+                    digest = _hash_file(path)
+                    for line, text, obj, error in _records(path):
+                        eligible = _in_period(level, path, obj, start, end)
+                        if error == "record_exceeds_parse_limit":
+                            # An unparseable record with no recognizable date
+                            # cannot safely be assigned to a different period.
+                            if eligible or not dated_path(path):
+                                raise SummaryValidationError(
+                                    "Summary source exceeds the bounded record parser; explicit partitioning required"
+                                )
+                            continue
+                        if (
+                            level in {"L1", "L2"}
+                            and not _valid_record_time(level, obj)
+                            and not dated_path(path)
+                        ):
+                            raise SummaryValidationError(
+                                "Summary source has no valid timestamp or recognizable file date"
+                            )
+                        if not eligible:
+                            continue
+                        source_id = _source_id("workspace", rel, digest, line)
+                        if level in {"L1", "L2"} and not _valid_record_time(level, obj):
+                            error = error or "missing_or_invalid_timestamp"
+                        selected.append(
+                            {
+                                "source_id": source_id,
+                                "path": rel,
+                                "line": line,
+                                "parse_error": error,
+                            }
                         )
-                        if info["sha256"] != entry["sha256"]:
-                            raise SourceChangedError("Summary input changed before freezing")
-                    _atomic(staging / "manifest.json", _json(manifest))
-                    os.replace(staging, directory)
-                    _fsync_dir(self.batches)
-                finally:
-                    if staging.exists():
-                        shutil.rmtree(staging)
-            with self._db() as db:
-                for entry in manifest["files"]:
-                    self._index_file(
-                        db,
-                        "workspace",
-                        entry["path"],
-                        _join(directory / "files", entry["path"]),
-                        entry["sha256"],
-                    )
+                        total_bytes += len(text.encode())
+                        files[rel] = {"path": rel, "sha256": digest, "size": before[2]}
+                        if len(selected) > 10000 or total_bytes > 16 * 1024 * 1024:
+                            raise SummaryValidationError(
+                                "Summary batch needs explicit partitioning; no sources were silently truncated"
+                            )
+                    if before != _fingerprint(path):
+                        raise SourceChangedError("Summary input changed while selecting records")
+                if inventory() != initial:
+                    raise SourceChangedError("Summary source inventory changed while selecting")
+                if not selected:
+                    raise NoSourcesError("No source records cover this period")
+                manifest = {
+                    "schema_version": 1,
+                    "level": level,
+                    "period": period,
+                    "timezone": timezone,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "prompt_version": "chronicle-v1",
+                    "files": list(files.values()),
+                    "sources": selected,
+                    "target": _summary_target(level, period),
+                }
+                batch_id = _digest(_json(manifest))
+                manifest["batch_id"] = batch_id
+                directory = _join(self.batches, batch_id)
+                if not directory.exists():
+                    staging = Path(tempfile.mkdtemp(prefix=".batch-", dir=self.batches))
+                    try:
+                        for entry in manifest["files"]:
+                            info = _stable_copy(
+                                _join(self.workspace, entry["path"]),
+                                _join(staging / "files", entry["path"]),
+                            )
+                            if info["sha256"] != entry["sha256"]:
+                                raise SourceChangedError("Summary input changed before freezing")
+                        _atomic(staging / "manifest.json", _json(manifest))
+                        if inventory() != initial:
+                            raise SourceChangedError(
+                                "Summary source inventory changed while freezing"
+                            )
+                        os.replace(staging, directory)
+                        _fsync_dir(self.batches)
+                    finally:
+                        if staging.exists():
+                            shutil.rmtree(staging)
+                else:
+                    if json.loads(_join(directory, "manifest.json").read_text()) != manifest:
+                        raise SummaryValidationError("Frozen batch manifest integrity check failed")
+                    for entry in manifest["files"]:
+                        if _hash_file(_join(directory / "files", entry["path"])) != entry["sha256"]:
+                            raise SourceChangedError("Frozen batch integrity check failed")
+                    if inventory() != initial:
+                        raise SourceChangedError("Summary source inventory changed while freezing")
+                with self._db() as db:
+                    for entry in manifest["files"]:
+                        self._index_file(
+                            db,
+                            "workspace",
+                            entry["path"],
+                            _join(directory / "files", entry["path"]),
+                            entry["sha256"],
+                        )
+            except FileNotFoundError as exc:
+                raise SourceChangedError("A summary source disappeared while freezing") from exc
         # The worker may write inside --cd under workspace-write. Frozen
         # evidence stays outside that writable root; the host commits via MCP.
         candidate_path = _join(self.workspace, f".alice/candidates/{batch_id}.json")
@@ -1024,6 +1187,8 @@ class MemoryStore:
             raise SummaryValidationError("Invalid batch identifier")
         directory = _join(self.batches, batch_id)
         manifest = json.loads(_join(directory, "manifest.json").read_text())
+        if manifest.get("schema_version") != 1:
+            raise SummaryValidationError("Unsupported summary batch schema version")
         check = dict(manifest)
         if check.pop("batch_id") != batch_id or _digest(_json(check)) != batch_id:
             raise SummaryValidationError("Batch manifest integrity check failed")
@@ -1046,9 +1211,14 @@ class MemoryStore:
             for entry in manifest["files"]:
                 current = _join(self.workspace, entry["path"])
                 # A later append does not invalidate the frozen earlier prefix.
-                if _hash_file(current, entry["size"]) != entry["sha256"]:
+                try:
+                    current_hash = _hash_file(current, entry["size"])
+                    frozen_hash = _hash_file(_join(directory / "files", entry["path"]))
+                except FileNotFoundError as exc:
+                    raise SourceChangedError("A frozen summary source is missing") from exc
+                if current_hash != entry["sha256"]:
                     raise SourceChangedError("A frozen summary source was modified")
-                if _hash_file(_join(directory / "files", entry["path"])) != entry["sha256"]:
+                if frozen_hash != entry["sha256"]:
                     raise SourceChangedError("Frozen batch integrity check failed")
             target = _join(self.workspace, manifest["target"])
             before = target.read_bytes() if target.exists() else None
@@ -1066,9 +1236,10 @@ class MemoryStore:
                 "manifest": manifest,
             }
             _atomic(intent_path, _json(intent))
-            _atomic(target, rendered)
-            intent["status"] = "committed"
-            _atomic(intent_path, _json(intent))
+            # Reconcile the target again after the durable intent. A manual
+            # edit during that write must receive the same conflict protection
+            # as an edit made during a process interruption.
+            self._recover_commits()
             return {"batch_id": batch_id, "target_path": str(target), "already_committed": False}
 
     def _recover_commits(self) -> None:
@@ -1078,6 +1249,12 @@ class MemoryStore:
         for path in sorted(commits.glob("*.json")):
             _join(commits, path.name)
             intent = json.loads(path.read_text())
+            if intent.get("schema_version") != 1:
+                raise MemoryConflictError("Unsupported summary commit schema version")
+            if intent.get("manifest", {}).get("schema_version") != 1:
+                raise MemoryConflictError("Unsupported summary batch schema version in commit")
+            if intent.get("status") not in {"pending", "committed"}:
+                raise MemoryConflictError("Summary commit has an invalid status")
             if intent["status"] != "pending":
                 continue
             target = _join(self.workspace, intent["target"])
@@ -1235,7 +1412,7 @@ def _validate_candidate(manifest: dict, candidate: dict) -> None:
     ):
         raise SummaryValidationError("Source coverage is incomplete or contradictory")
     cited = set(_CITATION.findall(content))
-    if cited != set(candidate["source_ids"]) or not cited or not cited <= covered:
+    if cited != set(candidate["source_ids"]) or (covered and not cited) or not cited <= covered:
         raise SummaryValidationError("Inline citations must match known, covered sources")
     malformed = {s["source_id"] for s in manifest["sources"] if s["parse_error"]}
     if not malformed <= set(missing_ids):
