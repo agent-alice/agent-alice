@@ -151,7 +151,7 @@ def run_check(
 class ReleaseManager:
     """Candidates live in home/releases; current.json is only a code selector."""
 
-    POLICY_VERSION = 5
+    POLICY_VERSION = 6
 
     def __init__(self, home: Path | str):
         self.home = Path(home).expanduser().resolve()
@@ -204,7 +204,7 @@ class ReleaseManager:
         if (
             not isinstance(manifest, dict)
             or manifest.get("id") != candidate_id
-            or manifest.get("policy_version") not in {4, self.POLICY_VERSION}
+            or manifest.get("policy_version") not in {4, 5, self.POLICY_VERSION}
         ):
             raise ReleaseError("invalid candidate manifest")
         return candidate, manifest
@@ -393,7 +393,7 @@ class ReleaseManager:
     def _candidate_pair(self, manifest: dict):
         if manifest.get("policy_version") != self.POLICY_VERSION:
             raise ReleaseError(
-                "legacy candidate needs a new paired-runtime verification; old report preserved"
+                "legacy candidate needs current-policy verification; old report preserved"
             )
         from .config import RuntimeConfig
         from .runtime_bundle import CodexBundle, verify_runtime_bundle
@@ -535,7 +535,7 @@ class ReleaseManager:
         candidate, manifest = self._manifest(candidate_id)
         if manifest.get("policy_version") != self.POLICY_VERSION:
             raise ReleaseError(
-                "legacy candidate needs new paired verification; old report preserved"
+                "legacy candidate needs current-policy verification; old report preserved"
             )
         # Invalidate a previous successful result before any new verification attempt.
         manifest["verified_report_sha256"] = None
@@ -910,6 +910,7 @@ class ReleaseManager:
             return None
         candidate, manifest = self._verified(pointer["current"])
         self._check_data_schema(manifest, data_schema)
+        self._check_bootstrap_policy(manifest)
         canonical = {
             "current": manifest["id"],
             "previous": pointer.get("previous"),

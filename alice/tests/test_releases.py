@@ -106,11 +106,27 @@ def test_fixture_companion_contract():
     return source, binary
 
 
-def stage(tmp_path, project, *, version="0.0.1", value="good", manager=None):
+def prepare_identity_gate(source):
+    # Structural gate fixture only; production native acceptance exercises real
+    # hooks and rebinding through the installed package, not this constant.
+    (source / "tests/test_identity_native.py").write_text('''import os
+import subprocess
+import pytest
+pytestmark = pytest.mark.native
+
+def test_synthetic_installed_identity_contract():
+    result = subprocess.run([os.environ["ALICE_ARTIFACT_PYTHON"], "-I", "-c", "from alice_codex.identity import IDENTITY_HOOK_COMPAT_VERSION; print(IDENTITY_HOOK_COMPAT_VERSION)"], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "1"
+''')
+
+
+def stage(tmp_path, project, *, version="0.0.1", value="good", manager=None, identity_capability=None):
     source, binary = project
+    if identity_capability == 1:
+        prepare_identity_gate(source)
     manager = manager or ReleaseManager(tmp_path / "runtime")
     candidate = manager.stage_wheel(
-        make_wheel(tmp_path, version, value),
+        make_wheel(tmp_path, version, value, identity_capability=identity_capability),
         source_root=source,
         python=sys.executable,
         codex_binary=binary,
@@ -182,16 +198,17 @@ def test_runtime_host_must_match_actual_candidate_tool_evidence(tmp_path, projec
     assert manager.current() is None
 
 
-def test_legacy_candidate_stays_readable_but_cannot_reuse_or_overwrite_old_report(tmp_path, project):
+@pytest.mark.parametrize("legacy_policy", [4, 5])
+def test_legacy_candidate_stays_readable_but_cannot_reuse_or_overwrite_old_report(tmp_path, project, legacy_policy):
     manager, candidate = stage(tmp_path, project)
     assert manager.verify(candidate, native=True)["promotable"]
     pointer = manager.activate(candidate)
     folder, manifest = manager._manifest(candidate)
-    manifest["policy_version"] = 4
+    manifest["policy_version"] = legacy_policy
     (folder / "candidate.json").write_text(json.dumps(manifest))
     before = (folder / "verification.json").read_bytes()
     assert manager.current() == pointer
-    assert manager._manifest(candidate)[1]["policy_version"] == 4
+    assert manager._manifest(candidate)[1]["policy_version"] == legacy_policy
     with pytest.raises(ReleaseError, match="legacy candidate"):
         manager.checked_current()
     with pytest.raises(ReleaseError, match="legacy candidate"):
@@ -591,7 +608,9 @@ def test_runtime_verifies_private_pin_after_original_application_changes(
     from alice_codex.config import initialize_config
     from alice_codex.files import write_json
 
-    manager, candidate = stage(tmp_path, project)
+    # Current init writes owned identity hooks, so this pair-focused positive
+    # case must use a compatible fixture; legacy rejection has separate tests.
+    manager, candidate = stage(tmp_path, project, identity_capability=1)
     report = manager.verify(candidate, native=True)
     assert report["passed"]
     config = initialize_config(manager.home, project[1])

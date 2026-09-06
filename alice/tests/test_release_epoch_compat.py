@@ -116,6 +116,11 @@ def test_old_bootstrap_cannot_introduce_epochs_even_before_first_journal(
         value["installed"]["resource_epoch_capability"] = 1
         write_json(path, value)
     write_json(manager.home / "state/supervisor.json", {"version": 2})
+    if tamper_bootstrap:
+        with pytest.raises(ReleaseError, match="capability metadata changed"):
+            manager.checked_current()
+    else:
+        assert manager.checked_current() == original
     manager, new = stage_epoch(tmp_path, project, version="0.0.2", manager=manager)
     assert manager.verify(new, native=True)["promotable"]
     expected = "capability metadata changed" if tamper_bootstrap else "uninstall.*resource epochs"

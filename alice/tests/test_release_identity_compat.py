@@ -6,21 +6,7 @@ import pytest
 
 from alice_codex.files import write_json
 from alice_codex.releases import ReleaseError, ReleaseManager
-from test_releases import make_wheel, project as project
-
-
-def prepare_identity_gate(source):
-    # Structural gate fixture only; the production native file exercises actual
-    # hook registration, delivery and rebinding through the installed package.
-    (source / "tests/test_identity_native.py").write_text('''import os
-import subprocess
-import pytest
-pytestmark = pytest.mark.native
-
-def test_synthetic_installed_identity_contract():
-    result = subprocess.run([os.environ["ALICE_ARTIFACT_PYTHON"], "-I", "-c", "from alice_codex.identity import IDENTITY_HOOK_COMPAT_VERSION; print(IDENTITY_HOOK_COMPAT_VERSION)"], capture_output=True, text=True, check=True)
-    assert result.stdout.strip() == "1"
-''')
+from test_releases import make_wheel, prepare_identity_gate, project as project
 
 
 def stage_identity(tmp_path, project, *, capability=1, version="0.0.1", manager=None):
