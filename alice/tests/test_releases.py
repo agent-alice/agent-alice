@@ -16,7 +16,10 @@ from alice_codex.releases import ReleaseError, ReleaseManager, source_fingerprin
 from alice_codex.store import Store
 
 
-def make_wheel(path, version="0.0.1", value="good", *, resource_schema=1, epoch_capability=None):
+def make_wheel(
+    path, version="0.0.1", value="good", *, resource_schema=1,
+    epoch_capability=None, identity_capability=None,
+):
     """A real minimal wheel: installation/entry execution need no network."""
     filename = path / f"alice_codex-{version}-py3-none-any.whl"
     info = f"alice_codex-{version}.dist-info"
@@ -32,6 +35,8 @@ def make_wheel(path, version="0.0.1", value="good", *, resource_schema=1, epoch_
     }
     if epoch_capability is not None:
         files["alice_codex/service.py"] = f"RESOURCE_EPOCH_CAPABILITY = {epoch_capability!r}\n"
+    if identity_capability is not None:
+        files["alice_codex/identity.py"] = f"IDENTITY_HOOK_COMPAT_VERSION = {identity_capability!r}\n"
     record = io.StringIO()
     writer = csv.writer(record)
     for name, text in files.items():

@@ -327,10 +327,13 @@ class ReleaseManager:
                     "import importlib,importlib.util; "
                     "service=importlib.import_module('alice_codex.service') if "
                     "importlib.util.find_spec('alice_codex.service') is not None else None; "
+                    "identity=importlib.import_module('alice_codex.identity') if "
+                    "importlib.util.find_spec('alice_codex.identity') is not None else None; "
                     "print(json.dumps({'python':sys.version, 'schedule_schema':Store.SCHEMA_VERSION, "
                     "'memory_schema':MemoryStore.SCHEMA_VERSION, "
                     "'resource_schema':ResourceLedger.SCHEMA_VERSION, "
                     "'resource_epoch_capability':getattr(service,'RESOURCE_EPOCH_CAPABILITY',0), "
+                    "'identity_hook_compat_version':getattr(identity,'IDENTITY_HOOK_COMPAT_VERSION',0), "
                     "'packages':sorted((d.metadata['Name'],d.version) for d in m.distributions())}))",
                 ],
                 cwd=candidate,
@@ -341,6 +344,7 @@ class ReleaseManager:
                 raise ReleaseError(f"installed candidate cannot load its schema: {probe.output}")
             installed_metadata = json.loads(probe.output)
             self._epoch_capability(installed_metadata)
+            self._identity_capability(installed_metadata)
             head = subprocess.run(
                 ["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True, timeout=10
             )
@@ -457,6 +461,10 @@ class ReleaseManager:
             manifest["installed"]
         ):
             raise ReleaseError("installed resource epoch capability does not match candidate metadata")
+        if self._probe_identity_capability(
+            self._python(candidate), candidate
+        ) != self._identity_capability(manifest["installed"]):
+            raise ReleaseError("installed identity hook capability does not match candidate metadata")
 
     @staticmethod
     def _epoch_capability(installed: dict) -> int:
@@ -469,26 +477,51 @@ class ReleaseManager:
         return value
 
     def _probe_epoch_capability(self, python: Path, directory: Path) -> int:
+        value = self._probe_capability(
+            python, directory, "alice_codex.service", "RESOURCE_EPOCH_CAPABILITY", "resource_epoch_capability"
+        )
+        return self._epoch_capability(value)
+
+    @staticmethod
+    def _identity_capability(installed: dict) -> int:
+        if not isinstance(installed, dict):
+            raise ReleaseError("invalid installed compatibility metadata")
+        value = installed.get("identity_hook_compat_version", 0)
+        if type(value) is not int or value not in {0, 1}:
+            raise ReleaseError("unsupported or invalid identity hook capability")
+        return value
+
+    def _probe_identity_capability(self, python: Path, directory: Path) -> int:
+        value = self._probe_capability(
+            python, directory, "alice_codex.identity", "IDENTITY_HOOK_COMPAT_VERSION", "identity_hook_compat_version"
+        )
+        return self._identity_capability(value)
+
+    def _probe_capability(
+        self, python: Path, directory: Path, module: str, constant: str, key: str
+    ) -> dict:
         result = run_check(
-            "installed-resource-epoch-capability",
+            "installed-" + key,
             [
                 str(python), "-I", "-c",
                 "import importlib,importlib.util,json; "
-                "service=importlib.import_module('alice_codex.service') if "
-                "importlib.util.find_spec('alice_codex.service') is not None else None; "
-                "print(json.dumps({'resource_epoch_capability':"
-                "getattr(service,'RESOURCE_EPOCH_CAPABILITY',0)}))",
+                f"module=importlib.import_module({module!r}) if "
+                f"importlib.util.find_spec({module!r}) is not None else None; "
+                f"print(json.dumps({{{key!r}:getattr(module,{constant!r},0)}}))",
             ],
             cwd=directory,
             env=self._environment(directory / "compatibility-probe-home"),
             timeout=30,
         )
         if result.status != "passed":
-            raise ReleaseError("installed resource epoch capability probe failed: " + result.output)
+            raise ReleaseError(f"installed {key} probe failed: " + result.output)
         try:
-            return self._epoch_capability(json.loads(result.output))
+            value = json.loads(result.output)
+            if not isinstance(value, dict) or key not in value:
+                raise ValueError("missing capability value")
+            return value
         except (TypeError, ValueError) as error:
-            raise ReleaseError("invalid installed resource epoch capability probe") from error
+            raise ReleaseError(f"invalid installed {key} probe") from error
 
     def verify(
         self,
@@ -576,8 +609,12 @@ class ReleaseManager:
                     raise ReleaseError("required native Code Mode pair test is missing")
                 epoch_capability = self._epoch_capability(manifest["installed"])
                 epoch_test = "tests/test_native_service_resource_epochs.py"
+                identity_capability = self._identity_capability(manifest["installed"])
+                identity_test = "tests/test_identity_native.py"
                 if epoch_capability and not (source / epoch_test).is_file():
                     raise ReleaseError("required native Service resource epoch test is missing")
+                if identity_capability and not (source / identity_test).is_file():
+                    raise ReleaseError("required native identity hook test is missing")
                 commands.append(
                     (
                         "native",
@@ -588,6 +625,7 @@ class ReleaseManager:
                             "tests",
                             "--ignore=tests/test_native_code_mode.py",
                             "--ignore=" + epoch_test,
+                            "--ignore=" + identity_test,
                             "-m",
                             "native and not live and not native_resource_epoch",
                             "-q",
@@ -621,6 +659,14 @@ class ReleaseManager:
                             candidate / "native-resource-epoch.xml",
                         )
                     )
+                if identity_capability:
+                    commands.append(
+                        (
+                            "native_identity",
+                            [python, "-m", "pytest", identity_test, "-m", "native and not live", "-q"],
+                            candidate / "native-identity.xml",
+                        )
+                    )
             if live:
                 commands.append(
                     (
@@ -651,6 +697,7 @@ class ReleaseManager:
             "codex_code_mode_host_sha256": manifest["codex_code_mode_host_sha256"],
             "environment_fingerprint": manifest["environment_fingerprint"],
             "resource_epoch_capability": self._epoch_capability(manifest["installed"]),
+            "identity_hook_compat_version": self._identity_capability(manifest["installed"]),
             "native_required": native,
             "live_required": live,
             "checks": [asdict(result) for result in results],
@@ -682,6 +729,8 @@ class ReleaseManager:
         required.update({"native", "native_pair"})
         if self._epoch_capability(manifest["installed"]):
             required.add("native_resource_epoch")
+        if self._identity_capability(manifest["installed"]):
+            required.add("native_identity")
         if report.get("live_required"):
             required.add("live")
         checks = report.get("checks", [])
@@ -699,6 +748,7 @@ class ReleaseManager:
             or report.get("codex_sha256") != manifest["codex_sha256"]
             or report.get("codex_code_mode_host_sha256") != manifest["codex_code_mode_host_sha256"]
             or self._epoch_capability(report) != self._epoch_capability(manifest["installed"])
+            or self._identity_capability(report) != self._identity_capability(manifest["installed"])
         ):
             raise ReleaseError("candidate required checks did not all pass")
         return candidate, manifest
@@ -707,6 +757,7 @@ class ReleaseManager:
         # These are database format guards, not a claim that every JSON/document
         # format or future migration can be reversed. No data is overwritten.
         self._check_resource_epoch_compat(manifest)
+        self._check_identity_compat(manifest)
         databases = {
             "schedule": self.home / "state/schedules.sqlite3",
             "memory": self.home / "memory-state/sources.sqlite3",
@@ -783,6 +834,15 @@ class ReleaseManager:
             raise ReleaseError(
                 "stop and uninstall the previous supervisor before introducing resource epochs"
             )
+        bootstrap_identity = self._identity_capability(bootstrap["installed"])
+        if self._probe_identity_capability(
+            bootstrap_python, bootstrap_python.parents[2]
+        ) != bootstrap_identity:
+            raise ReleaseError("installed bootstrap identity hook capability metadata changed")
+        if bootstrap_identity < self._identity_capability(manifest["installed"]):
+            raise ReleaseError(
+                "stop and uninstall the previous supervisor before introducing identity hooks"
+            )
         if (
             bootstrap.get("release_policy_version") != self.POLICY_VERSION
             or bootstrap.get("codex_sha256") != manifest["codex_sha256"]
@@ -792,6 +852,37 @@ class ReleaseManager:
             raise ReleaseError(
                 "stop and uninstall the previous supervisor before changing its verified runtime pair"
             )
+
+    def _check_identity_compat(self, manifest: dict) -> None:
+        capability = self._identity_capability(manifest["installed"])
+        path = self.home / "state/identity-runtime.json"
+        delivery = self.home / "state/identity-delivery"
+        config_path = self.home / "codex/config.toml"
+        if any(item.is_symlink() for item in (path, delivery, config_path, config_path.parent)):
+            raise ReleaseError("identity compatibility state must not be a symbolic link")
+        present = path.exists() or delivery.exists()
+        try:
+            if config_path.exists():
+                import tomllib
+                from .identity import has_owned_identity_hooks
+
+                document = tomllib.loads(config_path.read_text(encoding="utf-8"))
+                # init/configuration can write hooks before the ready manifest.
+                # Detect that prefix window with the owner's exact recognizer.
+                present = present or has_owned_identity_hooks(document)
+            if not present:
+                return
+            if capability < 1:
+                raise ReleaseError("runtime identity hooks require a rebinding-capable candidate")
+            if path.exists():
+                from .identity import IdentityError, validate_identity_runtime_manifest
+
+                try:
+                    validate_identity_runtime_manifest(read_json(path))
+                except IdentityError as error:
+                    raise ReleaseError(f"invalid identity runtime manifest: {error}") from error
+        except (ImportError, OSError, TypeError, ValueError) as error:
+            raise ReleaseError(f"invalid identity compatibility state: {error}") from error
 
     def current(self) -> dict[str, Any] | None:
         path = self.root / "current.json"

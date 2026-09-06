@@ -156,3 +156,95 @@ def test_schema_two_legacy_candidate_cannot_spawn_over_a_prepared_epoch(tmp_path
         manager.activate(old)
     assert manager.current() is None
     assert (manager.home / "state/runtime.json").read_bytes() == before
+
+
+def test_capable_candidate_accepts_known_journal_and_rejects_corrupt_variants(tmp_path, project):
+    import copy
+
+    prepare_epoch_gate(project[0])
+    manager, candidate = stage_epoch(tmp_path, project)
+    assert manager.verify(candidate, native=True)["promotable"]
+    install_epoch_data(manager)
+    pointer = manager.activate(candidate)
+    assert manager.checked_current() == pointer
+    variants = []
+    for value in (None, [], {"": {"state": "prepared", "server": None}},
+                  {"epoch": {"state": "unknown", "server": None}},
+                  {"epoch": {"state": "prepared", "server": {"pid": 123}}},
+                  {"epoch": {"state": "bound", "server": {"pid": True, "birth": "born", "identity": "owned"}}}):
+        state = epoch_state()
+        state["resource_epochs"] = value
+        variants.append(state)
+    wrong_version = epoch_state()
+    wrong_version["version"] = True
+    variants.append(wrong_version)
+    missing_binding = epoch_state()
+    missing_binding["server"] = {
+        "resource_epoch_id": "missing", "pid": 123, "birth": "born", "identity": "owned"
+    }
+    variants.append(missing_binding)
+    mismatch = copy.deepcopy(missing_binding)
+    mismatch["resource_epochs"]["missing"] = {
+        "state": "bound", "server": {"pid": 123, "birth": "other birth", "identity": "owned"}
+    }
+    variants.append(mismatch)
+    path = manager.home / "state/runtime.json"
+    for state in variants:
+        write_json(path, state)
+        before = path.read_bytes()
+        with pytest.raises(ReleaseError, match="resource epoch"):
+            manager.activate(candidate)
+        assert manager.current() == pointer
+        assert path.read_bytes() == before
+
+
+def test_manual_and_automatic_rollback_preserve_prepared_journal_and_new_data(tmp_path, project):
+    import sqlite3
+
+    prepare_epoch_gate(project[0])
+    manager, old = stage_epoch(tmp_path, project, capability=None)
+    assert manager.verify(old, native=True)["promotable"]
+    manager.activate(old)
+    manager, capable = stage_epoch(tmp_path, project, version="0.0.2", manager=manager)
+    assert manager.verify(capable, native=True)["promotable"]
+    pointer = manager.activate(capable)
+    install_epoch_data(manager)
+    path = manager.home / "state/runtime.json"
+    before = path.read_bytes()
+    with pytest.raises(ReleaseError, match="resource epoch"):
+        manager.rollback()
+    assert manager.current() == pointer
+    with pytest.raises(ReleaseError, match="resource epoch"):
+        manager.automatic_rollback(capable, {capable}, expected_epoch=pointer["activation_epoch"])
+    assert manager.current() == pointer
+    assert manager.checked_current() == pointer
+    assert path.read_bytes() == before
+    with sqlite3.connect(manager.home / "state/resources.sqlite3") as connection:
+        assert connection.execute("SELECT value FROM retained_evidence").fetchone()[0] == "new synthetic observation"
+
+
+async def test_supervisor_blocks_before_starting_an_epoch_unaware_service(tmp_path, project, monkeypatch):
+    from alice_codex.config import RuntimeConfig
+    from alice_codex.supervisor import Supervisor
+
+    manager, old = stage_epoch(tmp_path, project, capability=None)
+    assert manager.verify(old, native=True)["promotable"]
+    manager.activate(old)
+    install_epoch_data(manager)
+    manifest = manager._manifest(old)[1]
+    config = RuntimeConfig(str(manager.home), str(project[1]), "codex-cli test-fixture", sha256_file(project[1]))
+    config.prepare_directories()
+    path = manager.home / "state/runtime.json"
+    before = path.read_bytes()
+    supervisor = Supervisor(config, bootstrap_manifest=manifest)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("incompatible journal must be rejected before starting a service")
+
+    monkeypatch.setattr(supervisor, "launch_command", unexpected)
+    # run() propagates initial compatibility errors; the installed supervisor
+    # main() records the blocked diagnostic. Neither path may reach spawn.
+    with pytest.raises(ReleaseError, match="resource epoch"):
+        await supervisor.run()
+    assert supervisor.process is None
+    assert path.read_bytes() == before
