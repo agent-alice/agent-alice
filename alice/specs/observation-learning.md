@@ -14,7 +14,7 @@
 
 ## 固定任务集与评分
 
-`tests/fixtures/observation_learning/tasks.json` 只存任务输入，`oracle.json` 是人工从合成事实推导的检查项，`correction.json` 记录失败案例、原因假设、修改和范围。版本为 `observation-learning-v1`，共 20 例：1 个训练原例、14 个未见形状、5 个反例。15 例预期发现观察/对账缺口。反例包含真实零、完整空集合、完整多页、有效缓存与正确绑定的读回，防止“全部 unknown”制造成功。
+`src/alice_codex/learning_cases/tasks.json` 只存任务输入，`oracle.json` 是人工从合成事实推导的检查项，`correction.json` 记录失败案例、原因假设、修改和范围。版本为 `observation-learning-v1`，共 20 例：1 个训练原例、14 个未见形状、5 个反例。15 例预期发现观察/对账缺口。反例包含真实零、完整空集合、完整多页、有效缓存与正确绑定的读回，防止“全部 unknown”制造成功。
 
 从 `alice/` 在已安装锁定依赖的隔离环境运行：
 
@@ -22,11 +22,11 @@
 python -m pytest tests/test_business.py tests/test_collector.py tests/test_resources.py \
   tests/test_task_resources.py tests/test_evaluation.py -q
 python -m alice_codex.evaluation \
-  --tasks tests/fixtures/observation_learning/tasks.json \
-  --oracle tests/fixtures/observation_learning/oracle.json \
+  --tasks src/alice_codex/learning_cases/tasks.json \
+  --oracle src/alice_codex/learning_cases/oracle.json \
   --report "$EVIDENCE_DIR/candidate.json" \
   --baseline-report "$EVIDENCE_DIR/baseline.json" \
-  --correction tests/fixtures/observation_learning/correction.json
+  --correction src/alice_codex/learning_cases/correction.json
 ```
 
 `EVIDENCE_DIR` 必须是仓库外的新证据目录，报告文件不允许覆盖。没有基线报告时省略最后两个参数可单独评分，不能生成纠正链。评分器逐例执行现有纯函数，仅给候选输入副本，不给 oracle；比较独立检查项，输出结果与输入/参考答案/实现/评分器 hash。报告中的 `passed`、计数和状态不能自证：纠正比较会重新评分实际输出。测试另以自填 passed、第一页截断、always-unknown 及伪造证据绑定证明错误候选被拒绝。

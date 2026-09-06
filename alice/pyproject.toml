@@ -21,7 +21,7 @@ alice-mcp = "alice_codex.mcp:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-alice_codex = ["templates/**/*", "templates/.agents/skills/*/SKILL.md"]
+alice_codex = ["templates/**/*", "templates/.agents/skills/*/SKILL.md", "learning_cases/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

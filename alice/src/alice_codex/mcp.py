@@ -1,7 +1,9 @@
 """Stdio MCP tools delegate to Alice's single private control service."""
 
 import argparse
+from importlib import resources
 from pathlib import Path
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
@@ -22,6 +24,37 @@ def create_server(home: Path) -> FastMCP:
     async def status() -> dict:
         """Inspect runtime, task roots, persisted pause and pinned Codex version."""
         return await call("status")
+
+    @server.tool()
+    async def runtime_info() -> dict:
+        """Get argument arrays for the Alice package serving this MCP connection.
+
+        Execute arrays directly, or quote each argument for a shell; never use
+        bare python or resolve away the virtualenv interpreter symlink. Refresh
+        after reconnect/restart. This is process metadata, not release approval.
+        Learning inputs are public synthetic regression cases, not a transfer test.
+        """
+        python = str(Path(sys.executable).absolute())
+        prefix = [python, "-I", "-m"]
+        cases = resources.files("alice_codex").joinpath("learning_cases")
+        return {
+            "schema_version": 1,
+            "environment_source": "running_mcp_process",
+            "python": python,
+            "package_path": str(Path(__file__).absolute().parent),
+            "workspace": str(config.workspace),
+            "commands": {
+                name: [*prefix, "alice_codex.business", name]
+                for name in ("check-draft", "summarize-observation", "reconcile-publication")
+            } | {
+                "collect": [*prefix, "alice_codex", "--home", config.home, "collect"],
+                "evaluate": [*prefix, "alice_codex.evaluation"],
+            },
+            "learning_inputs": {
+                name: str(cases.joinpath(name + ".json"))
+                for name in ("tasks", "oracle", "correction")
+            },
+        }
 
     @server.tool()
     async def cron_create(

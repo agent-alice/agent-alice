@@ -172,7 +172,7 @@ value = "unknown setting"
     assert server["command"] == interpreter
     assert server["enabled"] is True
     assert server["required"] is True
-    assert server["args"] == ["-m", "alice_codex.mcp", "--home", config.home]
+    assert server["args"] == ["-I", "-m", "alice_codex.mcp", "--home", config.home]
     assert server["env"] == before["mcp_servers"]["alice"]["env"]
     assert server["extra_future_option"] == "keep this field"
     assert server["default_tools_approval_mode"] == "prompt"

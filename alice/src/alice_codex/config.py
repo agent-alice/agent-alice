@@ -31,6 +31,7 @@ CONFIG_VERSION = 1
 # tools keep Codex's approval default; explicit user resume remains a CLI action.
 UNATTENDED_TOOLS = (
     "status",
+    "runtime_info",
     "cron_create",
     "cron_list",
     "cron_update",
@@ -315,7 +316,7 @@ class RuntimeConfig:
             )
         for key, value in {
             "command": python,
-            "args": ["-m", "alice_codex.mcp", "--home", self.home],
+            "args": ["-I", "-m", "alice_codex.mcp", "--home", self.home],
             "enabled": True,
             "required": True,
             "startup_timeout_sec": 15,
