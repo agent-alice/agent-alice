@@ -16,7 +16,13 @@ import time
 import uuid
 
 from .codex import CodexClient
-from .calendar import prepare_dispatch, dispatch_completion, summary_level
+from .calendar import (
+    prepare_dispatch,
+    dispatch_completion,
+    summary_level,
+    summary_dependencies,
+    UnclosedSummaryDependency,
+)
 from .config import RuntimeConfig
 from .control import MAX_MESSAGE
 from .files import SingletonLock, read_json, write_json
@@ -24,7 +30,7 @@ from .memory import MemoryStore
 from .journal import NativeJournal
 from .resources import ResourceLedger
 from .rpc import RpcClient, RpcError
-from .scheduler import Scheduler, RejectedDispatch
+from .scheduler import Scheduler, RejectedDispatch, DeferredDispatch
 from .store import DispatchReceipt, Store
 
 
@@ -84,6 +90,8 @@ class Service:
         self._background: list[asyncio.Task] = []
         self._handlers: set[asyncio.Task] = set()
         self._native_interrupts: dict[str, str] = {}
+        self._resuming: set[str] = set()
+        self._pause_revision = 0  # In-flight resume fence; no resume survives process exit.
         self.scheduler = Scheduler(self.store, self)
 
     def save(self) -> None:
@@ -308,6 +316,7 @@ class Service:
                     if limit_id:
                         observed["rateLimitsByLimitId"] = {limit_id: snapshot}
                     self.resources.record_rate_limits(observed)
+                    self._mark_resource_pauses()
             except Exception:
                 self._fail("Native resource observations could not be persisted")
             return
@@ -332,6 +341,7 @@ class Service:
         # Persist before the next await so a due heartbeat cannot revive it.
         for key, task in list(self.state["tasks"].items()):
             if task["thread_id"] == thread and not task.get("paused"):
+                self._pause_revision += 1
                 task["paused"] = True
                 if key == "main":
                     self.store.set_autonomy_paused(True)
@@ -425,6 +435,7 @@ class Service:
                     raise RuntimeError("Owned Codex connection was lost")
                 if time.monotonic() >= self._resource_refresh_at:
                     await self.refresh_resources()
+                await self._stop_resource_paused_tasks()
                 await self.reconcile()
                 await self.scheduler.poll()
                 await asyncio.sleep(self.config.poll_seconds)
@@ -444,7 +455,33 @@ class Service:
             self.resources.record_rate_limits(None)
         else:
             self.resources.record_rate_limits(result)
+        self._mark_resource_pauses()
+        await self._stop_resource_paused_tasks()
         return self.resources.status()
+
+    def _mark_resource_pauses(self) -> None:
+        if self.resources.can_dispatch(automatic=True)["allowed"]:
+            return
+        changed = False
+        for key, task in self.state["tasks"].items():
+            if (
+                task.get("automatic") is True
+                and (not task.get("paused") or key in self._resuming)
+                and not task.get("resource_pause_pending")
+            ):
+                task.update(paused=True, resource_pause_pending=True)
+                changed = True
+        if changed:
+            self._pause_revision += 1
+            self.save()  # Persist admission and unfinished stop before the next await.
+
+    async def _stop_resource_paused_tasks(self) -> None:
+        async with self._lock("resource-stops"):
+            for key, task in list(self.state["tasks"].items()):
+                if task.get("resource_pause_pending"):
+                    await self.pause(key)  # Includes native Goal, input queue and descendants.
+                    task.pop("resource_pause_pending", None)
+                    self.save()
 
     async def ensure_thread(self, key: str) -> dict:
         if not isinstance(key, str) or not key or len(key) > 150:
@@ -476,7 +513,7 @@ class Service:
                     del self.state["tasks"][key]
                     self.save()
             if self.stopping:
-                raise RejectedDispatch("Service is stopping")
+                raise DeferredDispatch("Service is stopping")
             result = await self.codex.thread_start(
                 cwd=str(self.config.workspace),
                 model=self.config.model,
@@ -508,16 +545,15 @@ class Service:
         task = self.state["tasks"].get(target)
         if task and task.get("paused"):
             return True
-        if target.startswith("summary:L"):
-            rank = {"L1": 1, "L2": 2, "L3": 3, "L4": 4}
-            level = target.removeprefix("summary:")
-            if level not in rank:
-                raise ValueError("Unknown summary level")
-            for event in self.store.list_events():
-                lower = summary_level(event.job)
-                if lower and rank[lower] < rank[level] and event.status != "completed":
-                    return True  # Staggering clocks is not proof that lower summaries committed.
-        active = 0
+        # An acknowledgement can precede native status visibility; ambiguous
+        # inputs also reserve their root until reconciliation, never a new ID.
+        active = {
+            intent["thread_id"]
+            for intent in self.state["intents"].values()
+            if intent["status"] in {"sending", "unknown", "accepted", "queued"}
+        }
+        if task and task["thread_id"] in active:
+            return True
         task_snapshot = list(self.state["tasks"].items())
         task_ids = {(name, item["thread_id"]) for name, item in task_snapshot}
         for name, item in task_snapshot:
@@ -535,10 +571,10 @@ class Service:
                     continue
                 raise
             if thread.get("status", {}).get("type") == "active":
-                active += 1
+                active.add(item["thread_id"])
                 if name == target:
                     return True
-        return active >= self.config.max_active_tasks or task_ids != {
+        return len(active) >= self.config.max_active_tasks or task_ids != {
             (name, item["thread_id"]) for name, item in self.state["tasks"].items()
         }
 
@@ -554,25 +590,44 @@ class Service:
     ) -> dict:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Task input cannot be empty")
+        if type(automatic) is not bool:
+            raise ValueError("automatic must be boolean")
+        if not isinstance(target, str) or not target or len(target) > 150:
+            raise ValueError("Task name must contain 1–150 characters")
+        if intent_id is not None and (not isinstance(intent_id, str) or not intent_id):
+            raise ValueError("Request ID must be a nonempty string")
         intent_id = intent_id or str(uuid.uuid4())
         fingerprint = hashlib.sha256((target + "\0" + text).encode()).hexdigest()
-        async with self._lock("input:" + target):
-            if self.stopping or (
-                automatic
-                and (
-                    self.store.is_autonomy_paused()
-                    or not self.resources.can_dispatch(automatic=True)["allowed"]
-                )
-            ):
-                raise RejectedDispatch("Autonomy is paused")
+        # All entry points share the request namespace and capacity boundary.
+        # Hold admission only through the bounded native acknowledgement, never
+        # through model execution. Pause persists flags before waiting for input.
+        async with self._lock("admission"), self._lock("input:" + target):
             if intent_id in self.state["intents"]:
                 prior = self.state["intents"][intent_id]
                 if prior.get("input_sha256") != fingerprint:
                     raise ValueError("Request ID already identifies different input")
                 return prior
+            if self.stopping or (automatic and await self.is_busy(target)):
+                raise DeferredDispatch("Automatic dispatch is paused or busy")
             task = await self.ensure_thread(target)
             if task.get("paused"):
-                raise RejectedDispatch("Task is paused; resume it explicitly")
+                raise DeferredDispatch("Task is paused; resume it explicitly")
+            native = (await self.codex.thread_read(task["thread_id"]))["thread"]
+            if (
+                self.stopping
+                or task.get("paused")
+                or (
+                    automatic
+                    and (
+                        self.store.is_autonomy_paused()
+                        or not self.resources.can_dispatch(automatic=True)["allowed"]
+                        or native.get("status", {}).get("type") == "active"
+                    )
+                )
+            ):
+                # No input was sent, so retain the occurrence without inventing
+                # a failed durable intent that would poison its stable retry ID.
+                raise DeferredDispatch("Dispatch paused or busy before input was sent")
             intent = {
                 "id": intent_id,
                 "target": target,
@@ -581,27 +636,16 @@ class Service:
                 "event_id": event_id,
                 "created_at": time.time(),
                 "input_sha256": fingerprint,
+                "automatic": automatic,
             }
             if summary_plan:
                 intent["summary_plan"] = summary_plan
             self.state["intents"][intent_id] = intent
+            # A manual follow-up can share a native root with an autonomous
+            # Goal/queue. It cannot revoke ownership of that still-running tree.
+            task["automatic"] = automatic or task.get("automatic") is True
             self.save()  # Save intent before any RPC can start side effects.
             try:
-                native = (await self.codex.thread_read(task["thread_id"]))["thread"]
-                if (
-                    self.stopping
-                    or task.get("paused")
-                    or (
-                        automatic
-                        and (
-                            self.store.is_autonomy_paused()
-                            or not self.resources.can_dispatch(automatic=True)["allowed"]
-                        )
-                    )
-                ):
-                    intent["status"] = "failed"
-                    self.save()
-                    raise RejectedDispatch("Dispatch paused before input was sent")
                 if native.get("status", {}).get("type") == "active":
                     result = await self.codex.queue_add(
                         task["thread_id"], text, client_message_id=intent_id
@@ -630,6 +674,12 @@ class Service:
         )
         summary_plan = None
         if summary_level(event.job):
+            try:
+                dependencies = summary_dependencies(event, self.store.list_events())
+            except UnclosedSummaryDependency as error:
+                raise DeferredDispatch(str(error)) from error
+            if dependencies:
+                raise DeferredDispatch("Required lower summary windows are not completed")
             plan = prepare_dispatch(event, self.memory)
             if not plan["prepared"]:
                 return DispatchReceipt(
@@ -720,6 +770,7 @@ class Service:
             seen.add(cursor)
 
     async def pause(self, target: str | None = None) -> dict:
+        self._pause_revision += 1
         if target is None:
             self.store.set_autonomy_paused(True)
             keys = list(self.state["tasks"])
@@ -742,6 +793,59 @@ class Service:
                     )
         return {"paused": True, "tasks": results}
 
+    async def resume(self, target: str | None = None) -> dict:
+        await self._stop_resource_paused_tasks()
+        async with self._lock("admission"):
+            revision = self._pause_revision
+            keys = (
+                [target]
+                if target
+                else [name for name, task in self.state["tasks"].items() if task.get("paused")]
+            )
+            for key in keys:
+                async with self._lock("input:" + key):
+                    self._resuming.add(key)
+                    try:
+
+                        def check():
+                            self._mark_resource_pauses()
+                            if self.stopping or self._pause_revision != revision:
+                                raise RejectedDispatch("Resume superseded by a pause")
+                            if (
+                                self.state["tasks"].get(key, {}).get("automatic") is True
+                                and not self.resources.can_dispatch(automatic=True)["allowed"]
+                            ):
+                                raise RejectedDispatch("Automatic task resource limit is active")
+
+                        check()
+                        task = await self.ensure_thread(key)
+                        check()
+                        queue = await self.codex.queue_list(task["thread_id"], limit=1)
+                        check()
+                        if queue.get("data"):
+                            await self.codex.queue_start(task["thread_id"])
+                            check()
+                        goal = (
+                            await self.rpc.request(
+                                "thread/goal/get", {"threadId": task["thread_id"]}
+                            )
+                        ).get("goal")
+                        check()
+                        if goal and goal.get("status") == "paused":
+                            await self.rpc.request(
+                                "thread/goal/set",
+                                {"threadId": task["thread_id"], "status": "active"},
+                            )
+                            check()
+                        task["paused"] = False
+                        task.pop("reconcile_error", None)
+                        self.save()
+                    finally:
+                        self._resuming.discard(key)
+            if target is None:
+                self.store.set_autonomy_paused(False)
+        return {"resumed": target or "autonomy"}
+
     async def handle(self, action: str, params: dict) -> dict:
         if action == "status":
             return {
@@ -762,30 +866,7 @@ class Service:
         if action == "pause":
             return await self.pause(params.get("target"))
         if action == "resume":
-            target = params.get("target")
-            keys = (
-                [target]
-                if target
-                else [name for name, task in self.state["tasks"].items() if task.get("paused")]
-            )
-            for key in keys:
-                task = await self.ensure_thread(key)
-                queue = await self.codex.queue_list(task["thread_id"], limit=1)
-                if queue.get("data"):
-                    await self.codex.queue_start(task["thread_id"])
-                goal = (
-                    await self.rpc.request("thread/goal/get", {"threadId": task["thread_id"]})
-                ).get("goal")
-                if goal and goal.get("status") == "paused":
-                    await self.rpc.request(
-                        "thread/goal/set", {"threadId": task["thread_id"], "status": "active"}
-                    )
-                task["paused"] = False
-                task.pop("reconcile_error", None)
-                self.save()
-            if target is None:
-                self.store.set_autonomy_paused(False)
-            return {"resumed": target or "autonomy"}
+            return await self.resume(params.get("target"))
         if action == "thread":
             return await self.ensure_thread(params.get("target", "main"))
         if action == "ask":

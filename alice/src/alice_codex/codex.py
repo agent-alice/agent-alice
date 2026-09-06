@@ -242,21 +242,26 @@ class CodexClient:
 
     async def _discover_tree(self, root_id: str) -> set[str]:
         # An empty sourceKinds list means interactive sources, NOT all sources.
-        cursor = None
-        seen_cursors = set()
-        while True:
-            page = await self.thread_list(
-                limit=100,
-                cursor=cursor,
-                modelProviders=[],
-                sourceKinds=["cli", "vscode", "exec", "appServer", "subAgent", "unknown"],
-            )
-            cursor = page.get("nextCursor")
-            if not cursor:
-                break
-            if cursor in seen_cursors:
-                raise RpcError("Codex thread pagination repeated a cursor")
-            seen_cursors.add(cursor)
+        # Archiving changes the list view, not a thread's ancestry. A fresh
+        # adapter must discover archived parents/children as well; otherwise it
+        # loses their lineage after a control-process restart.
+        for archived in (False, True):
+            cursor = None
+            seen_cursors = set()
+            while True:
+                page = await self.thread_list(
+                    limit=100,
+                    cursor=cursor,
+                    archived=archived,
+                    modelProviders=[],
+                    sourceKinds=["cli", "vscode", "exec", "appServer", "subAgent", "unknown"],
+                )
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    break
+                if cursor in seen_cursors:
+                    raise RpcError("Codex thread pagination repeated a cursor")
+                seen_cursors.add(cursor)
         # Newly spawned V2 children can be running before persistent thread/list
         # exposes them. Query the runtime inventory as well, without resuming any
         # stored thread or assuming thread/started was broadcast to this client.

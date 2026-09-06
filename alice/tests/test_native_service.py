@@ -14,6 +14,7 @@ import subprocess
 import sys
 
 import pytest
+import tomlkit
 
 from alice_codex.config import load_config
 from alice_codex.control import request
@@ -49,7 +50,7 @@ async def until(operation, timeout=15):
     return await asyncio.wait_for(wait(), timeout)
 
 
-async def test_native_service_mcp_turn_pause_shutdown_and_history_restart(tmp_path):
+async def test_native_service_mcp_interrupt_crash_recovery_and_required_mcp_failure(tmp_path):
     binary = Path(
         os.environ.get(
             "ALICE_TEST_CODEX_BINARY", "/Applications/ChatGPT.app/Contents/Resources/codex"
@@ -81,6 +82,7 @@ async def test_native_service_mcp_turn_pause_shutdown_and_history_restart(tmp_pa
     }
     peers, handlers, model_requests, errors = set(), set(), [], []
     held, release_held, held_closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    crash_held, release_crash, crash_closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
     tool_identity = {}
 
     async def model(reader, writer):
@@ -88,6 +90,7 @@ async def test_native_service_mcp_turn_pause_shutdown_and_history_restart(tmp_pa
         task = asyncio.current_task()
         handlers.add(task)
         held_stream = False
+        crash_stream = False
         try:
             header = await reader.readuntil(b"\r\n\r\n")
             lines = header.decode().split("\r\n")
@@ -168,8 +171,7 @@ async def test_native_service_mcp_turn_pause_shutdown_and_history_restart(tmp_pa
                         {"type": "output_text", "text": "Recorded native execution completed."}
                     ],
                 }
-            else:
-                assert number == 4, f"unexpected additional model request {number}"
+            elif number == 4:
                 held_stream = True
                 writer.write(
                     b'data: {"type":"response.created","response":{"id":"held-native-turn"}}\n\n'
@@ -190,6 +192,21 @@ async def test_native_service_mcp_turn_pause_shutdown_and_history_restart(tmp_pa
                             "enabled": False,
                         }
                     ),
+                }
+            else:
+                assert number == 5, f"unexpected additional model request {number}"
+                crash_stream = True
+                writer.write(
+                    b'data: {"type":"response.created","response":{"id":"crashed-native-turn"}}\n\n'
+                )
+                await writer.drain()
+                crash_held.set()
+                await release_crash.wait()
+                item = {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "must-not-complete-after-crash",
+                    "content": [{"type": "output_text", "text": "Late crash result."}],
                 }
             events = [
                 {"type": "response.created", "response": {"id": f"native-{number}"}},
@@ -217,6 +234,8 @@ async def test_native_service_mcp_turn_pause_shutdown_and_history_restart(tmp_pa
             handlers.discard(task)
             if held_stream:
                 held_closed.set()
+            if crash_stream:
+                crash_closed.set()
 
     http = await asyncio.start_server(model, "127.0.0.1", 0)
     port = http.sockets[0].getsockname()[1]
@@ -238,7 +257,7 @@ async def test_native_service_mcp_turn_pause_shutdown_and_history_restart(tmp_pa
     async def mcp_exited():
         return all(not process_is_alive(pid) for pid in owned_mcp)
 
-    async def cli(*args, timeout=30):
+    async def cli(*args, timeout=30, expected_code=0):
         process = await asyncio.create_subprocess_exec(
             runtime_python,
             "-I",
@@ -259,10 +278,10 @@ async def test_native_service_mcp_turn_pause_shutdown_and_history_restart(tmp_pa
                 process.kill()
                 await process.wait()
             raise
-        assert process.returncode == 0, (
+        assert process.returncode == expected_code, (
             f"CLI {args}: {stderr.decode()}\n{stdout.decode()} errors={errors}"
         )
-        return json.loads(stdout)
+        return json.loads(stdout) if expected_code == 0 else stderr.decode()
 
     async def launch():
         nonlocal service
@@ -356,6 +375,14 @@ stream_max_retries = 0
         )
         assert len(model_requests) == 3
         assert "Recorded native execution completed." in json.dumps(done["thread"])
+        repeated = await cli(
+            "ask",
+            "Create the recorded disabled schedule via Alice MCP.",
+            "--request-id",
+            "native-integrated-first",
+        )
+        assert repeated == done["intent"]
+        assert len(model_requests) == 3, "a repeated request ID must not start a second turn"
 
         await cli("resume")
         waiting = await cli(
@@ -403,13 +430,86 @@ stream_max_retries = 0
         remember_mcp()
         await rpc.close()
         rpc = None
+
+        # Kill the control process itself; its separate native process group is
+        # still live and must be recovered using the recorded process identity.
+        service.kill()
+        await asyncio.wait_for(service.wait(), 5)
+        assert service.returncode == -signal.SIGKILL
+        assert process_is_alive(restarted["codex_pid"])
+        recovered = await launch()
+        assert recovered["codex_pid"] != restarted["codex_pid"]
+        assert not process_is_alive(restarted["codex_pid"])
+        assert recovered["autonomy_paused"] and recovered["tasks"]["main"]["paused"]
+        assert recovered["tasks"]["main"]["thread_id"] == thread_id
+        repeated = await cli(
+            "ask",
+            "Create the recorded disabled schedule via Alice MCP.",
+            "--request-id",
+            "native-integrated-first",
+        )
+        assert repeated == done["intent"]
+        assert len(model_requests) == 4
+
+        # Kill real Codex during a held turn, after the native receipt and the
+        # host intent have both been recorded. Recovery must retain the same
+        # association and never turn absence of a completion into success.
+        await cli("resume")
+        crashed = await cli(
+            "ask", "Wait for the isolated Codex crash.", "--request-id", "native-crashed-intent"
+        )
+        await asyncio.wait_for(crash_held.wait(), 15)
+        remember_mcp()
+        assert crashed["thread_id"] == thread_id
+        assert process_identity(recovered["codex_pid"]) == owned_codex_pids[recovered["codex_pid"]]
+        os.kill(recovered["codex_pid"], signal.SIGKILL)
+        await asyncio.wait_for(service.wait(), 15)
+        assert not process_is_alive(recovered["codex_pid"])
+        await until(mcp_exited)
+        after_crash = await launch()
+        assert after_crash["autonomy_paused"]
+        assert after_crash["tasks"]["main"]["thread_id"] == thread_id
+        resumed = await request(config.control_socket, "thread", {"target": "main"})
+        assert resumed["thread_id"] == thread_id
+        remember_mcp()
+        replay = await cli(
+            "ask", "Wait for the isolated Codex crash.", "--request-id", "native-crashed-intent"
+        )
+        assert replay["thread_id"] == thread_id and replay["turn_id"] == crashed["turn_id"]
+        assert replay["status"] in {"accepted", "unknown", "failed"}
+        release_crash.set()
+        await asyncio.wait_for(crash_closed.wait(), 5)
+        history = await cli("task-status", "--target", "main")
+        assert "Late crash result." not in json.dumps(history)
+        assert len(model_requests) == 5 and not errors
         assert (await cli("stop", timeout=25))["stopped"]
         await asyncio.wait_for(service.wait(), 10)
         assert service.returncode == 0
-        assert not process_is_alive(restarted["codex_pid"])
+        assert not process_is_alive(after_crash["codex_pid"])
         await until(mcp_exited)
+
+        # Required MCP initialization fails at native thread start/resume. The
+        # real CLI must expose that failure and preserve existing fixture data.
+        document = tomlkit.parse(config_file.read_text())
+        document["mcp_servers"]["alice"]["command"] = "/usr/bin/false"
+        document["mcp_servers"]["alice"]["args"] = []
+        config_file.write_text(tomlkit.dumps(document))
+        broken_config = config_file.read_bytes()
+        await launch()
+        preserved_jobs = (await cli("cron", "list"))["jobs"]
+        failure = await cli(
+            "ask", "Required MCP must fail.", "--target", "mcp-failure", expected_code=1
+        )
+        assert "required MCP servers failed to initialize: alice" in failure
+        assert config_file.read_bytes() == broken_config
+        assert (await cli("cron", "list"))["jobs"] == preserved_jobs
+        assert len(model_requests) == 5 and not errors
+        assert (await cli("stop", timeout=25))["stopped"]
+        await asyncio.wait_for(service.wait(), 10)
+        assert service.returncode == 0
     finally:
         release_held.set()
+        release_crash.set()
         if rpc is not None:
             await rpc.close()
         if service is not None and service.returncode is None:
