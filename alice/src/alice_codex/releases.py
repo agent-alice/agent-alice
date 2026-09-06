@@ -745,6 +745,9 @@ class ReleaseManager:
             )
             or report.get("wheel_sha256") != manifest["wheel_sha256"]
             or report.get("candidate_id") != candidate_id
+            or report.get("source_sha") != manifest["source_sha"]
+            or report.get("source_fingerprint") != manifest["source_fingerprint"]
+            or report.get("environment_fingerprint") != manifest["environment_fingerprint"]
             or report.get("codex_sha256") != manifest["codex_sha256"]
             or report.get("codex_code_mode_host_sha256") != manifest["codex_code_mode_host_sha256"]
             or self._epoch_capability(report) != self._epoch_capability(manifest["installed"])
@@ -789,10 +792,10 @@ class ReleaseManager:
     def _check_resource_epoch_compat(self, manifest: dict) -> None:
         capability = self._epoch_capability(manifest["installed"])
         path = self.home / "state/runtime.json"
+        if path.is_symlink() or path.parent.is_symlink():
+            raise ReleaseError("resource epoch runtime state must not be a symbolic link")
         if not path.exists():
             return
-        if path.is_symlink():
-            raise ReleaseError("resource epoch runtime state must not be a symbolic link")
         try:
             state = read_json(path)
             if not isinstance(state, dict):
@@ -816,7 +819,10 @@ class ReleaseManager:
             raise ReleaseError(f"invalid resource epoch journal: {error}") from error
 
     def _check_bootstrap_policy(self, manifest: dict) -> None:
-        if not (self.home / "state/supervisor.json").exists():
+        path = self.home / "state/supervisor.json"
+        if path.is_symlink() or path.parent.is_symlink():
+            raise ReleaseError("supervisor compatibility state must not be a symbolic link")
+        if not path.exists():
             return
         from .bootstrap import checked_runtime
 
@@ -858,7 +864,7 @@ class ReleaseManager:
         path = self.home / "state/identity-runtime.json"
         delivery = self.home / "state/identity-delivery"
         config_path = self.home / "codex/config.toml"
-        if any(item.is_symlink() for item in (path, delivery, config_path, config_path.parent)):
+        if any(item.is_symlink() for item in (path, path.parent, delivery, config_path, config_path.parent)):
             raise ReleaseError("identity compatibility state must not be a symbolic link")
         present = path.exists() or delivery.exists()
         try:

@@ -141,6 +141,26 @@ def test_unverified_candidate_cannot_replace_active_pointer(tmp_path, project):
     assert manager.current() is None
 
 
+@pytest.mark.parametrize("field", ["source_sha", "source_fingerprint", "environment_fingerprint"])
+def test_verified_report_cannot_claim_a_different_snapshot_or_environment(tmp_path, project, field):
+    from alice_codex.files import sha256_file, write_json
+
+    manager, candidate = stage(tmp_path, project)
+    assert manager.verify(candidate, native=True)["promotable"]
+    folder, manifest = manager._manifest(candidate)
+    report_path = folder / "verification.json"
+    report = json.loads(report_path.read_text())
+    report[field] = "different-synthetic-verification-context"
+    write_json(report_path, report)
+    # Match the receipt digest deliberately: the context itself must agree,
+    # like installed capability declarations, instead of relying on this hash.
+    manifest["verified_report_sha256"] = sha256_file(report_path)
+    write_json(folder / "candidate.json", manifest)
+    with pytest.raises(ReleaseError, match="required checks"):
+        manager.activate(candidate)
+    assert manager.current() is None
+
+
 def test_non_native_checks_can_pass_without_authorizing_runtime_promotion(tmp_path, project):
     manager, candidate = stage(tmp_path, project)
     report = manager.verify(candidate, native=False)

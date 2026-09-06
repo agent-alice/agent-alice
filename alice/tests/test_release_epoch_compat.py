@@ -130,6 +130,26 @@ def test_old_bootstrap_cannot_introduce_epochs_even_before_first_journal(
     assert not (manager.home / "state/runtime.json").exists()
 
 
+def test_dangling_supervisor_record_cannot_bypass_installed_bootstrap_compatibility(tmp_path, project):
+    from alice_codex.bootstrap import install_runtime
+
+    prepare_epoch_gate(project[0])
+    manager, old = stage_epoch(tmp_path, project, capability=None)
+    assert manager.verify(old, native=True)["promotable"]
+    original = manager.activate(old)
+    install_runtime(manager)
+    path = manager.home / "state/supervisor.json"
+    path.parent.mkdir(exist_ok=True)
+    missing = tmp_path / "missing-supervisor-record.json"
+    path.symlink_to(missing)
+    manager, capable = stage_epoch(tmp_path, project, version="0.0.2", manager=manager)
+    assert manager.verify(capable, native=True)["promotable"]
+    with pytest.raises(ReleaseError, match="supervisor.*symbolic link"):
+        manager.activate(capable)
+    assert manager.current() == original
+    assert path.is_symlink() and not missing.exists()
+
+
 def epoch_state():
     return {
         "version": 1,
@@ -161,6 +181,30 @@ def test_schema_two_legacy_candidate_cannot_spawn_over_a_prepared_epoch(tmp_path
         manager.activate(old)
     assert manager.current() is None
     assert (manager.home / "state/runtime.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("linked_parent", [False, True], ids=["dangling-runtime", "linked-state-parent"])
+def test_linked_epoch_state_is_not_treated_as_absent(tmp_path, project, linked_parent):
+    manager, old = stage_epoch(tmp_path, project, capability=None)
+    assert manager.verify(old, native=True)["promotable"]
+    state_dir = manager.home / "state"
+    state_dir.mkdir(exist_ok=True)
+    if linked_parent:
+        assert not tuple(state_dir.iterdir())
+        state_dir.rmdir()
+        target = tmp_path / "unrelated-synthetic-state"
+        target.mkdir(mode=0o755)
+        state_dir.symlink_to(target, target_is_directory=True)
+    else:
+        target = tmp_path / "missing-synthetic-runtime.json"
+        (state_dir / "runtime.json").symlink_to(target)
+    with pytest.raises(ReleaseError, match="symbolic link"):
+        manager.activate(old)
+    assert manager.current() is None
+    if linked_parent:
+        assert not tuple(target.iterdir()) and target.stat().st_mode & 0o777 == 0o755
+    else:
+        assert not target.exists() and (state_dir / "runtime.json").is_symlink()
 
 
 def test_capable_candidate_accepts_known_journal_and_rejects_corrupt_variants(tmp_path, project):
