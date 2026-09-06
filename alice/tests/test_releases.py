@@ -26,6 +26,7 @@ def make_wheel(path, version="0.0.1", value="good"):
         "alice_codex/memory.py": "class MemoryStore:\n    SCHEMA_VERSION = 1\n",
         "alice_codex/resources.py": "class ResourceLedger:\n    SCHEMA_VERSION = 1\n",
         "alice_codex/probe.py": f'print("{value}")\n',
+        "alice_codex/supervisor.py": "BOOTSTRAP_PROTOCOL = 1\n",
         f"{info}/METADATA": f"Metadata-Version: 2.1\nName: alice-codex\nVersion: {version}\n",
         f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: alice-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
     }
@@ -365,3 +366,85 @@ def test_check_subprocess_keeps_explicit_proxies_but_not_model_credentials(tmp_p
         timeout=10,
     )
     assert json.loads(child.stdout) == {"proxies": proxies, "credentials_present": []}
+
+
+def test_automatic_rollback_is_conditional_and_never_revisits_failed_candidate(tmp_path, project):
+    manager, first = stage(tmp_path, project)
+    assert manager.verify(first)["passed"]
+    manager.activate(first)
+    _, second = stage(tmp_path, project, manager=manager, version="0.0.2")
+    assert manager.verify(second)["passed"]
+    promoted = manager.activate(second)
+    marker = manager.home / "new-evidence.json"
+    marker.write_text('{"new":true}')
+    with pytest.raises(ReleaseError, match="epoch changed"):
+        manager.automatic_rollback(second, {second}, expected_epoch="stale")
+    restored = manager.automatic_rollback(
+        second, {second}, expected_epoch=promoted["activation_epoch"]
+    )
+    assert restored["current"] == first
+    assert restored["activation_epoch"] == promoted["activation_epoch"]
+    assert marker.read_text() == '{"new":true}'
+    with pytest.raises(ReleaseError, match="no unfailed"):
+        manager.automatic_rollback(first, {first, second})
+    assert manager.current() == restored
+    assert manager.activate(first)["activation_epoch"] != restored["activation_epoch"]
+    database = manager.home / "memory-state/sources.sqlite3"
+    database.parent.mkdir()
+    with sqlite3.connect(database) as db:
+        db.execute("PRAGMA user_version=2")
+    before = manager.current()
+    with pytest.raises(ReleaseError, match="memory schema"):
+        manager.automatic_rollback(first, {first})
+    assert manager.current() == before
+    assert marker.read_text() == '{"new":true}'
+
+
+def test_independent_bootstrap_survives_damaged_candidate_and_rejects_own_damage(tmp_path, project):
+    from alice_codex.bootstrap import checked_runtime, install_runtime
+
+    manager, candidate = stage(tmp_path, project)
+    assert manager.verify(candidate)["passed"]
+    manager.activate(candidate)
+    bootstrap = install_runtime(manager)
+    independent = Path(bootstrap["python"])
+    candidate_folder = manager._candidate(candidate)
+    original = next(
+        candidate_folder.glob("venv/lib/python*/site-packages/alice_codex/supervisor.py")
+    )
+    original.write_text("raise RuntimeError('bad candidate startup')\n")
+    with pytest.raises(ReleaseError, match="environment changed"):
+        manager.checked_current()
+    assert checked_runtime(manager.home)["python"] == str(independent)
+    probe = subprocess.run(
+        [
+            str(independent),
+            "-I",
+            "-c",
+            "import alice_codex.supervisor as s; print(s.BOOTSTRAP_PROTOCOL)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert probe.returncode == 0 and probe.stdout.strip() == "1"
+    copied = next(
+        independent.parents[1].glob("lib/python*/site-packages/alice_codex/supervisor.py")
+    )
+    copied.write_text("raise RuntimeError('damaged stable environment')\n")
+    with pytest.raises(ReleaseError, match="bootstrap or base interpreter changed"):
+        checked_runtime(manager.home)
+
+
+def test_bootstrap_rejects_environment_links_to_unrelated_external_files(tmp_path):
+    from alice_codex.bootstrap import _check_links
+
+    environment = tmp_path / "environment"
+    (environment / "bin").mkdir(parents=True)
+    (environment / "bin/python").symlink_to(Path(sys.executable).resolve())
+    external = tmp_path / "unrelated.txt"
+    external.write_text("unrelated synthetic evidence")
+    (environment / "escaped-data").symlink_to(external)
+    with pytest.raises(ReleaseError, match="unsupported external"):
+        _check_links(environment)
+    assert external.read_text() == "unrelated synthetic evidence"
