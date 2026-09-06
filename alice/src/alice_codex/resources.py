@@ -365,43 +365,129 @@ class TaskPolicy:
 
 
 class ResourceLedger:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
+    _V1_TABLES = {"settings", "tokens", "checkpoints", "observations", "money", "settlements"}
+    _EPOCH_TABLES = {"token_epoch_events", "token_epoch_checkpoints", "token_epoch_receipts"}
+    _MIGRATION_KEY = "token_epoch_migration_v1_to_v2"
+    _COLUMNS = {
+        "settings": {"key", "value"},
+        "tokens": {"id", "fingerprint", "thread", "turn", "payload", "state"},
+        "checkpoints": {"thread", "counters"},
+        "observations": {"id", "fingerprint", "period", "summary", "observed_at"},
+        "money": {"seq", "id", "kind", "amount", "source"},
+        "settlements": {"period", "receipt_id", "count", "amount"},
+        "token_epoch_events": {"epoch", "fingerprint", "thread", "turn", "payload", "state"},
+        "token_epoch_checkpoints": {"epoch", "thread", "first_counters", "counters"},
+        "token_epoch_receipts": {"id", "epoch", "fingerprint"},
+    }
 
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser().resolve()
         private_dir(self.path.parent)
         with self._db() as db:
-            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise ResourceError("resource database is damaged; preserved for recovery")
-            version = db.execute("PRAGMA user_version").fetchone()[0]
-            tables = {
-                row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            }
+            version, tables = self._schema(db)
+            if version == 1:
+                raise ResourceError(
+                    "resource schema 1 requires explicit ResourceLedger.migrate_v1(path)"
+                )
             if version not in (0, self.SCHEMA_VERSION) or (version == 0 and tables):
                 raise ResourceError("unsupported resource database schema; preserved for recovery")
-            expected = {"settings", "tokens", "checkpoints", "observations", "money", "settlements"}
-            if version == self.SCHEMA_VERSION and not expected <= tables:
-                raise ResourceError("resource database is incomplete; preserved for recovery")
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY, fingerprint TEXT UNIQUE NOT NULL,
-                    thread TEXT NOT NULL, turn TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS checkpoints(thread TEXT PRIMARY KEY, counters TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS observations(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
-                    period TEXT NOT NULL, summary TEXT NOT NULL, observed_at REAL NOT NULL);
-                CREATE TABLE IF NOT EXISTS money(seq INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL,
-                    kind TEXT NOT NULL, amount INTEGER NOT NULL, source TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS settlements(period TEXT PRIMARY KEY, receipt_id TEXT NOT NULL,
-                    count INTEGER NOT NULL, amount INTEGER NOT NULL);
-            """)
-            db.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+            if version == self.SCHEMA_VERSION:
+                self._validate_tables(db, self._V1_TABLES | self._EPOCH_TABLES)
+            if version == 0:
+                for statement in (
+                    "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                    "CREATE TABLE tokens(id TEXT PRIMARY KEY, fingerprint TEXT UNIQUE NOT NULL, "
+                    "thread TEXT NOT NULL, turn TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL)",
+                    "CREATE TABLE checkpoints(thread TEXT PRIMARY KEY, counters TEXT NOT NULL)",
+                    "CREATE TABLE observations(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
+                    "period TEXT NOT NULL, summary TEXT NOT NULL, observed_at REAL NOT NULL)",
+                    "CREATE TABLE money(seq INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, "
+                    "kind TEXT NOT NULL, amount INTEGER NOT NULL, source TEXT NOT NULL)",
+                    "CREATE TABLE settlements(period TEXT PRIMARY KEY, receipt_id TEXT NOT NULL, "
+                    "count INTEGER NOT NULL, amount INTEGER NOT NULL)",
+                ):
+                    db.execute(statement)
+                self._create_epoch_tables(db)
+                db.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
+    @staticmethod
+    def _schema(db):
+        if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise ResourceError("resource database is damaged; preserved for recovery")
+        return db.execute("PRAGMA user_version").fetchone()[0], {
+            row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+
+    @classmethod
+    def _validate_tables(cls, db, expected):
+        for table in expected:
+            columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+            if not cls._COLUMNS[table] <= columns:
+                raise ResourceError("resource database is incomplete; preserved for recovery")
+
+    @staticmethod
+    def _create_epoch_tables(db):
+        # execute(), not executescript(): DDL, receipt and version must share one transaction.
+        for statement in (
+            "CREATE TABLE token_epoch_events(epoch TEXT NOT NULL, fingerprint TEXT NOT NULL, "
+            "thread TEXT NOT NULL, turn TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL, "
+            "PRIMARY KEY(epoch,fingerprint))",
+            "CREATE TABLE token_epoch_checkpoints(epoch TEXT NOT NULL, thread TEXT NOT NULL, "
+            "first_counters TEXT NOT NULL, counters TEXT NOT NULL, PRIMARY KEY(epoch,thread))",
+            "CREATE TABLE token_epoch_receipts(id TEXT PRIMARY KEY, epoch TEXT, fingerprint TEXT NOT NULL)",
+        ):
+            db.execute(statement)
+
+    @classmethod
+    def migrate_v1(cls, path: str | Path) -> dict:
+        """Explicit, additive transaction; never infer epochs or replace old records.
+
+        Stop writers before migration and prepare a verified schema-2-compatible
+        rollback candidate. Old schema-1 binaries reject this database. Roll back
+        code only to a compatible reader/writer, retaining all new records; never
+        restore an old database snapshot over current data.
+        """
+        ledger = cls.__new__(cls)
+        ledger.path = Path(path).expanduser().resolve()
+        with ledger._db(must_exist=True) as db:
+            version, tables = cls._schema(db)
+            if version == cls.SCHEMA_VERSION:
+                cls._validate_tables(db, cls._V1_TABLES | cls._EPOCH_TABLES)
+                return {"migrated": False, "receipt": cls._get(db, cls._MIGRATION_KEY)}
+            if version != 1:
+                raise ResourceError("unsupported resource database schema; preserved for recovery")
+            if not cls._V1_TABLES <= tables or cls._EPOCH_TABLES & tables:
+                raise ResourceError(
+                    "resource database is incomplete or conflicting; preserved for recovery"
+                )
+            cls._validate_tables(db, cls._V1_TABLES)
+            if db.execute("SELECT 1 FROM settings WHERE key=?", (cls._MIGRATION_KEY,)).fetchone():
+                raise ResourceError("resource migration receipt conflict; preserved for recovery")
+            receipt = {
+                "migration": "token_epochs_v1_to_v2",
+                "from_schema": 1,
+                "to_schema": cls.SCHEMA_VERSION,
+                "retained_rows": {
+                    table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in sorted(cls._V1_TABLES)
+                },
+            }
+            cls._create_epoch_tables(db)
+            cls._put(db, cls._MIGRATION_KEY, receipt)
+            db.execute(f"PRAGMA user_version={cls.SCHEMA_VERSION}")
+        return {"migrated": True, "receipt": receipt}
+
     @contextmanager
-    def _db(self):
+    def _db(self, *, must_exist=False):
         db = None
         try:
-            db = sqlite3.connect(self.path, timeout=10)
+            db = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=rw" if must_exist else self.path,
+                timeout=10,
+                uri=must_exist,
+            )
             db.row_factory = sqlite3.Row
             db.execute("BEGIN IMMEDIATE")
             yield db
@@ -410,6 +496,10 @@ class ResourceLedger:
             if db is not None:
                 db.rollback()
             raise ResourceError(f"resource persistence failed: {exc}") from exc
+        except BaseException:
+            if db is not None:
+                db.rollback()
+            raise
         finally:
             if db is not None:
                 db.close()
@@ -525,11 +615,20 @@ class ResourceLedger:
             db.execute("INSERT INTO money(id,kind,amount,source) VALUES (?,?,?,?)", values)
         return {"recorded": True, "receipt_id": receipt_id}
 
-    def record_token_usage(self, params: dict, *, event_id: str | None = None):
-        """Persist native thread/tokenUsage/updated params using cumulative high-water marks.
+    def record_token_usage(
+        self, params: dict, *, event_id: str | None = None, epoch_id: str | None = None
+    ):
+        """Observe cumulative counters within a caller-attested AppServer generation.
 
-        The first counter may include pre-migration or fork-inherited history;
-        it is not an invoice, and `last` must never be added to `total`.
+        The host must save an opaque epoch before starting an owned AppServer and
+        bind it to that process's listener; same-process reconnection reuses it.
+        Never infer a new epoch from a decreasing counter. Omitted epoch retains
+        the legacy unscoped view; historical records are not assigned an epoch.
+
+        Deduplication is (epoch, payload); receipt IDs bind globally to that pair,
+        including aliases of duplicate payloads. A new epoch's first counter is
+        a baseline, never consumption: it may include inherited history. Changes
+        to `last` or context-window size do not add to observed cumulative usage.
         """
         if not isinstance(params, dict):
             raise ValueError("native token notification params must be an object")
@@ -539,7 +638,14 @@ class ResourceLedger:
         )
         payload = _json(params)
         fingerprint = hashlib.sha256(payload.encode()).hexdigest()
-        identity = _text(event_id or fingerprint, "event_id")
+        if epoch_id is not None:
+            _text(epoch_id, "epoch_id")
+        default_id = (
+            fingerprint
+            if epoch_id is None
+            else hashlib.sha256(_json([epoch_id, fingerprint]).encode()).hexdigest()
+        )
+        identity = _text(default_id if event_id is None else event_id, "event_id")
         usage = params.get("tokenUsage")
         total = usage.get("total") if isinstance(usage, dict) else None
         known = isinstance(total, dict) and all(
@@ -547,26 +653,45 @@ class ResourceLedger:
         )
         state, increase = "unknown", None
         with self._db() as db:
+            receipt = db.execute(
+                "SELECT epoch,fingerprint FROM token_epoch_receipts WHERE id=?", (identity,)
+            ).fetchone()
+            if receipt and (receipt["epoch"] != epoch_id or receipt["fingerprint"] != fingerprint):
+                raise ResourceError("token event ID identifies conflicting evidence")
+            # Preserve IDs recorded by schema 1 without rewriting those rows.
             previous = db.execute(
                 "SELECT fingerprint,state FROM tokens WHERE id=?", (identity,)
             ).fetchone()
-            if previous:
-                if previous["fingerprint"] != fingerprint:
-                    raise ResourceError("token event ID identifies conflicting evidence")
-                return {"recorded": False, "state": previous["state"], "increase": None}
-            repeated = db.execute(
-                "SELECT state FROM tokens WHERE fingerprint=?", (fingerprint,)
+            if previous and (epoch_id is not None or previous["fingerprint"] != fingerprint):
+                raise ResourceError("token event ID identifies conflicting evidence")
+            repeated = (
+                db.execute("SELECT state FROM tokens WHERE fingerprint=?", (fingerprint,))
+                if epoch_id is None
+                else db.execute(
+                    "SELECT state FROM token_epoch_events WHERE epoch=? AND fingerprint=?",
+                    (epoch_id, fingerprint),
+                )
             ).fetchone()
+            if not receipt:
+                db.execute(
+                    "INSERT INTO token_epoch_receipts VALUES (?,?,?)",
+                    (identity, epoch_id, fingerprint),
+                )
             if repeated:
                 return {"recorded": False, "state": repeated["state"], "increase": None}
             if known:
                 counters = {key: total[key] for key in TOKEN_FIELDS}
                 cache_write = total.get("cacheWriteInputTokens")
                 counters["cacheWriteInputTokens"] = (
-                    cache_write if type(cache_write) is int and cache_write >= 0 else None
+                    cache_write if type(cache_write) is int and 0 <= cache_write <= 2**53 else None
                 )
-                row = db.execute(
-                    "SELECT counters FROM checkpoints WHERE thread=?", (thread,)
+                row = (
+                    db.execute("SELECT counters FROM checkpoints WHERE thread=?", (thread,))
+                    if epoch_id is None
+                    else db.execute(
+                        "SELECT counters FROM token_epoch_checkpoints WHERE epoch=? AND thread=?",
+                        (epoch_id, thread),
+                    )
                 ).fetchone()
                 old = json.loads(row[0]) if row else None
                 if old and any(counters[key] < old[key] for key in TOKEN_FIELDS):
@@ -576,14 +701,27 @@ class ResourceLedger:
                     increase = (
                         {key: counters[key] - old[key] for key in TOKEN_FIELDS} if old else None
                     )
-                    db.execute(
-                        "INSERT INTO checkpoints VALUES (?,?) ON CONFLICT(thread) DO UPDATE SET counters=excluded.counters",
-                        (thread, _json(counters)),
-                    )
-            db.execute(
-                "INSERT INTO tokens VALUES (?,?,?,?,?,?)",
-                (identity, fingerprint, thread, turn, payload, state),
-            )
+                    if epoch_id is None:
+                        db.execute(
+                            "INSERT INTO checkpoints VALUES (?,?) ON CONFLICT(thread) DO UPDATE SET counters=excluded.counters",
+                            (thread, _json(counters)),
+                        )
+                    else:
+                        db.execute(
+                            "INSERT INTO token_epoch_checkpoints VALUES (?,?,?,?) "
+                            "ON CONFLICT(epoch,thread) DO UPDATE SET counters=excluded.counters",
+                            (epoch_id, thread, _json(counters), _json(counters)),
+                        )
+            if epoch_id is None:
+                db.execute(
+                    "INSERT INTO tokens VALUES (?,?,?,?,?,?)",
+                    (identity, fingerprint, thread, turn, payload, state),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO token_epoch_events VALUES (?,?,?,?,?,?)",
+                    (epoch_id, fingerprint, thread, turn, payload, state),
+                )
         return {"recorded": True, "state": state, "increase": increase}
 
     def record_rate_limits(self, response: dict | None, *, observed_at: float | None = None):
@@ -737,11 +875,6 @@ class ResourceLedger:
                 ).fetchone()[0]
                 credit = db.execute("SELECT COALESCE(SUM(amount),0) FROM settlements").fetchone()[0]
                 balance = budget["opening_balance_microusd"] + net + credit
-            counters = {
-                row[0]: json.loads(row[1])
-                for row in db.execute("SELECT thread,counters FROM checkpoints")
-            }
-            unknown = db.execute("SELECT COUNT(*) FROM tokens WHERE state!='known'").fetchone()[0]
             financial = {
                 row[0]: {"amount_microusd": row[1], "receipts": row[2]}
                 for row in db.execute("SELECT kind,SUM(amount),COUNT(*) FROM money GROUP BY kind")
@@ -763,13 +896,7 @@ class ResourceLedger:
                     "configuration": budget,
                 },
                 "historical_rule_reference": self._get(db, "historical_rule_reference"),
-                "tokens": {
-                    "state": "unknown" if unknown or not counters else "known",
-                    "scope": "native_cumulative_per_thread_not_an_account_invoice",
-                    "threads": counters,
-                    "unknown_or_out_of_order_events": unknown,
-                    "cost_microusd": None,
-                },
+                "tokens": self._token_status(db),
                 "money_receipts": financial,
                 "latest_observation": {
                     "receipt_id": latest[0],
@@ -787,6 +914,55 @@ class ResourceLedger:
                     "blocking_reasons": blocked or [],
                 },
             }
+
+    @staticmethod
+    def _token_status(db):
+        legacy = {
+            row[0]: json.loads(row[1])
+            for row in db.execute("SELECT thread,counters FROM checkpoints ORDER BY thread")
+        }
+        unknown = db.execute("SELECT COUNT(*) FROM tokens WHERE state!='known'").fetchone()[0]
+        epochs = {}
+        for row in db.execute(
+            "SELECT epoch,thread,COUNT(*) AS count,SUM(state!='known') AS unknown "
+            "FROM token_epoch_events GROUP BY epoch,thread ORDER BY epoch,thread"
+        ):
+            epochs.setdefault(row["epoch"], {})[row["thread"]] = {
+                "event_count": row["count"],
+                "unknown_or_out_of_order_events": row["unknown"],
+                "first_observed": None,
+                "high_water": None,
+                "observed_increase_after_first": None,
+            }
+            unknown += row["unknown"]
+        peaks, increases = None, None
+        for row in db.execute("SELECT * FROM token_epoch_checkpoints ORDER BY epoch,thread"):
+            first, high = json.loads(row["first_counters"]), json.loads(row["counters"])
+            change = {key: high[key] - first[key] for key in TOKEN_FIELDS}
+            epochs[row["epoch"]][row["thread"]].update(
+                first_observed=first,
+                high_water=high,
+                observed_increase_after_first=change,
+            )
+            if peaks is None:
+                peaks, increases = dict.fromkeys(TOKEN_FIELDS, 0), dict.fromkeys(TOKEN_FIELDS, 0)
+            for key in TOKEN_FIELDS:
+                peaks[key] += high[key]
+                increases[key] += change[key]
+        return {
+            "state": "unknown" if unknown or (not legacy and peaks is None) else "known",
+            "scope": "native_cumulative_observations_not_an_account_invoice",
+            "threads": legacy,
+            "legacy_unscoped": bool(db.execute("SELECT 1 FROM tokens LIMIT 1").fetchone()),
+            "epochs": epochs,
+            "sum_epoch_high_water_marks": peaks,
+            "sum_observed_increases_after_first": increases,
+            # Process identity cannot establish whether snapshots include inherited history.
+            "epoch_boundary_state": "unverified",
+            "actual_usage_total": None,
+            "unknown_or_out_of_order_events": unknown,
+            "cost_microusd": None,
+        }
 
     def can_dispatch(
         self, *, automatic: bool, now: float | None = None, limit_id: str = "codex"
