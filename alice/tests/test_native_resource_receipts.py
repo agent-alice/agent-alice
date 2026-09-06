@@ -63,7 +63,8 @@ def validate_native_resource_receipts(
         _require(epoch in coverage, "Unexpected native observation epoch")
         _require(epoch not in final, "Native observations continue after epoch close")
         if record.get("kind") == "close":
-            _require(record.get("observer_error") is None, "Native resource observer failed")
+            _require("observer_error" in record and record["observer_error"] is None,
+                     "Native resource observer error witness is missing or failed")
             _require(record.get("write_failures") == 0, "Native frame capture had write failures")
             _require(record.get("pending_count") == 0 and record.get("unresolved") == [],
                      "Native resource listener closed with unresolved observations")
@@ -165,7 +166,8 @@ def _fixture(tmp_path):
                         "event": {"method": "thread/tokenUsage/updated", "params": params}}
                        for _ in range(35))
         records.append({"kind": "close", "epoch_id": epoch, "token_frames": 35,
-                        "write_failures": 0, "pending_count": 0, "unresolved": []})
+                        "write_failures": 0, "pending_count": 0, "unresolved": [],
+                        "observer_error": None})
         event_rows.append((epoch, fingerprint, child, "turn-synthetic", payload, "known"))
         receipt_rows.append((receipt, epoch, fingerprint))
     log_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in records))
@@ -195,6 +197,7 @@ def test_native_receipt_judge_accepts_replay_dedup_across_restart(tmp_path):
 @pytest.mark.parametrize("mutation", [
     "drop_receipt", "missing_child", "wrong_epoch", "wrong_receipt_hash",
     "unknown", "extra_event", "wrong_payload", "empty_log", "missing_epoch",
+    "missing_observer_error", "observer_failed",
 ])
 def test_native_receipt_judge_rejects_incomplete_evidence(tmp_path, mutation):
     log_path, database_path, expectations = _fixture(tmp_path)
@@ -220,5 +223,13 @@ def test_native_receipt_judge_rejects_incomplete_evidence(tmp_path, mutation):
             rows = [json.loads(line) for line in log_path.read_text().splitlines()]
             log_path.write_text("".join(json.dumps(row) + "\n" for row in rows
                                         if row["epoch_id"] != "epoch-after"))
+        elif mutation in {"missing_observer_error", "observer_failed"}:
+            rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+            close = next(row for row in rows if row["kind"] == "close")
+            if mutation == "missing_observer_error":
+                del close["observer_error"]
+            else:
+                close["observer_error"] = "Synthetic unresolved observer failure"
+            log_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(ReceiptEvidenceError):
         validate_native_resource_receipts(log_path, database_path, **expectations)
