@@ -39,7 +39,9 @@ jobs:
       - name: Install the project and fixed verification tools
         run: python -m pip install -c requirements.lock -e '.[dev]'
       - name: Verify source and the actual installed candidate
-        run: python tools/check.py --report build/check-report.json
+        # Full suites construct many isolated release environments. Keep a finite
+        # runner budget with headroom; individual behavior assertions are unchanged.
+        run: python tools/check.py --timeout 900 --report build/check-report.json
       - name: Preserve verification outcome even on failure
         if: always()
         uses: actions/upload-artifact@v4
