@@ -16,6 +16,7 @@ dev = ["pytest==9.1.1", "pytest-asyncio==1.4.0", "ruff==0.16.6", "build==1.6.0"]
 alice = "alice_codex.cli:main"
 alice-codex = "alice_codex.cli:main"
 alice-mcp = "alice_codex.mcp:main"
+alice-run = "alice_codex.launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

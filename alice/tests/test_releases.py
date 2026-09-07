@@ -20,6 +20,7 @@ def make_wheel(
     path, version="0.0.1", value="good", *, resource_schema=1,
     epoch_capability=None, identity_capability=None,
     summary_capability=None, heartbeat_capability=None,
+    command_probe=False,
 ):
     """A real minimal wheel: installation/entry execution need no network."""
     filename = path / f"alice_codex-{version}-py3-none-any.whl"
@@ -34,6 +35,12 @@ def make_wheel(
         f"{info}/METADATA": f"Metadata-Version: 2.1\nName: alice-codex\nVersion: {version}\n",
         f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: alice-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
     }
+    if command_probe:
+        files["alice_codex/__main__.py"] = (
+            "import json,os,sys\n"
+            "print(json.dumps({'python':sys.executable,'argv':sys.argv[1:],"
+            "'pythonpath':os.environ.get('PYTHONPATH'),'cwd':os.getcwd()}))\n"
+        )
     if epoch_capability is not None:
         files["alice_codex/service.py"] = f"RESOURCE_EPOCH_CAPABILITY = {epoch_capability!r}\n"
     if identity_capability is not None:
@@ -125,13 +132,19 @@ def test_synthetic_installed_identity_contract():
 ''')
 
 
-def stage(tmp_path, project, *, version="0.0.1", value="good", manager=None, identity_capability=None):
+def stage(
+    tmp_path, project, *, version="0.0.1", value="good", manager=None,
+    identity_capability=None, command_probe=False,
+):
     source, binary = project
     if identity_capability == 1:
         prepare_identity_gate(source)
     manager = manager or ReleaseManager(tmp_path / "runtime")
     candidate = manager.stage_wheel(
-        make_wheel(tmp_path, version, value, identity_capability=identity_capability),
+        make_wheel(
+            tmp_path, version, value,
+            identity_capability=identity_capability, command_probe=command_probe,
+        ),
         source_root=source,
         python=sys.executable,
         codex_binary=binary,

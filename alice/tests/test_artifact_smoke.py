@@ -274,6 +274,20 @@ def verify_runtime_commands(runtime, info):
     assert actual["consumption"]["model_calls"] == 0
 
 
+def test_installed_launcher_refuses_to_invent_an_active_release(runtime):
+    config = runtime["home"] / "config.json"
+    before = config.read_bytes()
+    result = subprocess.run(
+        [runtime["python"], "-I", "-m", "alice_codex.launcher",
+         "--home", str(runtime["home"]), "status"],
+        cwd=runtime["cwd"], env=runtime["env"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 1 and "No verified Alice release is active" in result.stderr
+    assert config.read_bytes() == before
+    assert not (runtime["home"] / "state/runtime.json").exists()
+
+
 def test_installed_invalid_startup_setting_preserves_running_service(runtime):
     cli = runtime["cli"]
     started = runtime["remember"](cli("start"))
