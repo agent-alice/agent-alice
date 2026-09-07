@@ -48,6 +48,14 @@ async def main():
         await stop.wait()
         record('exited')
         return 0
+    if a.mode=='delayed':
+        while not (root/'allow-ready').exists():
+            try:
+                await asyncio.wait_for(stop.wait(),0.01)
+                record('exited')
+                return 0
+            except TimeoutError:
+                pass
     async def control(reader,writer):
         message=json.loads(await reader.readline())
         result={'ready':True,'pid':os.getpid(),'autonomy_paused':True}
@@ -222,6 +230,57 @@ async def test_changed_candidate_never_executes_and_previous_can_run(runtime):
         value.stop_event.set()
         await asyncio.gather(task, return_exceptions=True)
     assert [row["mode"] for row in records(runtime) if row["kind"] == "started"] == ["good"]
+
+
+@pytest.mark.asyncio
+async def test_custom_deadline_allows_owned_process_ready_after_30_seconds(runtime, monkeypatch):
+    from types import SimpleNamespace
+    import alice_codex.supervisor as supervisor_module
+
+    value = supervisor(runtime, {"A": "good", "B": "delayed"})
+    value.startup_timeout = 120
+    offset = [0]
+    monkeypatch.setattr(
+        supervisor_module, "time",
+        SimpleNamespace(monotonic=lambda: time.monotonic() + offset[0], time=time.time),
+    )
+    observed_after_shift = asyncio.Event()
+    original_status = value.status
+
+    async def observe_status():
+        result = await original_status()
+        if offset[0]:
+            observed_after_shift.set()
+        return result
+
+    async def child_started():
+        return (runtime.root / "process-events.jsonl").exists() and any(
+            row["mode"] == "delayed" for row in records(runtime)
+        )
+
+    async def child_ready():
+        return value.state["lifecycle"] == "running"
+
+    value.status = observe_status
+    task = asyncio.create_task(value.run())
+    try:
+        await eventually(child_started)
+        offset[0] = 31
+        # A real child remains owned while its readiness gate is held. The old
+        # 30-second deadline would fail on the next supervisor observation.
+        await asyncio.wait_for(observed_after_shift.wait(), 5)
+        assert value.state["lifecycle"] == "starting"
+        assert value.manager.fallbacks == []
+        (runtime.root / "allow-ready").touch()
+        await eventually(child_ready)
+        assert (await request(runtime.control_socket, "status"))["ready"]
+        assert value.manager.current()["current"] == "B"
+    finally:
+        value.stop_event.set()
+        await asyncio.wait_for(task, 10)
+    started = {row["pid"] for row in records(runtime) if row["kind"] == "started"}
+    exited = {row["pid"] for row in records(runtime) if row["kind"] == "exited"}
+    assert started == exited
 
 
 @pytest.mark.asyncio

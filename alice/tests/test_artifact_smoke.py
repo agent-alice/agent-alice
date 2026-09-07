@@ -274,6 +274,33 @@ def verify_runtime_commands(runtime, info):
     assert actual["consumption"]["model_calls"] == 0
 
 
+def test_installed_invalid_startup_setting_preserves_running_service(runtime):
+    cli = runtime["cli"]
+    started = runtime["remember"](cli("start"))
+    assert started["ready"]
+    setting = runtime["home"] / "state/supervisor.json"
+    assert not setting.exists()
+    try:
+        for value in ("0", "nan", "601"):
+            result = cli("service", "install", "--startup-timeout", value, check=False)
+            assert result.returncode == 2 and "startup timeout must be" in result.stderr
+            assert not setting.exists()
+        setting.write_text(json.dumps({"startup_timeout_seconds": -1}))
+        original = setting.read_bytes()
+        result = cli("service", "install", check=False)
+        assert result.returncode != 0 and "startup timeout must be" in result.stderr
+        assert setting.read_bytes() == original
+    finally:
+        # Only this fixture created the invalid installation metadata.
+        setting.unlink(missing_ok=True)
+    observed = cli("status")
+    assert observed["ready"] and observed["pid"] == started["pid"]
+    assert observed["codex_pid"] == started["codex_pid"]
+    assert cli("stop")["stopped"]
+    for key in ("pid", "codex_pid"):
+        wait_until(lambda key=key: not alive(started[key]))
+
+
 def test_installed_cli_mcp_execution_pause_and_process_restart(runtime):
     cli = runtime["cli"]
     started = runtime["remember"](cli("start"))

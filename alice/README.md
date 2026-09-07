@@ -204,6 +204,18 @@ alice start
 
 macOS 在已有受检且激活的 release 后可使用 `alice service install`、`alice service status`、`alice service uninstall`；Linux 可使用 `alice serve`。部署入口存在不代表所有平台上的服务安装和恢复均已验收。
 
+大日志索引需要更长的就绪时间时，可在包含该选项的候选完成验证并激活后配置：
+
+```sh
+alice stop
+alice service install --startup-timeout 120
+alice start
+```
+
+`--startup-timeout` 是每次候选启动等待就绪的秒数，默认 30，必须大于 0、有限且不超过 600。设置保存在服务安装元数据中；后续使用支持该选项的 `alice service install` 重装，省略参数会保留已保存值，显式传参则更新。`service uninstall` 会删除安装设置，重新安装时需再次指定。CLI 的等待窗口也随配置调整，但不为启动前的磁盘检查提供硬超时。
+
+非默认值要求候选支持新的 supervisor 参数，安装器会在替换独立 bootstrap 前检查；启动时也会核对保存设置与 plist。非法超时设置会阻止安装／启动，但不阻止 `alice stop` 停止已拥有的进程。这个选项只调整等待期限；重复完整性扫描的性能工作见 [#32](https://github.com/agent-alice/agent-alice/issues/32)，不会因此省略数据库检查。
+
 ## 当前待验范围
 
 - 源码和 CI 工作流随候选提供；远端结果及必需检查配置需要分别核对，规范本身不提供运行能力证据。
