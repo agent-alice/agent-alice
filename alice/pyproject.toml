@@ -16,6 +16,7 @@ dev = ["pytest==9.1.1", "pytest-asyncio==1.4.0", "ruff==0.16.6", "build==1.6.0"]
 alice = "alice_codex.cli:main"
 alice-codex = "alice_codex.cli:main"
 alice-mcp = "alice_codex.mcp:main"
+alice-run = "alice_codex.launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -26,7 +27,10 @@ alice_codex = ["templates/**/*", "templates/.agents/skills/*/SKILL.md", "learnin
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-ra"
+# Keep the last executing node and slowest cases in bounded verifier logs.
+# This changes diagnostics only; command deadlines and assertions stay intact.
+addopts = "-ra -vv --durations=20"
+faulthandler_timeout = 120
 markers = [
   "native: real Codex binary, no model inference unless also marked live",
   "native_resource_epoch: installed Service resource epoch gate with fixed Codex/host pair",

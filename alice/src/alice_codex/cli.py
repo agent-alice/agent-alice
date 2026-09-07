@@ -18,6 +18,7 @@ from .control import ControlError, request
 from .files import atomic_write, read_json
 from .memory import MemoryStore
 from .store import Store
+from .startup import parse_startup_timeout, startup_wait_seconds, validate_startup_timeout
 
 
 def parser() -> argparse.ArgumentParser:
@@ -142,7 +143,12 @@ def parser() -> argparse.ArgumentParser:
         release.add_parser(op)
     service = commands.add_parser("service").add_subparsers(dest="operation", required=True)
     for op in ("install", "uninstall", "status"):
-        service.add_parser(op)
+        command = service.add_parser(op)
+        if op == "install":
+            command.add_argument(
+                "--startup-timeout", type=parse_startup_timeout,
+                help="Persist per-candidate readiness deadline; omitted values survive reinstall",
+            )
     legacy = commands.add_parser("legacy").add_subparsers(dest="operation", required=True)
     export = legacy.add_parser("export")
     export.add_argument("source", type=Path)
@@ -189,11 +195,12 @@ async def start(config) -> dict:
     if supervised:
         from .launchd import start as start_supervisor
         from .launchd import status as supervisor_status
+        from .launchd import configured_startup_timeout
 
         # The stable supervisor must be allowed to recover a damaged current
         # candidate before resolving the runtime interpreter or writing MCP config.
         await asyncio.to_thread(start_supervisor, config)
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + startup_wait_seconds(configured_startup_timeout(config))
         next_supervisor_check = 0
         while time.monotonic() < deadline:
             status = await observe()
@@ -702,12 +709,20 @@ async def execute(args) -> dict | None:
 
         if args.operation == "status":
             return launchd.status(config)
+        if args.operation == "install":
+            # Reject a damaged saved setting before the install command stops
+            # a running service. The installer rechecks under its lifecycle lock.
+            timeout = getattr(args, "startup_timeout", None)
+            if timeout is None:
+                launchd.configured_startup_timeout(config)
+            else:
+                validate_startup_timeout(timeout)
         if await running(config):
             stop_args = argparse.Namespace(command="stop", home=args.home)
             await execute(stop_args)
         if args.operation == "uninstall":
             return launchd.uninstall(config)
-        return launchd.install(config)
+        return launchd.install(config, startup_timeout=getattr(args, "startup_timeout", None))
     if args.command == "legacy":
         from .legacy import export_legacy_plan, import_legacy_plan
 

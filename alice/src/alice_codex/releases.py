@@ -1148,14 +1148,11 @@ class ReleaseManager:
             raise ReleaseError("invalid activation epoch")
         return value
 
-    def checked_current(self, *, data_schema: int | None = None) -> dict[str, Any] | None:
-        """Resolve a runnable active candidate; never execute a pointer's raw path."""
+    def _resolve_current(self) -> tuple[dict[str, Any], dict] | None:
         pointer = self.current()
         if pointer is None:
             return None
         candidate, manifest = self._verified(pointer["current"])
-        self._check_data_schema(manifest, data_schema)
-        self._check_bootstrap_policy(manifest)
         canonical = {
             "current": manifest["id"],
             "previous": pointer.get("previous"),
@@ -1169,6 +1166,27 @@ class ReleaseManager:
             or pointer.get("wheel_sha256") != canonical["wheel_sha256"]
         ):
             raise ReleaseError("active release pointer does not match the verified candidate")
+        return canonical, manifest
+
+    def resolve_current(self) -> dict[str, Any] | None:
+        """Resolve verified command code; this does not establish data health.
+
+        Command launchers may use this so diagnostics and stop remain reachable
+        without scanning unrelated stores. Service startup and release switches
+        must still use their existing data and bootstrap compatibility guards.
+        No validation result is cached: changed code/pointers fail on the next call.
+        """
+        resolved = self._resolve_current()
+        return resolved[0] if resolved else None
+
+    def checked_current(self, *, data_schema: int | None = None) -> dict[str, Any] | None:
+        """Resolve a runnable candidate and check its data/bootstrap compatibility."""
+        resolved = self._resolve_current()
+        if resolved is None:
+            return None
+        canonical, manifest = resolved
+        self._check_data_schema(manifest, data_schema)
+        self._check_bootstrap_policy(manifest)
         return canonical
 
     def activate(self, candidate_id: str, *, data_schema: int | None = None) -> dict[str, Any]:

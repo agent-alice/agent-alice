@@ -14,6 +14,7 @@ from .config import RuntimeConfig
 from .files import SingletonLock, atomic_write, read_json, write_json
 from .releases import ReleaseManager
 from .service import process_birth, process_identity
+from .startup import DEFAULT_STARTUP_TIMEOUT, validate_startup_timeout
 
 
 def label(config: RuntimeConfig) -> str:
@@ -24,12 +25,18 @@ def service_target(config: RuntimeConfig) -> str:
     return f"gui/{os.getuid()}/{label(config)}"
 
 
-def definition(config: RuntimeConfig, python: str) -> dict:
+def definition(
+    config: RuntimeConfig, python: str, *, startup_timeout: float = DEFAULT_STARTUP_TIMEOUT
+) -> dict:
     if not Path(python).is_absolute():
         raise ValueError("Service interpreter must be an absolute verified path")
+    timeout = validate_startup_timeout(startup_timeout)
+    arguments = [python, "-I", "-m", "alice_codex.supervisor", "--home", config.home]
+    if timeout != DEFAULT_STARTUP_TIMEOUT:
+        arguments.extend(["--startup-timeout", str(timeout)])
     return {
         "Label": label(config),
-        "ProgramArguments": [python, "-I", "-m", "alice_codex.supervisor", "--home", config.home],
+        "ProgramArguments": arguments,
         "WorkingDirectory": str(config.workspace),
         "EnvironmentVariables": {
             "ALICE_HOME": config.home,
@@ -97,23 +104,55 @@ def status(config: RuntimeConfig) -> dict:
     }
 
 
-def install(config: RuntimeConfig, *, directory: Path | None = None) -> dict:
+def configured_startup_timeout(config: RuntimeConfig) -> float:
+    path = config.root / "state/supervisor.json"
+    record = read_json(path) if path.exists() else {}
+    return validate_startup_timeout(record.get("startup_timeout_seconds", DEFAULT_STARTUP_TIMEOUT))
+
+
+def _probe_startup_timeout_support(python: str) -> bool:
+    # Probe the exact installed candidate before replacing the independent
+    # bootstrap. Importing this module does not initialize data or native work.
+    result = subprocess.run(
+        [python, "-I", "-B", "-c",
+         "import alice_codex.supervisor as s; "
+         "print(getattr(s,'SUPERVISOR_STARTUP_OPTIONS_VERSION',0))"],
+        capture_output=True, text=True, timeout=15,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "1"
+
+
+def install(
+    config: RuntimeConfig, *, directory: Path | None = None, startup_timeout: float | None = None
+) -> dict:
+    if startup_timeout is not None:
+        validate_startup_timeout(startup_timeout)
     with SingletonLock(config.root / "state/lifecycle.lock"):
-        return _install(config, directory=directory)
+        return _install(config, directory=directory, startup_timeout=startup_timeout)
 
 
-def _install(config: RuntimeConfig, *, directory: Path | None = None) -> dict:
+def _install(
+    config: RuntimeConfig, *, directory: Path | None = None, startup_timeout: float | None = None
+) -> dict:
+    timeout = (
+        configured_startup_timeout(config)
+        if startup_timeout is None else validate_startup_timeout(startup_timeout)
+    )
     manager = ReleaseManager(config.root)
     current = manager.checked_current()
     if not current:
         raise ValueError("Activate a verified release before installing the persistent service")
     if status(config)["loaded"]:
         raise ValueError("Unload the existing Alice user service before reinstalling it")
+    if timeout != DEFAULT_STARTUP_TIMEOUT and not _probe_startup_timeout_support(current["python"]):
+        raise ValueError("Candidate bootstrap does not support the configured startup timeout")
     bootstrap = install_runtime(manager)
     directory = directory or Path.home() / "Library/LaunchAgents"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{label(config)}.plist"
-    payload = plistlib.dumps(definition(config, bootstrap["python"]), sort_keys=True)
+    payload = plistlib.dumps(
+        definition(config, bootstrap["python"], startup_timeout=timeout), sort_keys=True
+    )
     if path.exists():
         prior = plistlib.loads(path.read_bytes())
         if prior.get("Label") != label(config):
@@ -128,6 +167,7 @@ def _install(config: RuntimeConfig, *, directory: Path | None = None) -> dict:
             "label": label(config),
             "plist": str(path),
             "installed_release": current["current"],
+            "startup_timeout_seconds": timeout,
         },
     )
     _command("bootstrap", f"gui/{os.getuid()}", str(path))
@@ -143,10 +183,19 @@ def _start(config: RuntimeConfig) -> None:
     state = status(config)
     if not state["installed"]:
         raise ValueError("Alice has no installed user service")
-    checked_runtime(config.root)
+    runtime = checked_runtime(config.root)
     metadata = read_json(config.root / "state/supervisor.json")
     if metadata.get("version") != 2:
         raise ValueError("Reinstall the user service to enable the stable supervisor")
+    timeout = configured_startup_timeout(config)
+    if "startup_timeout_seconds" in metadata:
+        path = Path(state["plist"])
+        if path.is_symlink() or path.name != f"{label(config)}.plist":
+            raise ValueError("Installed startup settings refer to an unexpected plist")
+        actual = plistlib.loads(path.read_bytes()).get("ProgramArguments")
+        expected = definition(config, runtime["python"], startup_timeout=timeout)["ProgramArguments"]
+        if actual != expected:
+            raise ValueError("Installed startup settings disagree with the launch plist; reinstall")
     metadata["last_start_requested_at"] = time.time()
     write_json(config.root / "state/supervisor.json", metadata)
     if not state["loaded"]:

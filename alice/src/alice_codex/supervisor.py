@@ -17,10 +17,12 @@ from .files import SingletonLock, read_json, write_json
 from .releases import ReleaseError, ReleaseManager
 from .service import process_birth, process_identity, recover_owned_server
 from .store import Store
+from .startup import DEFAULT_STARTUP_TIMEOUT, parse_startup_timeout, validate_startup_timeout
 from .memory import MemoryStore
 from .resources import ResourceLedger
 
 BOOTSTRAP_PROTOCOL = 1
+SUPERVISOR_STARTUP_OPTIONS_VERSION = 1
 
 
 class Supervisor:
@@ -28,13 +30,14 @@ class Supervisor:
         self,
         config,
         *,
-        startup_timeout: float = 30,
+        startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
         max_failures: int = 2,
         healthy_seconds: float = 60,
         stop_timeout: float = 40,
         retry_delay: float = 1,
         bootstrap_manifest: dict | None = None,
     ):
+        startup_timeout = validate_startup_timeout(startup_timeout)
         if min(startup_timeout, max_failures, healthy_seconds, stop_timeout) <= 0:
             raise ValueError("supervisor bounds must be positive")
         self.config = config
@@ -305,14 +308,16 @@ class Supervisor:
             return 0
 
 
-async def _main(home: Path) -> int:
+async def _main(home: Path, *, startup_timeout: float = DEFAULT_STARTUP_TIMEOUT) -> int:
     # This independent package must match the installed bootstrap pointer, even
     # when the current candidate is broken. No current-candidate import is used.
     runtime = checked_runtime(home)
     if Path(sys.executable).absolute() != Path(runtime["python"]).absolute():
         raise ReleaseError("supervisor must run from its independent bootstrap environment")
     config = load_config(home)
-    supervisor = Supervisor(config, bootstrap_manifest=runtime["manifest"])
+    supervisor = Supervisor(
+        config, bootstrap_manifest=runtime["manifest"], startup_timeout=startup_timeout
+    )
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, supervisor.stop_event.set)
@@ -322,9 +327,13 @@ async def _main(home: Path) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, required=True)
+    parser.add_argument(
+        "--startup-timeout", type=parse_startup_timeout, default=DEFAULT_STARTUP_TIMEOUT,
+        help="Seconds allowed for each candidate to become ready (maximum 600)",
+    )
     args = parser.parse_args(argv)
     try:
-        return asyncio.run(_main(args.home))
+        return asyncio.run(_main(args.home, startup_timeout=args.startup_timeout))
     except (Exception, KeyboardInterrupt) as error:
         # A startup-control failure must not become launchd's infinite crash loop.
         with suppress(Exception):
